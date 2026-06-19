@@ -136,6 +136,51 @@ def test_boxes_project_into_camera(frame: Frame):
     assert any_in_view, "no box projected into any camera — bad extrinsics/intrinsics?"
 
 
+def test_stereo_sample_contract(dataset: Py123dDataset):
+    """The consolidated output handed to preprocessing is well-formed."""
+    # Use a frame far enough in that boxes are visible in the stereo pair.
+    sample = dataset.get_frame(0, dataset.scenes[0].number_of_history_iterations + 13).to_stereo_sample()
+
+    # Stereo pair: matching uint8 HxWx3 images.
+    assert sample.image_left.shape == sample.image_right.shape
+    assert sample.image_left.ndim == 3 and sample.image_left.shape[2] == 3
+    assert sample.image_left.dtype == np.uint8
+
+    h, w = sample.image_left.shape[:2]
+    # Depth (if precomputed) aligns with the left image.
+    if sample.depth_left is not None:
+        assert sample.depth_left.shape == (h, w)
+
+    # LiDAR + the "3D position outside boxes" split is consistent.
+    assert sample.lidar_xyz.ndim == 2 and sample.lidar_xyz.shape[1] == 3
+    assert sample.points_in_box_mask.shape[0] == sample.lidar_xyz.shape[0]
+    assert sample.points_outside_boxes_xyz.shape[0] == int((~sample.points_in_box_mask).sum())
+
+    # 3D labels and the labels/tokens/velocity that describe them line up.
+    n = sample.boxes_3d.shape[0]
+    assert sample.boxes_3d.shape == (n, 10)
+    assert len(sample.boxes_3d_labels) == n
+    assert len(sample.boxes_3d_track_tokens) == n
+    assert sample.boxes_3d_velocity.shape == (n, 3)
+
+    # 2D boxes are auto-generated from 3D: each maps back to a 3D box and sits
+    # inside the image.
+    assert sample.boxes_2d_left.shape[1:] == (4,)
+    assert sample.boxes_2d_left.shape[0] == sample.boxes_2d_left_box_indices.shape[0]
+    if sample.boxes_2d_left.shape[0]:
+        assert sample.boxes_2d_left_box_indices.max() < n
+        x1, y1, x2, y2 = sample.boxes_2d_left.T
+        assert np.all((x2 >= x1) & (y2 >= y1))
+        assert np.all(sample.boxes_2d_left >= 0)
+        assert np.all((x2 <= w) & (y2 <= h))
+
+    # Calibration: real 4x4 / 3x3 transforms and a sane stereo baseline.
+    c = sample.calibration
+    assert c.left_intrinsics.shape == (3, 3) and c.right_intrinsics.shape == (3, 3)
+    assert c.ego_to_global.shape == (4, 4) and c.left_to_ego.shape == (4, 4)
+    assert 0.0 < c.stereo_baseline_m < 2.0  # AV2 stereo baseline is ~0.5 m
+
+
 # --------------------------------------------------------------------------- #
 # GUI: scroll through frames, each shown with its 3D bounding boxes drawn on top
 # --------------------------------------------------------------------------- #
