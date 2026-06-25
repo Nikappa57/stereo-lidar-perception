@@ -27,15 +27,23 @@ Quick start::
     lbls, stats = cluster_points(sample) # (P,) int, list[ClusterStats]
 """
 
+
 from __future__ import annotations
+
+import sysconfig
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
+import torch
+import torch.nn as nn
+from matplotlib import streamplot
+
 
 from data import Calibration, StereoSample
+from pointpillars import PillarConfig, pillarize, PillarFeatureNet, PointPillarsScatter, BEVBackbone2D
 
 # Helpers for preprocessing
 
@@ -54,6 +62,22 @@ def _ego_to_cam(
     pts_h = np.hstack([xyz_ego, np.ones((len(xyz_ego), 1), dtype=xyz_ego.dtype)])
     xyz_cam = (ego_to_cam @ pts_h.T).T[:, :3]
     return xyz_cam, ego_to_cam
+
+def _cam_to_ego(
+    xyz_cam: np.ndarray,
+    cam_to_ego: np.ndarray,
+) -> np.ndarray:
+    """Transform camera-frame points into ego coordinates.
+
+    :param xyz_cam: ``(P, 3)`` points in the **camera** frame.
+
+    :param cam_to_ego: ``(4, 4)`` camera → ego transform (from Calibration).
+    :returns: ``(xyz_ego, ego_to_cam_4x4)`` — ego-frame points ``(P, 3)``
+              and the 4×4 inverse transform used internally.
+    """
+    pts_h = np.hstack([xyz_cam, np.ones((len(xyz_cam), 1), dtype=xyz_cam.dtype)])
+    xyz_ego = (cam_to_ego @ pts_h.T).T[:, :3]
+    return xyz_ego
 
 
 def _project_to_image(
@@ -83,89 +107,36 @@ def _project_to_image(
 # 1.  BEV  
 
 @dataclass
-class BEVConfig:
-    """Configuration for :func:`bev_map`."""
-    x_range:    Tuple[float, float] = (-40.0,  40.0)  # forward (ego X), metres
-    y_range:    Tuple[float, float] = (-40.0,  40.0)  # lateral (ego Y), metres
-    z_range:    Tuple[float, float] = (-3.0,    1.0)  # height  (ego Z), metres
-    resolution: float               = 0.1              # metres per pixel
-    #: Channels in the output map (one per sub-list entry):
-    #:  0 – max normalised height  [0,1]
-    #:  1 – point density (log1p normalised)
-    #:  2 – intensity mean (if available, else zeros)
-    num_channels: int = 3
+class PointPillarsBranch(nn.Module):
+    """End-to-end module: raw point cloud -> BEV LiDAR feature map."""
 
+    def __init__(self, cfg: PillarConfig, pillar_feat_channels: int = 64, use_backbone: bool = True):
+        super().__init__()
+        self.cfg = cfg
+        self.pfn = PillarFeatureNet(in_channels=9, out_channels=pillar_feat_channels)
+        self.scatter = PointPillarsScatter(cfg.grid_size, channels=pillar_feat_channels)
+        self.use_backbone = use_backbone
+        if use_backbone:
+            self.backbone = BEVBackbone2D(in_channels=pillar_feat_channels, out_channels=128)
 
-def bev_map(
-    sample: StereoSample,	
-    config: Optional[BEVConfig] = None,
-) -> np.ndarray:
-    """Build a Bird's-Eye-View feature map from the LiDAR point cloud.
+    def forward(self, points: np.ndarray, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+        pillar_points, pillar_coords, npoints = pillarize(points, self.cfg)
+        nx, ny = self.cfg.grid_size
 
-    The ego frame is used directly (X forward, Y left, Z up for AV2).
-    Points outside ``config.{x,y,z}_range`` are discarded.
+        if pillar_points.shape[0] == 0:
+            c = 128 if self.use_backbone else self.pfn.linear.out_features
+            return torch.zeros(c, nx, ny, device=device)
 
-    :param sample: A :class:`~data.StereoSample`.
-    :param config: :class:`BEVConfig`; uses defaults when ``None``.
-    :returns: Float32 array ``(C, H, W)`` where ``H`` spans the Y range and
-              ``W`` spans the X range (both at ``config.resolution`` m/px).
-    """
-    cfg = config or BEVConfig()
-    xyz = sample.lidar_xyz.astype(np.float32)
-    if xyz.shape[0] == 0:
-        h = int(round((cfg.y_range[1] - cfg.y_range[0]) / cfg.resolution))
-        w = int(round((cfg.x_range[1] - cfg.x_range[0]) / cfg.resolution))
-        return np.zeros((cfg.num_channels, h, w), dtype=np.float32)
+        pillar_points_t = torch.from_numpy(pillar_points).to(device)
+        pillar_coords_t = torch.from_numpy(pillar_coords).to(device)
+        npoints_t = torch.from_numpy(npoints).to(device)
 
-    # --- spatial filter ---
-    mask = (
-        (xyz[:, 0] >= cfg.x_range[0]) & (xyz[:, 0] < cfg.x_range[1])
-        & (xyz[:, 1] >= cfg.y_range[0]) & (xyz[:, 1] < cfg.y_range[1])
-        & (xyz[:, 2] >= cfg.z_range[0]) & (xyz[:, 2] < cfg.z_range[1])
-    )
-    xyz = xyz[mask]
+        pillar_feats = self.pfn(pillar_points_t, npoints_t)
+        bev = self.scatter(pillar_feats, pillar_coords_t)
 
-    # --- intensity (optional channel) ---
-    intensity: Optional[np.ndarray] = None
-    if sample.lidar_features is not None:
-        for key in ("intensity", "reflectance", "intensity_lidar"):
-            if key in sample.lidar_features:
-                intensity = sample.lidar_features[key].astype(np.float32)[mask]
-                break
-
-    # --- grid indices ---
-    h = int(round((cfg.y_range[1] - cfg.y_range[0]) / cfg.resolution))
-    w = int(round((cfg.x_range[1] - cfg.x_range[0]) / cfg.resolution))
-    ix = np.floor((xyz[:, 0] - cfg.x_range[0]) / cfg.resolution).astype(np.int32)
-    iy = np.floor((xyz[:, 1] - cfg.y_range[0]) / cfg.resolution).astype(np.int32)
-    ix = np.clip(ix, 0, w - 1)
-    iy = np.clip(iy, 0, h - 1)
-
-    # --- fill channels ---
-    z_norm  = ((xyz[:, 2] - cfg.z_range[0]) / (cfg.z_range[1] - cfg.z_range[0])).clip(0.0, 1.0)
-    out     = np.zeros((cfg.num_channels, h, w), dtype=np.float32)
-
-    # Channel 0: max height (scatter-reduce)
-    np.maximum.at(out[0], (iy, ix), z_norm)
-
-    # Channel 1: density (point count, log1p-normalised)
-    count = np.zeros((h, w), dtype=np.float32)
-    np.add.at(count, (iy, ix), 1.0)
-    max_count = count.max() if count.max() > 0 else 1.0
-    out[1] = np.log1p(count) / np.log1p(max_count)
-
-    # Channel 2: mean intensity
-    if intensity is not None and cfg.num_channels >= 3:
-        intsum = np.zeros((h, w), dtype=np.float32)
-        np.add.at(intsum, (iy, ix), intensity)
-        valid_px = count > 0
-        out[2, valid_px] = intsum[valid_px] / count[valid_px]
-        # normalise to [0, 1]
-        peak = out[2].max()
-        if peak > 0:
-            out[2] /= peak
-
-    return out
+        if self.use_backbone:
+            bev = self.backbone(bev.unsqueeze(0)).squeeze(0)
+        return bev  # (C, nx, ny) ready for alignment/fusion with the BEV camera
 
 
 
@@ -490,3 +461,34 @@ def cluster_points(
         )
     stats.sort(key=lambda s: s.num_points, reverse=True)
     return labels_out, stats
+
+
+
+#visualize the BEV feature map
+def visualize_bev(bev: torch.Tensor, title: str = "BEV Feature Map"):
+    import matplotlib.pyplot as plt
+    plt.imshow(bev)
+    plt.title(title)
+    plt.show()
+
+
+if __name__ == "__main__":
+    from data import Py123dDataset
+
+    dataset = Py123dDataset(split_names=["av2-sensor_val"])
+
+    cfg = PillarConfig(x_range=(-40.0, 40.0), y_range=(-40.0, 40.0), z_range=(-3.0, 1.0))
+    branch = PointPillarsBranch(cfg)
+
+    sample = dataset[0].to_stereo_sample()
+    points = sample.lidar_xyz.astype(np.float32)
+    features = sample.lidar_features['intensity'][:, None]
+    points = np.concatenate([points, features], axis=1)
+    with torch.no_grad():
+        bev_lidar = branch(points)
+
+    print("BEV LiDAR shape:", bev_lidar.shape)  # (128, nx, ny)
+
+    #visualize for each channel 
+    for i in range(0, 32, 4):
+        visualize_bev(bev_lidar[i], title=f"BEV Feature Map - Channel {i}")
