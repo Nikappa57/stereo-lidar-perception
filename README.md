@@ -62,3 +62,19 @@ The `py123d` Scene API allows access to frame-by-frame data. Key methods include
 - **Network:** Neural network architecture definition.
 - **Train:** Training loop and optimization procedures.
 - **Evaluation:** Model testing and validation routines.
+
+## Perception Pipeline
+
+### Preprocessing (`preprocessing.py`)
+The preprocessing module is responsible for transforming raw stereo and LiDAR data into structured representations:
+- **Bird's-Eye-View (BEV):** Density and height maps projected from the LiDAR point cloud onto a regular 2D grid. (TODO: STEREO BEV)
+- **Camera Frustum:** Extracts LiDAR returns that fall inside a 2D camera detection box, lifted into a local frustum frame, optionally with RGB colors appended.
+- **Voxel Grid:** Builds a volumetric occupancy and feature grid from the ego-frame point cloud. Includes features like mean height, point density, and intensity.
+- **Clustering:** Euclidean-distance DBSCAN clustering of the point cloud, providing per-point labels and cluster statistics (centroids, extents).
+
+### PointPillars (`pointpillars.py`)
+The LiDAR branch utilizes a PointPillars architecture to encode raw point clouds into a Bird's-Eye-View (BEV) feature map. The pipeline includes:
+1. **Pillarization:** Bins the 3D point cloud into vertical columns (pillars) on an x-y grid. Points are augmented with offsets to their pillar centroid and geometric cell center.
+2. **Pillar Feature Net (PFN):** A simplified PointNet (shared MLP and max-pooling) that computes a single feature vector for each pillar.
+3. **Scatter:** Scatters the extracted pillar features back onto the dense 2D grid to form a pseudo-image.
+4. **BEV Backbone 2D:** A lightweight 2D Convolutional Neural Network that refines the pseudo-image, adding spatial context among neighboring pillars.
