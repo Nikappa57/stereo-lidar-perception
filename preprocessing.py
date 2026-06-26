@@ -43,6 +43,7 @@ from matplotlib import streamplot
 
 
 from data import Calibration, StereoSample
+from monobev import MonoBEVConfig, _EfficientNetBackbone, build_frustum_points, splat
 from pointpillars import PillarConfig, pillarize, PillarFeatureNet, PointPillarsScatter, BEVBackbone2D
 
 # Helpers for preprocessing
@@ -138,6 +139,104 @@ class PointPillarsBranch(nn.Module):
             bev = self.backbone(bev.unsqueeze(0)).squeeze(0)
         return bev  # (C, nx, ny) ready for alignment/fusion with the BEV camera
 
+
+# MonoBEV: Lift-Splat-Shoot monocular BEV pipeline
+
+class MonoBEV(nn.Module):
+    """Lift-Splat-Shoot monocular Bird's-Eye-View pipeline.
+
+    Given a single calibrated RGB image the module:
+
+    1. Extracts a shared feature map with a CNN backbone.
+    2. Predicts a *depth distribution* over ``D`` bins per pixel (depth head).
+    3. Predicts a *context feature* vector of length ``C`` per pixel (context
+       head).
+    4. Forms the outer product  ``(C,) ⊗ (D,)``  per pixel, yielding a
+       ``H'×W'×D`` frustum where each point carries a ``C``-dim feature
+       *weighted* by its depth probability.
+    5. Unprojects every frustum point into the ego/vehicle frame using the
+       camera intrinsics ``K`` and the camera-to-ego extrinsic ``T_cam2ego``.
+    6. Splats all frustum features onto the 2-D BEV grid using an efficient
+       **sort + cumulative-sum** pooling — no Python loops, no
+       ``scatter_add`` (see :meth:`_splat`).
+
+    The output ``(C, nx, ny)`` tensor is pixel-aligned with the LiDAR BEV
+    produced by :class:`PointPillarsBranch`.
+
+    Args:
+        cfg:  :class:`MonoBEVConfig` instance.
+    """
+
+    def __init__(self, cfg: Optional[MonoBEVConfig] = None):
+        super().__init__()
+        self.cfg = cfg or MonoBEVConfig()
+        c = self.cfg
+
+        # ---- BEV grid dimensions ----
+        self.nx = int(round((c.x_range[1] - c.x_range[0]) / c.bev_res_m))
+        self.ny = int(round((c.y_range[1] - c.y_range[0]) / c.bev_res_m))
+
+        # ---- depth bins (D,) ---- registered as buffer so they move with .to(device)
+        if c.log_depth:
+            bins = torch.exp(
+                torch.linspace(np.log(c.d_min), np.log(c.d_max), c.num_depth_bins)
+            )
+        else:
+            bins = torch.linspace(c.d_min, c.d_max, c.num_depth_bins)
+        self.register_buffer("depth_bins", bins)  # (D,)
+
+        # ---- shared backbone ----
+        self.backbone = _EfficientNetBackbone(out_ch=c.img_backbone_out)
+
+        mid = c.img_backbone_out
+        D   = c.num_depth_bins
+        C   = c.context_channels
+
+        # ---- depth head → (B, D, H', W') ----
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(mid, mid, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid), nn.ReLU(inplace=True),
+            nn.Conv2d(mid, D, 1),
+        )
+
+        # ---- context head → (B, C, H', W') ----
+        self.context_head = nn.Sequential(
+            nn.Conv2d(mid, mid, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid), nn.ReLU(inplace=True),
+            nn.Conv2d(mid, C, 1),
+        )
+
+        # ---- BEV refinement backbone ----
+        self.bev_backbone = BEVBackbone2D(in_channels=C, out_channels=C)
+
+    def forward(
+        self,
+        image:      torch.Tensor,   # (B, 3, H, W)  normalised RGB
+        K:          torch.Tensor,   # (B, 3, 3) or (3, 3)  camera intrinsics
+        T_cam2ego:  torch.Tensor,   # (B, 4, 4) or (4, 4)  camera→ego SE(3)
+    ) -> torch.Tensor:
+        """Run the full Lift-Splat-Shoot pipeline."""
+        # ---- Step 1: shared backbone ----
+        shared = self.backbone(image)                          # (B, mid, H', W')
+        stride = image.shape[-1] // shared.shape[-1]          # e.g. 8
+
+        # ---- Step 2: depth distribution + context features ----
+        depth_logits = self.depth_head(shared)                 # (B, D, H', W')
+        depth_dist   = depth_logits.softmax(dim=1)             # (B, D, H', W')
+        context      = self.context_head(shared)               # (B, C, H', W')
+
+        # ---- Steps 3-5: outer product + unproject ----
+        xyz_ego, feats = build_frustum_points(
+            depth_dist, context, K, T_cam2ego, stride, self.depth_bins
+        )                                                      # (B, N, 3), (B, N, C)
+
+        # ---- Step 6: voxel-pool onto BEV grid ----
+        bev = splat(xyz_ego, feats, self.nx, self.ny, self.cfg.x_range, self.cfg.y_range, self.cfg.bev_res_m)                      # (B, C, nx, ny)
+
+        # ---- Step 7: BEV CNN refinement ----
+        bev = self.bev_backbone(bev)                           # (B, C, nx, ny)
+
+        return bev
 
 
 # 2.  Frustum
@@ -471,24 +570,200 @@ def visualize_bev(bev: torch.Tensor, title: str = "BEV Feature Map"):
     plt.title(title)
     plt.show()
 
+# Demo helpers
+def _lidar_bev(
+    sample,
+    device: "torch.device",
+    x_range=(0.0, 50.0),
+    y_range=(-20.0, 20.0),
+    z_range=(-3.0, 1.0),
+) -> "torch.Tensor":
+    """Run the PointPillars branch on one StereoSample.
+
+    Returns
+    -------
+    bev : (C, nx, ny) float32 tensor on *device*.
+    """
+    cfg    = PillarConfig(x_range=x_range, y_range=y_range, z_range=z_range)
+    branch = PointPillarsBranch(cfg).to(device).eval()
+    pts    = sample.lidar_xyz.astype(np.float32)
+    inten  = sample.lidar_features["intensity"][:, None].astype(np.float32)
+    pts    = np.concatenate([pts, inten], axis=1)
+    with torch.no_grad():
+        return branch(pts, device=device)
+
+
+def _camera_bev(
+    sample,
+    device: "torch.device",
+    target_hw=(192, 640),
+    x_range=(0.0, 50.0),
+    y_range=(-20.0, 20.0),
+) -> "torch.Tensor":
+    """Run the MonoBEV (Lift-Splat-Shoot) branch on one StereoSample.
+
+    Handles image resizing, K scaling, and extrinsic conversion.
+
+    Returns
+    -------
+    bev : (C, nx, ny) float32 tensor on *device*.
+    """
+    import torchvision.transforms.functional as TF
+
+    target_h, target_w = target_hw
+    img_np = sample.image_left
+    img_h, img_w = img_np.shape[:2]
+
+    # image → normalised tensor
+    img_t = TF.to_tensor(img_np)
+    img_t = TF.resize(img_t, [target_h, target_w])
+    img_t = TF.normalize(img_t,
+                         mean=[0.485, 0.456, 0.406],
+                         std =[0.229, 0.224, 0.225])
+    img_batch = img_t.unsqueeze(0).to(device)
+
+    # scale K to the resized resolution
+    K_np = sample.calibration.left_intrinsics.copy().astype(np.float32)
+    K_np[0] *= target_w / img_w
+    K_np[1] *= target_h / img_h
+    K = torch.from_numpy(K_np).to(device)
+
+    T_cam2ego = torch.from_numpy(
+        sample.calibration.left_to_ego.astype(np.float32)
+    ).to(device)
+
+    cfg   = MonoBEVConfig(x_range=x_range, y_range=y_range)
+    model = MonoBEV(cfg).to(device).eval()
+    with torch.no_grad():
+        bev = model(img_batch, K, T_cam2ego)
+    return bev.squeeze(0)
+
+
+def _stereo_bev(
+    sample,
+    device: "torch.device",
+    x_range=(0.0, 50.0),
+    y_range=(-20.0, 20.0),
+    z_range=(-3.0, 1.0),
+) -> "torch.Tensor":
+    """Run the stereo (cv2.StereoSGBM) branch on one StereoSample.
+
+    Computes SGBM disparity → metric depth → ego point cloud → geometric BEV,
+    pixel-aligned with the LiDAR and camera BEVs.
+
+    Returns
+    -------
+    bev : (C, nx, ny) float32 tensor on *device* (C=7: occ, density, max/mean
+          height, mean RGB).
+    """
+    from stereo import stereo_bev, StereoBEVConfig
+
+    bcfg = StereoBEVConfig(x_range=x_range, y_range=y_range, z_range=z_range)
+    bev  = stereo_bev(sample, bev_cfg=bcfg)          # (C, nx, ny) numpy
+    return torch.from_numpy(bev).to(device)
+
+
+def _print_bev_stats(name: str, bev: "np.ndarray") -> None:
+    """Print min / max / non-zero% for a BEV feature map."""
+    nonzero = float((bev != 0).mean()) * 100
+    print(f"{name:<12s}  min={bev.min():.4f}  max={bev.max():.4f}"
+          f"  non-zero={nonzero:.1f}%")
+
+
+#: Human-readable names for the geometric stereo-BEV channels (see stereo.stereo_bev).
+_STEREO_CH_NAMES = ("occupancy", "log-density", "max-height", "mean-height",
+                    "mean-R", "mean-G", "mean-B")
+
+
+def _plot_bev_comparison(
+    img_np: "np.ndarray",
+    bev_camera: "np.ndarray",
+    bev_lidar: "np.ndarray",
+    title: str,
+    bev_stereo: "Optional[np.ndarray]" = None,
+    channels=(0, 8, 16, 32),
+    stereo_channels=(0, 1, 2, 3),
+    save_path: str = "monobev_test_output.png",
+) -> None:
+    """Camera image + per-branch BEV channels, one row per branch.
+
+    Rows: camera image | camera BEV | LiDAR BEV | stereo BEV (when provided).
+    Each panel uses an independent 1st–99th-percentile colour scale so weak
+    channels aren't crushed by stronger ones in the same tensor.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
+    def _panel(ax, feat, label, cmap):
+        lo = float(np.percentile(feat,  1))
+        hi = float(np.percentile(feat, 99))
+        if hi <= lo:
+            lo, hi = float(feat.min()), float(feat.max()) + 1e-9
+        im = ax.imshow(feat, cmap=cmap, origin="lower", vmin=lo, vmax=hi)
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("Y (lateral →)")
+        ax.set_ylabel("X (forward →)")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    n_rows = 4 if bev_stereo is not None else 3
+    fig = plt.figure(figsize=(18, 3.3 * n_rows))
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    gs  = gridspec.GridSpec(n_rows, 4, figure=fig, hspace=0.5, wspace=0.25)
+
+    ax0 = fig.add_subplot(gs[0, :])
+    ax0.imshow(img_np)
+    ax0.set_title("Left camera image", fontsize=11)
+    ax0.axis("off")
+
+    for col, ch in enumerate(channels):
+        _panel(fig.add_subplot(gs[1, col]),
+               bev_camera[ch], f"Camera BEV ch={ch}", "plasma")
+
+    for col, ch in enumerate(channels):
+        ch_lid = min(ch, bev_lidar.shape[0] - 1)
+        _panel(fig.add_subplot(gs[2, col]),
+               bev_lidar[ch_lid], f"LiDAR BEV ch={ch_lid}", "viridis")
+
+    if bev_stereo is not None:
+        for col, ch in enumerate(stereo_channels):
+            ch_s = min(ch, bev_stereo.shape[0] - 1)
+            name = _STEREO_CH_NAMES[ch_s] if ch_s < len(_STEREO_CH_NAMES) else f"ch={ch_s}"
+            _panel(fig.add_subplot(gs[3, col]),
+                   bev_stereo[ch_s], f"Stereo BEV {name}", "turbo")
+
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    print(f"\nFigure saved → {save_path}")
+    plt.show()
+
 
 if __name__ == "__main__":
     from data import Py123dDataset
 
     dataset = Py123dDataset(split_names=["av2-sensor_val"])
+    sample  = dataset[0].to_stereo_sample()
+    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfg = PillarConfig(x_range=(-40.0, 40.0), y_range=(-40.0, 40.0), z_range=(-3.0, 1.0))
-    branch = PointPillarsBranch(cfg)
+    print(f"Frame  : {sample.dataset}  log={sample.log_name}  iter={sample.iteration}")
+    print(f"Image  : {sample.image_left.shape}   LiDAR : {sample.lidar_xyz.shape[0]} pts")
+    print(f"Device : {device}")
 
-    sample = dataset[0].to_stereo_sample()
-    points = sample.lidar_xyz.astype(np.float32)
-    features = sample.lidar_features['intensity'][:, None]
-    points = np.concatenate([points, features], axis=1)
-    with torch.no_grad():
-        bev_lidar = branch(points)
+    bev_lidar  = _lidar_bev(sample, device)
+    bev_camera = _camera_bev(sample, device)
+    bev_stereo = _stereo_bev(sample, device)
 
-    print("BEV LiDAR shape:", bev_lidar.shape)  # (128, nx, ny)
+    bev_lid_np = bev_lidar.detach().cpu().numpy()
+    bev_cam_np = bev_camera.detach().cpu().numpy()
+    bev_ste_np = bev_stereo.detach().cpu().numpy()
 
-    #visualize for each channel 
-    for i in range(0, 32, 4):
-        visualize_bev(bev_lidar[i], title=f"BEV Feature Map - Channel {i}")
+    _print_bev_stats("Camera BEV", bev_cam_np)
+    _print_bev_stats("LiDAR  BEV", bev_lid_np)
+    _print_bev_stats("Stereo BEV", bev_ste_np)
+
+    _plot_bev_comparison(
+        img_np     = sample.image_left,
+        bev_camera = bev_cam_np,
+        bev_lidar  = bev_lid_np,
+        bev_stereo = bev_ste_np,
+        title      = f"MonoBEV + PointPillars + Stereo  |  {sample.dataset}  iter={sample.iteration}",
+    )
+
