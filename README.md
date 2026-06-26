@@ -67,7 +67,7 @@ The `py123d` Scene API allows access to frame-by-frame data. Key methods include
 
 ### Preprocessing (`preprocessing.py`)
 The preprocessing module is responsible for transforming raw stereo and LiDAR data into structured representations:
-- **Bird's-Eye-View (BEV):** Density and height maps projected from the LiDAR point cloud onto a regular 2D grid. (TODO: STEREO BEV)
+- **Bird's-Eye-View (BEV):** Density and height maps from LiDAR (PointPillars branch) and monocular camera features (MonoBEV branch) projected onto the same pixel-aligned 2D grid.
 - **Camera Frustum:** Extracts LiDAR returns that fall inside a 2D camera detection box, lifted into a local frustum frame, optionally with RGB colors appended.
 - **Voxel Grid:** Builds a volumetric occupancy and feature grid from the ego-frame point cloud. Includes features like mean height, point density, and intensity.
 - **Clustering:** Euclidean-distance DBSCAN clustering of the point cloud, providing per-point labels and cluster statistics (centroids, extents).
@@ -77,4 +77,36 @@ The LiDAR branch utilizes a PointPillars architecture to encode raw point clouds
 1. **Pillarization:** Bins the 3D point cloud into vertical columns (pillars) on an x-y grid. Points are augmented with offsets to their pillar centroid and geometric cell center.
 2. **Pillar Feature Net (PFN):** A simplified PointNet (shared MLP and max-pooling) that computes a single feature vector for each pillar.
 3. **Scatter:** Scatters the extracted pillar features back onto the dense 2D grid to form a pseudo-image.
-4. **BEV Backbone 2D:** A lightweight 2D Convolutional Neural Network that refines the pseudo-image, adding spatial context among neighboring pillars.
+4. **BEV Backbone 2D:** A lightweight 2D CNN that refines the pseudo-image, adding spatial context among neighbouring pillars.
+
+### MonoBEV — Camera Branch (`monobev.py`)
+The camera branch implements the **Lift-Splat-Shoot** paradigm to produce a BEV feature map from a single calibrated RGB image, pixel-aligned with the LiDAR BEV for direct fusion:
+1. **Shared CNN backbone** (EfficientNet-style, stride 8×) extracts dense image features.
+2. **Depth head** predicts a softmax distribution over D=41 depth bins per pixel.
+3. **Context head** predicts a C=64 semantic feature vector per pixel.
+4. **Outer product** — `context ⊗ depth_dist` — weights each depth bin's feature by its predicted probability, building a `H'×W'×D` frustum cloud.
+5. **Lift to 3D:** Every frustum point is unprojected to ego frame via `K⁻¹` (LAPACK, CPU) and the camera-to-ego extrinsic `T_cam2ego`.
+6. **Voxel pooling (Splat):** Frustum features are sum-pooled into BEV cells using the sort + cumulative-sum boundary trick — O(M log M), fully vectorised, no Python loops.
+7. **BEV Backbone 2D** refines the splatted map.
+
+**Output:** `(B, C, nx, ny)` aligned with the LiDAR BEV and ready for channel-wise fusion.
+
+> **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for the full step-by-step explanation with equations and implementation notes.
+
+### Quick start — running both branches
+
+```python
+from preprocessing import _lidar_bev, _camera_bev, _print_bev_stats
+from data import Py123dDataset
+import torch
+
+dataset = Py123dDataset(split_names=["av2-sensor_val"])
+sample  = dataset[0].to_stereo_sample()
+device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+bev_lidar  = _lidar_bev(sample, device)   # (128, 200, 160) LiDAR BEV
+bev_camera = _camera_bev(sample, device)  # ( 64, 200, 160) Camera BEV
+
+_print_bev_stats("LiDAR BEV",  bev_lidar.cpu().numpy())
+_print_bev_stats("Camera BEV", bev_camera.cpu().numpy())
+```
