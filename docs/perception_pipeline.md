@@ -154,7 +154,75 @@ The splatted map is passed through `BEVBackbone2D` (the same lightweight 2D CNN 
 
 The triangular frustum shape and the Y-axis centering at y=0 m are a geometry sanity-check that is visible even in the untrained model.
 
+---
+
+## 4. Stereo Depth Branch (`stereo.py`)
+
+The stereo branch recovers metric geometry from the raw left/right pair using **classic block matching** (`cv2.StereoSGBM`) — no learning, no training. It is the depth source that feeds the *stereo BEV* (and can supervise/replace the MonoBEV depth head).
+
+### 4.1. Why rectify first
+
+`cv2.StereoSGBM` assumes the two views are **rectified**: a 3-D point projects to the *same image row* in both, so the search is 1-D along the scanline. The AV2 `pcam_stereo_l` / `pcam_stereo_r` pair is *almost* rectified but not exactly — there is a ≈0.4° relative rotation, ~2 px vertical principal-point offset and ~1.4 px focal mismatch (verified from calibration). Skipping rectification leaks disparity into vertical error and biases depth.
+
+`build_rectification` computes the relative pose `X_right = R·X_left + T` from the extrinsics, calls `cv2.stereoRectify` (with `CALIB_ZERO_DISPARITY`, `alpha=0`), and builds the `cv2.remap` maps plus the reprojection matrix `Q`. **All rectification is done at full resolution** so `Q` / `fx_rect` always describe the true geometry.
+
+### 4.2. Disparity (`cv2.StereoSGBM`)
+
+The rectified pair is matched with SGBM. The smoothness penalties follow the OpenCV convention `P = factor · channels · block_size²`, so `block_size` can be tuned without re-tuning `P1`/`P2`. For speed the matching runs on a **downscaled** copy of the rectified pair (`downscale=0.5` → ~4× faster); the resulting disparity is upscaled and multiplied by `1/downscale` back to full-res pixels. `num_disparities` is specified in **full-res pixels** and scaled internally for the matcher.
+
+> **Gotcha (found & fixed during dev):** rectifying directly at low resolution (scaling `K` and calling `initUndistortRectifyMap` at the small size) produced badly under-estimated disparities (≈½ the true value → depth ≈2× too large). Rectify at full res, downscale only the *images* for matching. This is what the code does.
+
+### 4.3. Disparity → Depth → Ego point cloud
+
+```
+depth   = fx_rect · baseline / disparity         #  fx_rect ≈ 1724,  baseline ≈ 0.4996 m
+xyz_rect = cv2.reprojectImageTo3D(disparity, Q)  #  3-D in the rectified-left frame
+xyz_left = R1ᵀ · xyz_rect                         #  rectified-left → original-left
+xyz_ego  = R_cam2ego · xyz_left + t_cam2ego       #  original-left → ego
+```
+
+The result is a **coloured point cloud in the ego frame** — the same frame as `lidar_xyz`, so it can be dropped into any LiDAR consumer (BEV / voxels / frustum). A convenience `depth_left` re-projects the dense depth back into the *original* left image (z-buffered) so it lines up with `sample.depth_left` (the sparse LiDAR depth) for evaluation.
+
+### 4.4. Stereo BEV
+
+`stereo_bev` bins the ego cloud into a geometric BEV on the **same grid** as the LiDAR / camera BEVs (`x_range`, `y_range`, `bev_res_m` from `StereoBEVConfig`, defaults matching `PillarConfig`). Channels:
+
+| ch | meaning |
+|---|---|
+| 0 | occupancy (binary) |
+| 1 | log-density |
+| 2 | max height (normalised over `z_range`) |
+| 3 | mean height (normalised) |
+| 4–6 | mean RGB (when `append_rgb`) |
+
+Output `(C, nx, ny)` with `ix` along x (forward), `iy` along y (lateral) — identical indexing to `PointPillarsScatter`, so the LiDAR / camera / stereo BEVs concatenate channel-wise for fusion.
+
+### 4.5. Sanity / accuracy
+
+**Cameras used:** only the stereo pair `pcam_stereo_l` / `pcam_stereo_r` (the other 7 AV2 cameras are ignored). Baseline ≈ **0.4996 m**, `fx` ≈ **1688 px**, resolution **1550 × 2048**, already undistorted.
+
+**Overall vs. LiDAR** (the dataset's only depth ground truth, on shared pixels in `[1, 80] m`): **median abs error ≈ 0.4 m, MAE ≈ 2 m, ~82 % of pixels within 2 m**. RMSE (~5–6 m) is dominated by far-range / occluded-edge outliers.
+
+**Error vs. range** — passive-stereo error grows with the square of distance (`Δz ∝ z² / (fx · baseline)`), so accuracy is range-dependent:
+
+| range | MAE | median | rel. err |
+|---|---|---|---|
+| 1–10 m | **0.40 m** | 0.13 m | 5 % |
+| 10–20 m | 1.07 m | 0.28 m | 7 % |
+| 20–30 m | 2.44 m | 0.68 m | 10 % |
+| 30–50 m | 3.94 m | 1.44 m | 10 % |
+| 50–80 m | **9.01 m** | 5.13 m | 14 % |
+
+Take-aways:
+
+- **Near field (< 20 m): stereo ≈ LiDAR** (decimetre-level) — excellent for the close BEV (road surface, nearby objects), and stereo is *denser* than LiDAR there, with RGB.
+- **Far field (> 50 m): stereo is weak** (~9 m error) — the 0.5 m baseline is too short for that range. Stereo **complements** LiDAR (fills dense near surfaces), it does not replace it.
+- For a clean stereo BEV, keep the BEV `x_range` at ≤ 50 m (the default): within 50 m the depth is solid.
+
+The fan-shaped BEV footprint (single forward-camera FOV cone, centred on `y = 0`) is a geometry sanity check that holds even before any training (the stereo branch is not learned).
+
 ### References
 
+- Hirschmüller, H. (2008). *Stereo Processing by Semi-Global Matching and Mutual Information.* (SGBM)
 - Philion, J., & Fidler, S. (2020). *Lift, Splat, Shoot: Encoding Images from Arbitrary Camera Rigs by Implicitly Unprojecting to 3D.*
 - Lang, A. H., et al. (2019). *PointPillars: Fast Encoders for Object Detection from Point Clouds.*

@@ -639,6 +639,30 @@ def _camera_bev(
     return bev.squeeze(0)
 
 
+def _stereo_bev(
+    sample,
+    device: "torch.device",
+    x_range=(0.0, 50.0),
+    y_range=(-20.0, 20.0),
+    z_range=(-3.0, 1.0),
+) -> "torch.Tensor":
+    """Run the stereo (cv2.StereoSGBM) branch on one StereoSample.
+
+    Computes SGBM disparity → metric depth → ego point cloud → geometric BEV,
+    pixel-aligned with the LiDAR and camera BEVs.
+
+    Returns
+    -------
+    bev : (C, nx, ny) float32 tensor on *device* (C=7: occ, density, max/mean
+          height, mean RGB).
+    """
+    from stereo import stereo_bev, StereoBEVConfig
+
+    bcfg = StereoBEVConfig(x_range=x_range, y_range=y_range, z_range=z_range)
+    bev  = stereo_bev(sample, bev_cfg=bcfg)          # (C, nx, ny) numpy
+    return torch.from_numpy(bev).to(device)
+
+
 def _print_bev_stats(name: str, bev: "np.ndarray") -> None:
     """Print min / max / non-zero% for a BEV feature map."""
     nonzero = float((bev != 0).mean()) * 100
@@ -646,16 +670,24 @@ def _print_bev_stats(name: str, bev: "np.ndarray") -> None:
           f"  non-zero={nonzero:.1f}%")
 
 
+#: Human-readable names for the geometric stereo-BEV channels (see stereo.stereo_bev).
+_STEREO_CH_NAMES = ("occupancy", "log-density", "max-height", "mean-height",
+                    "mean-R", "mean-G", "mean-B")
+
+
 def _plot_bev_comparison(
     img_np: "np.ndarray",
     bev_camera: "np.ndarray",
     bev_lidar: "np.ndarray",
     title: str,
+    bev_stereo: "Optional[np.ndarray]" = None,
     channels=(0, 8, 16, 32),
+    stereo_channels=(0, 1, 2, 3),
     save_path: str = "monobev_test_output.png",
 ) -> None:
-    """3-row figure: camera image | camera BEV channels | LiDAR BEV channels.
+    """Camera image + per-branch BEV channels, one row per branch.
 
+    Rows: camera image | camera BEV | LiDAR BEV | stereo BEV (when provided).
     Each panel uses an independent 1st–99th-percentile colour scale so weak
     channels aren't crushed by stronger ones in the same tensor.
     """
@@ -673,9 +705,10 @@ def _plot_bev_comparison(
         ax.set_ylabel("X (forward →)")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    fig = plt.figure(figsize=(18, 10))
+    n_rows = 4 if bev_stereo is not None else 3
+    fig = plt.figure(figsize=(18, 3.3 * n_rows))
     fig.suptitle(title, fontsize=14, fontweight="bold")
-    gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.45, wspace=0.25)
+    gs  = gridspec.GridSpec(n_rows, 4, figure=fig, hspace=0.5, wspace=0.25)
 
     ax0 = fig.add_subplot(gs[0, :])
     ax0.imshow(img_np)
@@ -690,6 +723,13 @@ def _plot_bev_comparison(
         ch_lid = min(ch, bev_lidar.shape[0] - 1)
         _panel(fig.add_subplot(gs[2, col]),
                bev_lidar[ch_lid], f"LiDAR BEV ch={ch_lid}", "viridis")
+
+    if bev_stereo is not None:
+        for col, ch in enumerate(stereo_channels):
+            ch_s = min(ch, bev_stereo.shape[0] - 1)
+            name = _STEREO_CH_NAMES[ch_s] if ch_s < len(_STEREO_CH_NAMES) else f"ch={ch_s}"
+            _panel(fig.add_subplot(gs[3, col]),
+                   bev_stereo[ch_s], f"Stereo BEV {name}", "turbo")
 
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     print(f"\nFigure saved → {save_path}")
@@ -709,17 +749,21 @@ if __name__ == "__main__":
 
     bev_lidar  = _lidar_bev(sample, device)
     bev_camera = _camera_bev(sample, device)
+    bev_stereo = _stereo_bev(sample, device)
 
     bev_lid_np = bev_lidar.detach().cpu().numpy()
     bev_cam_np = bev_camera.detach().cpu().numpy()
+    bev_ste_np = bev_stereo.detach().cpu().numpy()
 
     _print_bev_stats("Camera BEV", bev_cam_np)
     _print_bev_stats("LiDAR  BEV", bev_lid_np)
+    _print_bev_stats("Stereo BEV", bev_ste_np)
 
     _plot_bev_comparison(
         img_np     = sample.image_left,
         bev_camera = bev_cam_np,
         bev_lidar  = bev_lid_np,
-        title      = f"MonoBEV + PointPillars  |  {sample.dataset}  iter={sample.iteration}",
+        bev_stereo = bev_ste_np,
+        title      = f"MonoBEV + PointPillars + Stereo  |  {sample.dataset}  iter={sample.iteration}",
     )
 

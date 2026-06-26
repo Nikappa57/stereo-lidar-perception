@@ -91,12 +91,23 @@ The camera branch implements the **Lift-Splat-Shoot** paradigm to produce a BEV 
 
 **Output:** `(B, C, nx, ny)` aligned with the LiDAR BEV and ready for channel-wise fusion.
 
+### Stereo — Depth Branch (`stereo.py`)
+The stereo branch turns the raw left/right image pair into metric geometry with classic block matching (no learning):
+1. **Rectify** — `cv2.stereoRectify` removes the small residual rotation / principal-point offset between `pcam_stereo_l` and `pcam_stereo_r` so epipolar lines are horizontal.
+2. **Disparity** — `cv2.StereoSGBM` matches the rectified pair (matched on a downscaled copy for speed, then scaled back to full res).
+3. **Depth** — `depth = fx · baseline / disparity` (fx ≈ 1724 rect, baseline ≈ 0.4996 m).
+4. **Lift** — `cv2.reprojectImageTo3D` → 3-D points, transformed rectified-left → left → **ego**, giving a coloured point cloud in the same frame as `lidar_xyz`.
+5. **Stereo BEV** — the cloud is binned into a geometric BEV (occupancy, density, max/mean height, mean RGB) on the **same grid** as the LiDAR / camera BEVs.
+
+**Output:** `StereoDepth` (disparity + metric depth) and a `(C, nx, ny)` stereo BEV. Validated against the sparse LiDAR depth: **median error ≈ 0.4 m, ~82 % of pixels within 2 m**.
+
 > **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for the full step-by-step explanation with equations and implementation notes.
 
-### Quick start — running both branches
+### Quick start — running all branches
 
 ```python
-from preprocessing import _lidar_bev, _camera_bev, _print_bev_stats
+from preprocessing import _lidar_bev, _camera_bev, _stereo_bev, _print_bev_stats
+from stereo import stereo_depth
 from data import Py123dDataset
 import torch
 
@@ -106,7 +117,12 @@ device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 bev_lidar  = _lidar_bev(sample, device)   # (128, 200, 160) LiDAR BEV
 bev_camera = _camera_bev(sample, device)  # ( 64, 200, 160) Camera BEV
+bev_stereo = _stereo_bev(sample, device)  # (  7, 200, 160) Stereo BEV
+
+sd = stereo_depth(sample)                 # SGBM disparity + metric depth
+print(f"stereo depth valid={float((sd.depth>0).mean())*100:.1f}%")
 
 _print_bev_stats("LiDAR BEV",  bev_lidar.cpu().numpy())
 _print_bev_stats("Camera BEV", bev_camera.cpu().numpy())
+_print_bev_stats("Stereo BEV", bev_stereo.cpu().numpy())
 ```
