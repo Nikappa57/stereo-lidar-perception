@@ -149,4 +149,7 @@ _print_bev_stats("Stereo BEV", bev_stereo.cpu().numpy())
 
 All three tensors share the same `(nx=200, ny=160)` spatial grid at 0.25 m/cell, covering `x∈[0,50] m` forward and `y∈[-20,20] m` lateral — ready for channel-wise concatenation in Pipeline A or cross-attention fusion in Pipeline C.
 
-> **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for full step-by-step explanations with equations and implementation notes.
+### BEV Fusion — Detection Head (`network.py`)
+The two BEV maps are fused (`ConcatConvFusion` — concat + conv) and read by a 2D `CenterPointHead` that outputs a per-class centre heatmap + sub-cell `(x, y)` offset (no yaw/z). The fusion block has a fixed interface (two BEV maps in, one out), so Pipeline C swaps in `CrossAttentionFusion` as a drop-in replacement.
+
+> **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for full step-by-step explanations with equations and implementation notes, and [`docs/bev_fusion.md`](docs/bev_fusion.md) for the BEV fusion input contract (what Stage A must emit, and why).
