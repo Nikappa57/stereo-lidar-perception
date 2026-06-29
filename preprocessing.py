@@ -781,7 +781,7 @@ def _plot_bev_comparison(
     bev_stereo: "Optional[np.ndarray]" = None,
     channels=(0, 8, 16, 32),
     stereo_channels=(1, 2, 4, 8),
-    save_path: str = "monobev_test_output.png",
+    save_path: str = "docs/img/monobev_test_output.png",
 ) -> None:
     """Camera image + per-branch BEV channels, one row per branch.
 
