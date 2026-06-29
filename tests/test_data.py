@@ -159,6 +159,11 @@ def test_stereo_sample_contract(dataset: Py123dDataset):
     # 3D labels and the labels/tokens/velocity that describe them line up.
     n = sample.boxes_3d.shape[0]
     assert sample.boxes_3d.shape == (n, 10)
+    # Ego-frame copy: same count/shape, sensor-scale centres (frame guard).
+    assert sample.boxes_3d_ego.shape == (n, 10)
+    from data import assert_boxes_in_sensor_range  # noqa: E402
+
+    assert_boxes_in_sensor_range(sample.boxes_3d_ego)
     assert len(sample.boxes_3d_labels) == n
     assert len(sample.boxes_3d_track_tokens) == n
     assert sample.boxes_3d_velocity.shape == (n, 3)
@@ -179,6 +184,76 @@ def test_stereo_sample_contract(dataset: Py123dDataset):
     assert c.left_intrinsics.shape == (3, 3) and c.right_intrinsics.shape == (3, 3)
     assert c.ego_to_global.shape == (4, 4) and c.left_to_ego.shape == (4, 4)
     assert 0.0 < c.stereo_baseline_m < 2.0  # AV2 stereo baseline is ~0.5 m
+
+
+def test_boxes_global_to_ego_roundtrip():
+    """``boxes_global_to_ego`` transforms pose, leaves extent, and round-trips."""
+    from data import boxes_global_to_ego  # noqa: E402
+    from py123d.geometry.geometry_index import BoundingBoxSE3Index  # noqa: E402
+    from py123d.geometry.transform import rel_to_abs_se3_array  # noqa: E402
+
+    rng = np.random.default_rng(0)
+    n = 6
+    boxes = np.zeros((n, 10), dtype=np.float64)
+    boxes[:, BoundingBoxSE3Index.XYZ] = rng.uniform(-50.0, 50.0, (n, 3))
+    quats = rng.normal(size=(n, 4))
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+    boxes[:, BoundingBoxSE3Index.QUATERNION] = quats
+    boxes[:, BoundingBoxSE3Index.EXTENT] = rng.uniform(0.5, 5.0, (n, 3))
+
+    yaw = np.pi / 3
+    origin = np.array([10.0, -5.0, 1.0, np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+
+    boxes_ego = boxes_global_to_ego(boxes, origin)
+    # Extent (l, w, h) is frame-invariant.
+    np.testing.assert_allclose(
+        boxes_ego[:, BoundingBoxSE3Index.EXTENT], boxes[:, BoundingBoxSE3Index.EXTENT]
+    )
+    # ego -> global recovers the originals (centres exactly; quaternions up to sign).
+    back = boxes.copy()
+    back[:, BoundingBoxSE3Index.SE3] = rel_to_abs_se3_array(origin, boxes_ego[:, BoundingBoxSE3Index.SE3])
+    np.testing.assert_allclose(
+        back[:, BoundingBoxSE3Index.XYZ], boxes[:, BoundingBoxSE3Index.XYZ], atol=1e-9
+    )
+    dot = np.abs((back[:, BoundingBoxSE3Index.QUATERNION] * boxes[:, BoundingBoxSE3Index.QUATERNION]).sum(axis=1))
+    np.testing.assert_allclose(dot, 1.0, atol=1e-9)
+    # Empty input stays empty and well-shaped.
+    assert boxes_global_to_ego(np.zeros((0, 10)), origin).shape == (0, 10)
+
+
+def test_boxes_ego_frame_matches_lidar(dataset):
+    """Box membership is frame-invariant: lidar (ego) lands in the same boxes
+    whether classified in ego (``boxes_3d_ego``) or global (``boxes_3d``) frame.
+
+    This is the strong check that the global->ego conversion is *correct* and in
+    the same frame as the point cloud — the exact thing the BEV target encoder
+    relies on.
+    """
+    from data import SENSOR_RANGE_M, assert_boxes_in_sensor_range  # noqa: E402
+    from py123d.geometry.geometry_index import BoundingBoxSE3Index  # noqa: E402
+    from py123d.geometry.transform import rel_to_abs_points_3d_array  # noqa: E402
+    from py123d.geometry.utils.bounding_box_utils import points_3d_in_bbse3_array  # noqa: E402
+
+    frame = dataset.get_frame(0, dataset.scenes[0].number_of_history_iterations + 13)
+    sample = frame.to_stereo_sample()
+    if sample.boxes_3d.shape[0] == 0 or sample.lidar_xyz.shape[0] == 0:
+        pytest.skip("frame has no boxes/lidar to cross-check")
+
+    boxes_g, boxes_e = sample.boxes_3d, sample.boxes_3d_ego
+    lidar_ego = sample.lidar_xyz.astype(np.float64)
+    lidar_global = rel_to_abs_points_3d_array(frame.ego_state().imu_se3, lidar_ego)
+
+    in_ego = points_3d_in_bbse3_array(lidar_ego, boxes_e)
+    in_global = points_3d_in_bbse3_array(lidar_global, boxes_g)
+    np.testing.assert_array_equal(in_ego, in_global)
+
+    # The guard must reject the *global* boxes when the city origin is far away
+    # (the realistic AV2 case); skip the assertion if this log sits near origin.
+    global_r = np.linalg.norm(boxes_g[:, BoundingBoxSE3Index.XYZ][:, :2], axis=1).max()
+    assert_boxes_in_sensor_range(boxes_e)
+    if global_r > SENSOR_RANGE_M:
+        with pytest.raises(AssertionError):
+            assert_boxes_in_sensor_range(boxes_g)
 
 
 # --------------------------------------------------------------------------- #
