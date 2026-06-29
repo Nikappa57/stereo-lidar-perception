@@ -3,12 +3,11 @@
 from typing import Tuple
 
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
 
 from data import StereoSample
-from preprocessing import BEVConfig, bev_map, frustum_points, voxel_grid, cluster_points
+from preprocessing import frustum_points, voxel_grid, cluster_points
+from pointpillars import PillarConfig
 
 
 
@@ -16,32 +15,48 @@ from preprocessing import BEVConfig, bev_map, frustum_points, voxel_grid, cluste
 
 
 def visualize_bev(sample: StereoSample, cmap: str = "inferno") -> None:
-    """Show BEV map with optional object outlines and points."""
-    cfg = BEVConfig()
-    bev = bev_map(sample, config=cfg)
-    # Normalize for visualization
-    bev_vis = bev.copy()
-    for c in range(bev_vis.shape[0]):
-        bev_vis[c] = (bev_vis[c] - bev_vis[c].min()) / (bev_vis[c].max() - bev_vis[c].min() + 1e-6)
-    grid_img = make_grid(torch.from_numpy(bev_vis), nrow=1, normalize=False).permute(1, 2, 0).numpy()
-    plt.imshow(grid_img)
-    # Overlay boxes if present
-    if sample.boxes_3d is not None and len(sample.boxes_3d) > 0:
-        for b in sample.boxes_3d:
-            l, w = b[7], b[8]
+    """Show a top-down LiDAR density BEV with the GT box outlines on top.
+
+    The grid (x/y range, resolution) is taken from :class:`PillarConfig` so the
+    picture is aligned with the LiDAR/camera BEV branches. Boxes are drawn from
+    ``boxes_3d_ego`` — the ego-frame copy that matches the grid; ``boxes_3d`` is
+    in the global frame and would land in the wrong cells here.
+    """
+    cfg = PillarConfig()
+    x_min, x_max = cfg.x_range
+    y_min, y_max = cfg.y_range
+    res = cfg.pillar_size
+    nx, ny = cfg.grid_size
+
+    # Point density per cell (ix along x/forward, iy along y/lateral).
+    grid = np.zeros((nx, ny), dtype=np.float32)
+    pts = sample.lidar_xyz
+    if pts.shape[0]:
+        m = (pts[:, 0] >= x_min) & (pts[:, 0] < x_max) & (pts[:, 1] >= y_min) & (pts[:, 1] < y_max)
+        p = pts[m]
+        ix = ((p[:, 0] - x_min) / res).astype(np.int64)
+        iy = ((p[:, 1] - y_min) / res).astype(np.int64)
+        np.add.at(grid, (ix, iy), 1.0)
+
+    plt.figure(figsize=(6, 8))
+    # extent lets us plot boxes directly in metres; origin="lower" -> x up, y right.
+    plt.imshow(np.log1p(grid), origin="lower", cmap=cmap,
+               extent=[y_min, y_max, x_min, x_max], aspect="auto")
+    boxes = sample.boxes_3d_ego
+    if boxes is not None and len(boxes) > 0:
+        for b in boxes:
+            cx, cy, l, w = b[0], b[1], b[7], b[8]
             qw, qx, qy, qz = b[3], b[4], b[5], b[6]
             heading = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-            # Draw box edges properly transformed to pixel coords
-            cx, cy = b[0], b[1]
             cos_h, sin_h = np.cos(heading), np.sin(heading)
-            dx = np.array([l/2, l/2, -l/2, -l/2, l/2])
-            dy = np.array([w/2, -w/2, -w/2, w/2, w/2])
-            x_corners = cx + dx * cos_h - dy * sin_h
-            y_corners = cy + dx * sin_h + dy * cos_h
-            px = (x_corners - cfg.x_range[0]) / cfg.resolution
-            py = (y_corners - cfg.y_range[0]) / cfg.resolution
-            plt.plot(px, py, 'r-', lw=1)
-    plt.title("BEV Map")
+            dx = np.array([l / 2, l / 2, -l / 2, -l / 2, l / 2])
+            dy = np.array([w / 2, -w / 2, -w / 2, w / 2, w / 2])
+            xs = cx + dx * cos_h - dy * sin_h
+            ys = cy + dx * sin_h + dy * cos_h
+            plt.plot(ys, xs, "r-", lw=1)  # (lateral, forward) to match extent
+    plt.xlabel("Y lateral (m)")
+    plt.ylabel("X forward (m)")
+    plt.title("LiDAR density BEV + GT boxes (ego frame)")
     plt.show()
 
 def visualize_frustum(sample: StereoSample, box_index: int = 0) -> None:
