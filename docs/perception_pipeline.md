@@ -226,3 +226,101 @@ The fan-shaped BEV footprint (single forward-camera FOV cone, centred on `y = 0`
 - Hirschmüller, H. (2008). *Stereo Processing by Semi-Global Matching and Mutual Information.* (SGBM)
 - Philion, J., & Fidler, S. (2020). *Lift, Splat, Shoot: Encoding Images from Arbitrary Camera Rigs by Implicitly Unprojecting to 3D.*
 - Lang, A. H., et al. (2019). *PointPillars: Fast Encoders for Object Detection from Point Clouds.*
+
+---
+
+## 5. StereoBEV — Grounded Stereo-Depth Splat Branch (`stereobev.py` + `preprocessing.py`)
+
+The StereoBEV branch is the **camera branch for Pipelines A and C** (design doc §07). It is structurally identical to MonoBEV but replaces the *predicted* depth distribution with a **hard, metric depth** from the SGBM stereo matcher — grounding the splat in real geometry.
+
+> **Key difference from MonoBEV:** MonoBEV predicts a soft distribution over D depth bins (outer product → frustum cloud of `H'×W'×D` points). StereoBEV has *one* depth value per pixel (no D dimension, no outer product) — the SGBM disparity is converted to metric depth and used directly to back-project each feature pixel into the ego frame.
+
+### 5.1 Configuration (`StereoBEVConfig`)
+
+| Field | Default | Description |
+|---|---|---|
+| `x_range` | `(0, 50)` m | Forward extent — must match `PillarConfig` |
+| `y_range` | `(-20, 20)` m | Lateral extent |
+| `bev_res_m` | `0.25` m | Metres per BEV cell |
+| `img_backbone_out` | `256` | Channels from the shared backbone |
+| `context_channels` | `64` | C — feature depth splatted to BEV |
+| `min_depth_m` | `0.5` m | Depth gate (invalid pixels set to 0) |
+| `max_depth_m` | `80.0` m | Far-range cutoff |
+| `img_h / img_w` | `192 / 640` | Backbone input resolution |
+
+### 5.2 Pipeline
+
+```
+left-rectified image  depth map (SGBM)
+        │                    │
+   [Backbone 1/8×]           │
+        │                    │
+ [Context head]    [Downsample to H'×W']
+        │  (B,C,H',W')       │  (B,1,H',W')
+        └──────────┬──────────┘
+                   │
+         [Back-project to ego XYZ]
+         ray = K_small⁻¹ · [u,v,1]ᵀ
+         X_cam = depth · ray
+         X_ego = R_cam2ego · X_cam + t
+                   │
+               (B, N, 3)  features (B, N, C)
+                   │
+            [Splat — sort+cumsum]
+                   │
+              (B, C, nx, ny)
+                   │
+           [BEV Backbone 2D]
+                   │
+              (B, C, nx, ny)  ← pixel-aligned with LiDAR BEV
+```
+
+**Step by step:**
+
+1. **SGBM depth** — `stereo_depth(sample)` rectifies the pair, runs the SGBM matcher, and returns a `StereoDepth` object containing `depth` (metric, rectified-left frame) and `rect_left` (the rectified left image).
+2. **Resize** — the rectified image and depth map are resized to `target_hw=(192, 640)`.
+3. **Intrinsics scaling** — the rectified `P1[:3,:3]` (not the raw `left_intrinsics`) is used and scaled to the target resolution. Using `P1` is important: it already accounts for the rectification rotation so the rays are computed in the **rectified** camera frame where the depth values are valid.
+4. **Extrinsics** — the rectified-left → ego transform is `T_left2ego @ R1ᵀ` (a 4×4). `R1` from `stereoRectify` rotates the original-left camera frame into the rectified frame; its transpose undoes that rotation so the final transform maps rectified-left points to ego.
+5. **Backbone + context head** — same `_EfficientNetBackbone` (stride 8×) and context-head architecture as MonoBEV (shared code). No depth head, no outer product.
+6. **Grounded back-projection** (`_build_grounded_frustum`) — for each of the `N = H'×W'` backbone pixels:
+   ```
+   ray   = K_small⁻¹ · [u + 0.5, v + 0.5, 1]ᵀ    # sub-pixel centred
+   X_cam = depth_small[v, u] · ray                  # hard metric depth
+   X_ego = R · X_cam + t                            # rectified-left → ego
+   ```
+   Pixels with `depth = 0` (SGBM invalid) yield `X_cam = 0`; their features are zeroed out before the splat so they contribute nothing.
+7. **Splat** — identical sort+cumsum sum-pooling from `monobev.splat`. O(M log M), fully vectorised.
+8. **BEV backbone** — same `BEVBackbone2D` refinement step.
+
+### 5.3 Module hierarchy
+
+| Layer | Location | Role |
+|---|---|---|
+| `StereoBEVConfig` | `stereobev.py` | All hyper-parameters |
+| `_build_grounded_frustum` | `stereobev.py` | Back-projection kernel |
+| `StereoBEV` | `stereobev.py` | Core `nn.Module` (backbone → context → lift → splat → BEV CNN) |
+| `StereoBEVBranch` | `preprocessing.py` | End-to-end interface: takes a `StereoSample`, runs SGBM, preps tensors, calls `StereoBEV` |
+| `_stereo_bev` | `preprocessing.py` | Demo helper (instantiates `StereoBEVBranch`) |
+
+### 5.4 Comparison: the three BEV branches
+
+| | **LiDAR (PointPillars)** | **MonoBEV** | **StereoBEV** |
+|---|---|---|---|
+| Input | Raw point cloud | Left RGB image | Left+right RGB images |
+| Depth source | Measured (LiDAR) | Predicted (softmax over D bins) | Measured (SGBM disparity) |
+| Frustum size | — | `H'×W'×D` | `H'×W'` (no D dimension) |
+| Output channels | 128 (after backbone) | 64 | 64 |
+| Trained component | PFN + backbone | Full network | Backbone + context head |
+| BEV type | Geometric + learned | Learned | Learned (grounded depth) |
+| Untrained appearance | Meaningful geometry | Depth-bin stripes | Structured (follows stereo depth) |
+
+### 5.5 Expected behaviour before training
+
+The untrained `StereoBEV` produces non-trivial BEV features because the **depth is grounded**: even random context features get placed at geometrically correct ego-frame positions. The BEV will show the forward camera FOV cone (same as the geometric stereo BEV) with random but spatially structured feature values. After training, the context features will become semantically meaningful and the BEV will concentrate signal at object locations.
+
+### References
+
+- Hirschmüller, H. (2008). *Stereo Processing by Semi-Global Matching and Mutual Information.* (SGBM)
+- Philion, J., & Fidler, S. (2020). *Lift, Splat, Shoot: Encoding Images from Arbitrary Camera Rigs by Implicitly Unprojecting to 3D.*
+- Lang, A. H., et al. (2019). *PointPillars: Fast Encoders for Object Detection from Point Clouds.*
+- Liu, Z., et al. (2023). *BEVFusion: Multi-Task Multi-Sensor Fusion with Unified BEV Representation.* ICRA.

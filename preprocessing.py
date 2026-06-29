@@ -45,6 +45,8 @@ from matplotlib import streamplot
 from data import Calibration, StereoSample
 from monobev import MonoBEVConfig, _EfficientNetBackbone, build_frustum_points, splat
 from pointpillars import PillarConfig, pillarize, PillarFeatureNet, PointPillarsScatter, BEVBackbone2D
+from stereo import StereoSGBMConfig
+from stereobev import StereoBEVConfig, StereoBEV
 
 # Helpers for preprocessing
 
@@ -237,6 +239,106 @@ class MonoBEV(nn.Module):
         bev = self.bev_backbone(bev)                           # (B, C, nx, ny)
 
         return bev
+
+
+# Stereo BEV (splat)
+
+class StereoBEVBranch(nn.Module):
+    """End-to-end module: stereo image pair → BEV camera feature map.
+
+    Mirrors the structure of :class:`PointPillarsBranch` and :class:`MonoBEV`
+    but uses a **grounded stereo-depth splat** instead of a predicted depth
+    distribution:
+
+    1. Compute SGBM stereo depth (rectified frame) from the image pair.
+    2. Resize the rectified left image + depth to the backbone input resolution.
+    3. Scale intrinsics (from the rectified ``P1``) to the new resolution.
+    4. Build the rectified-left → ego extrinsic (``T_left2ego @ R1^T``).
+    5. Run :class:`~stereobev.StereoBEV` — backbone → context head →
+       grounded back-projection → BEV splat → BEV CNN refinement.
+
+    The output ``(C, nx, ny)`` tensor is pixel-aligned with
+    :class:`PointPillarsBranch` and :class:`MonoBEV` outputs.
+
+    Args
+    ----
+    cfg        : :class:`~stereobev.StereoBEVConfig` (defaults when ``None``).
+    sgbm_cfg   : :class:`~stereo.StereoSGBMConfig`  (defaults when ``None``).
+    target_hw  : ``(H, W)`` to resize images to before the backbone.
+    """
+
+    def __init__(
+        self,
+        cfg:       Optional[StereoBEVConfig]  = None,
+        sgbm_cfg:  Optional[StereoSGBMConfig] = None,
+        target_hw: Tuple[int, int] = (192, 640),
+    ):
+        super().__init__()
+        self.cfg      = cfg or StereoBEVConfig()
+        self.sgbm_cfg = sgbm_cfg           # None = stereo_depth uses its defaults
+        self.target_hw = target_hw
+        self.model    = StereoBEV(self.cfg)
+
+    def forward(
+        self,
+        sample: "StereoSample",
+        device: torch.device = torch.device("cpu"),
+    ) -> torch.Tensor:
+        """Run the full stereo BEV branch on one sample.
+
+        Parameters
+        ----------
+        sample : :class:`~data.StereoSample` with ``image_left``,
+                 ``image_right``, and ``calibration``.
+        device : Target torch device.
+
+        Returns
+        -------
+        bev : (C, nx, ny) float32 tensor on *device*.
+        """
+        import torchvision.transforms.functional as TF
+        import torch.nn.functional as _F
+        from stereo import stereo_depth as _stereo_depth
+
+        target_h, target_w = self.target_hw
+
+        # 1. stereo depth (rectified frame)
+        sd       = _stereo_depth(sample, self.sgbm_cfg)
+        img_np   = sd.rect_left          # (H, W, 3) uint8, rectified-left
+        depth_np = sd.depth              # (H, W) float32, 0 = invalid
+        img_h, img_w = img_np.shape[:2]
+
+        # 2. image → normalised tensor
+        img_t = TF.to_tensor(img_np)
+        img_t = TF.resize(img_t, [target_h, target_w])
+        img_t = TF.normalize(img_t,
+                             mean=[0.485, 0.456, 0.406],
+                             std =[0.229, 0.224, 0.225])
+        img_batch = img_t.unsqueeze(0).to(device)              # (1, 3, H, W)
+
+        # 3. depth → tensor, resize
+        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0)
+        depth_t = _F.interpolate(depth_t, size=(target_h, target_w), mode="nearest")
+        depth_batch = depth_t.to(device)                       # (1, 1, H, W)
+
+        # 4. intrinsics: rectified P1[:3,:3], scaled to target resolution
+        K_np = sd.rect.P1[:3, :3].astype(np.float32)
+        K_np[0] *= target_w / img_w   # fx, cx
+        K_np[1] *= target_h / img_h   # fy, cy
+        K = torch.from_numpy(K_np).to(device)                  # (3, 3)
+
+        # 5. extrinsic: rectified-left → ego  (T_left2ego @ R1^T)
+        R1T_4x4 = np.eye(4)
+        R1T_4x4[:3, :3] = sd.rect.R1.T
+        T_cam2ego = torch.from_numpy(
+            (sample.calibration.left_to_ego.astype(np.float64) @ R1T_4x4)
+            .astype(np.float32)
+        ).to(device)                                           # (4, 4)
+
+        self.model.to(device).eval()
+        with torch.no_grad():
+            bev = self.model(img_batch, depth_batch, K, T_cam2ego)
+        return bev.squeeze(0)                                  # (C, nx, ny)
 
 
 # 2.  Frustum
@@ -642,25 +744,20 @@ def _camera_bev(
 def _stereo_bev(
     sample,
     device: "torch.device",
+    target_hw=(192, 640),
     x_range=(0.0, 50.0),
     y_range=(-20.0, 20.0),
-    z_range=(-3.0, 1.0),
 ) -> "torch.Tensor":
-    """Run the stereo (cv2.StereoSGBM) branch on one StereoSample.
-
-    Computes SGBM disparity → metric depth → ego point cloud → geometric BEV,
-    pixel-aligned with the LiDAR and camera BEVs.
+    """Run the :class:`StereoBEVBranch` on one StereoSample.
 
     Returns
     -------
-    bev : (C, nx, ny) float32 tensor on *device* (C=7: occ, density, max/mean
-          height, mean RGB).
+    bev : (C, nx, ny) float32 tensor on *device*, pixel-aligned with the
+          LiDAR and MonoBEV camera BEVs.
     """
-    from stereo import stereo_bev, StereoBEVConfig
-
-    bcfg = StereoBEVConfig(x_range=x_range, y_range=y_range, z_range=z_range)
-    bev  = stereo_bev(sample, bev_cfg=bcfg)          # (C, nx, ny) numpy
-    return torch.from_numpy(bev).to(device)
+    cfg    = StereoBEVConfig(x_range=x_range, y_range=y_range)
+    branch = StereoBEVBranch(cfg=cfg, target_hw=target_hw)
+    return branch(sample, device)
 
 
 def _print_bev_stats(name: str, bev: "np.ndarray") -> None:
@@ -670,9 +767,10 @@ def _print_bev_stats(name: str, bev: "np.ndarray") -> None:
           f"  non-zero={nonzero:.1f}%")
 
 
-#: Human-readable names for the geometric stereo-BEV channels (see stereo.stereo_bev).
-_STEREO_CH_NAMES = ("occupancy", "log-density", "max-height", "mean-height",
-                    "mean-R", "mean-G", "mean-B")
+#: The StereoBEV outputs *learned* feature channels (not geometric ones).
+#: Labels shown in the comparison plot are generic feature indices.
+def _stereo_ch_label(ch: int) -> str:
+    return f"feat ch={ch}"
 
 
 def _plot_bev_comparison(
@@ -682,7 +780,7 @@ def _plot_bev_comparison(
     title: str,
     bev_stereo: "Optional[np.ndarray]" = None,
     channels=(0, 8, 16, 32),
-    stereo_channels=(0, 1, 2, 3),
+    stereo_channels=(1, 2, 4, 8),
     save_path: str = "monobev_test_output.png",
 ) -> None:
     """Camera image + per-branch BEV channels, one row per branch.
@@ -727,9 +825,8 @@ def _plot_bev_comparison(
     if bev_stereo is not None:
         for col, ch in enumerate(stereo_channels):
             ch_s = min(ch, bev_stereo.shape[0] - 1)
-            name = _STEREO_CH_NAMES[ch_s] if ch_s < len(_STEREO_CH_NAMES) else f"ch={ch_s}"
             _panel(fig.add_subplot(gs[3, col]),
-                   bev_stereo[ch_s], f"Stereo BEV {name}", "turbo")
+                   bev_stereo[ch_s], f"Stereo BEV {_stereo_ch_label(ch_s)}", "turbo")
 
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     print(f"\nFigure saved → {save_path}")
@@ -764,6 +861,6 @@ if __name__ == "__main__":
         bev_camera = bev_cam_np,
         bev_lidar  = bev_lid_np,
         bev_stereo = bev_ste_np,
-        title      = f"MonoBEV + PointPillars + Stereo  |  {sample.dataset}  iter={sample.iteration}",
+        title      = f"MonoBEV + PointPillars + StereoBEV (grounded splat)  |  {sample.dataset}  iter={sample.iteration}",
     )
 

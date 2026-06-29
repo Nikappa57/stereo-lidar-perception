@@ -67,7 +67,10 @@ The `py123d` Scene API allows access to frame-by-frame data. Key methods include
 
 ### Preprocessing (`preprocessing.py`)
 The preprocessing module is responsible for transforming raw stereo and LiDAR data into structured representations:
-- **Bird's-Eye-View (BEV):** Density and height maps from LiDAR (PointPillars branch) and monocular camera features (MonoBEV branch) projected onto the same pixel-aligned 2D grid.
+- **Bird's-Eye-View (BEV):** Three pixel-aligned BEV branches on the same grid:
+  - **LiDAR BEV** — PointPillars (pillarize → PFN → scatter → BEV backbone).
+  - **Camera BEV (MonoBEV)** — Lift-Splat-Shoot from a single RGB image with a *predicted* depth distribution.
+  - **Stereo BEV (StereoBEV)** — Lift-Splat from the left-rectified image with a *grounded* SGBM depth map; the camera branch for Pipelines A & C.
 - **Camera Frustum:** Extracts LiDAR returns that fall inside a 2D camera detection box, lifted into a local frustum frame, optionally with RGB colors appended.
 - **Voxel Grid:** Builds a volumetric occupancy and feature grid from the ego-frame point cloud. Includes features like mean height, point density, and intensity.
 - **Clustering:** Euclidean-distance DBSCAN clustering of the point cloud, providing per-point labels and cluster statistics (centroids, extents).
@@ -85,11 +88,29 @@ The camera branch implements the **Lift-Splat-Shoot** paradigm to produce a BEV 
 2. **Depth head** predicts a softmax distribution over D=41 depth bins per pixel.
 3. **Context head** predicts a C=64 semantic feature vector per pixel.
 4. **Outer product** — `context ⊗ depth_dist` — weights each depth bin's feature by its predicted probability, building a `H'×W'×D` frustum cloud.
-5. **Lift to 3D:** Every frustum point is unprojected to ego frame via `K⁻¹` (LAPACK, CPU) and the camera-to-ego extrinsic `T_cam2ego`.
-6. **Voxel pooling (Splat):** Frustum features are sum-pooled into BEV cells using the sort + cumulative-sum boundary trick — O(M log M), fully vectorised, no Python loops.
+5. **Lift to 3D:** Every frustum point is unprojected to ego frame via `K⁻¹` and the camera-to-ego extrinsic `T_cam2ego`.
+6. **Voxel pooling (Splat):** Frustum features are sum-pooled into BEV cells using the sort + cumulative-sum boundary trick — O(M log M), fully vectorised.
 7. **BEV Backbone 2D** refines the splatted map.
 
 **Output:** `(B, C, nx, ny)` aligned with the LiDAR BEV and ready for channel-wise fusion.
+
+### StereoBEV — Grounded Stereo-Depth Branch (`stereobev.py` + `preprocessing.py`)
+ Structurally identical to MonoBEV but uses **grounded SGBM metric depth** instead of a predicted depth distribution — no outer product, no depth-bin dimension:
+1. Compute metric depth via SGBM (`stereo.stereo_depth`) in the rectified-left frame.
+2. Resize rectified left image + depth map to the backbone input resolution.
+3. Scale the rectified intrinsics (`P1[:3,:3]`) and build the rectified-left → ego extrinsic (`T_left2ego @ R1ᵀ`).
+4. **Shared CNN backbone** (same `_EfficientNetBackbone`) + **context head** → `(B, C, H', W')`.
+5. **Grounded back-projection** (`_build_grounded_frustum`): each pixel ray is scaled by its SGBM depth directly; pixels with invalid depth (0) are masked out.
+6. **Splat** — same sort+cumsum pooling from `monobev.splat`.
+7. **BEV Backbone 2D** refinement.
+
+**Output:** `(B, C, nx, ny)` with `C=64`, pixel-aligned with the LiDAR and MonoBEV BEVs.
+
+| | LiDAR BEV | MonoBEV | StereoBEV |
+|---|---|---|---|
+| Depth source | measured | predicted | measured (stereo) |
+| Frustum | — | `H'×W'×D` | `H'×W'` |
+| Output ch | 128 | 64 | 64 |
 
 ### Stereo — Depth Branch (`stereo.py`)
 The stereo branch turns the raw left/right image pair into metric geometry with classic block matching (no learning):
@@ -106,8 +127,10 @@ The stereo branch turns the raw left/right image pair into metric geometry with 
 ### Quick start — running all branches
 
 ```python
-from preprocessing import _lidar_bev, _camera_bev, _stereo_bev, _print_bev_stats
-from stereo import stereo_depth
+from preprocessing import (
+    PointPillarsBranch, MonoBEV, StereoBEVBranch,
+    _lidar_bev, _camera_bev, _stereo_bev, _print_bev_stats,
+)
 from data import Py123dDataset
 import torch
 
@@ -115,14 +138,15 @@ dataset = Py123dDataset(split_names=["av2-sensor_val"])
 sample  = dataset[0].to_stereo_sample()
 device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-bev_lidar  = _lidar_bev(sample, device)   # (128, 200, 160) LiDAR BEV
-bev_camera = _camera_bev(sample, device)  # ( 64, 200, 160) Camera BEV
-bev_stereo = _stereo_bev(sample, device)  # (  7, 200, 160) Stereo BEV
-
-sd = stereo_depth(sample)                 # SGBM disparity + metric depth
-print(f"stereo depth valid={float((sd.depth>0).mean())*100:.1f}%")
+bev_lidar  = _lidar_bev(sample, device)   # (128, 200, 160)  LiDAR BEV
+bev_camera = _camera_bev(sample, device)  # ( 64, 200, 160)  MonoBEV camera BEV
+bev_stereo = _stereo_bev(sample, device)  # ( 64, 200, 160)  StereoBEV camera BEV
 
 _print_bev_stats("LiDAR BEV",  bev_lidar.cpu().numpy())
 _print_bev_stats("Camera BEV", bev_camera.cpu().numpy())
 _print_bev_stats("Stereo BEV", bev_stereo.cpu().numpy())
 ```
+
+All three tensors share the same `(nx=200, ny=160)` spatial grid at 0.25 m/cell, covering `x∈[0,50] m` forward and `y∈[-20,20] m` lateral — ready for channel-wise concatenation in Pipeline A or cross-attention fusion in Pipeline C.
+
+> **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for full step-by-step explanations with equations and implementation notes.
