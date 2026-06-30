@@ -53,8 +53,21 @@ LIDAR_BEV_CHANNELS: int = 128  # C_lidar — PointPillars BEVBackbone2D output
 FUSED_CHANNELS: int = 128  # fused feature depth fed to the head
 
 # --------------------------------------------------------------------------- #
-# Classes (design doc §05) — placeholder until the class filter pins the set
+# Classes (design doc §05)
 # --------------------------------------------------------------------------- #
-CLASSES: tuple[str,
-               ...] = ("REGULAR_VEHICLE", "PEDESTRIAN", "CONSTRUCTION_CONE")
+# The py123d loader emits a *unified* taxonomy (VEHICLE / PERSON / BARRIER /
+# TWO_WHEELER / TRAFFIC_CONE / TRAFFIC_SIGN / OTHER / ANIMAL), coarser than the
+# AV2 raw names. We train on the 3-class design subset: VEHICLE (stability),
+# PERSON, and TRAFFIC_CONE — the small-object cone that is the Formula Student
+# transfer target. Everything else maps to the ignore bucket (index None).
+CLASSES: tuple[str, ...] = ("VEHICLE", "PERSON", "TRAFFIC_CONE")
 NUM_CLASSES: int = len(CLASSES)
+
+# Loader label -> training class index. Labels absent here are ignored (not a
+# negative, not a positive — dropped before encoding/loss).
+CLASS_REMAP: dict[str, int] = {name: i for i, name in enumerate(CLASSES)}
+
+
+def class_index(label: str) -> int | None:
+    """Map a loader label to its training class index, or ``None`` to ignore it."""
+    return CLASS_REMAP.get(label)
