@@ -19,25 +19,22 @@ def test_encoder_decoder_consistency():
     sample = dataset[0].to_stereo_sample()
 
     boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)  # (N, 10)
-    label_strs = sample.boxes_3d_labels
 
-    # The loader's taxonomy (VEHICLE/PERSON/TWO_WHEELER/BARRIER/…) differs from
-    # globals.CLASSES, and the official subset is still an open decision, so we
-    # build the label→index map from the labels actually present in the frame.
-    names = sorted(set(label_strs))
-    name_to_idx = {n: i for i, n in enumerate(names)}
-    labels = torch.tensor([name_to_idx[n] for n in label_strs], dtype=torch.long)
-
-    # Keep only boxes whose centre is inside the BEV grid — the only ones the
-    # encoder rasterises (legitimate labels also sit behind/beside the crop).
+    # Map loader labels to training class indices; drop ignored classes (None)
+    # and boxes whose centre is outside the BEV grid — the encoder rasterises
+    # neither (legitimate labels also sit behind/beside the crop).
+    idx = [G.class_index(l) for l in sample.boxes_3d_labels]
     x, y = boxes[:, 0], boxes[:, 1]
     inside = ((x >= G.X_RANGE[0]) & (x < G.X_RANGE[1]) &
               (y >= G.Y_RANGE[0]) & (y < G.Y_RANGE[1]))
-    boxes, labels = boxes[inside], labels[inside]
-    assert len(boxes) > 0, "no GT boxes inside the BEV grid for this frame"
+    keep = torch.tensor([c is not None for c in idx]) & inside
+    boxes = boxes[keep]
+    labels = torch.tensor([c for c, k in zip(idx, keep.tolist()) if k],
+                          dtype=torch.long)
+    assert len(boxes) > 0, "no kept GT boxes inside the BEV grid for this frame"
 
     # 2. Encoder: GT -> heatmap + offset
-    encoder = TargetEncoder(num_classes=len(names))
+    encoder = TargetEncoder(num_classes=G.NUM_CLASSES)
     heatmap, offset = encoder.encode(boxes, labels)
 
     # 3. Decoder: heatmap -> predictions
