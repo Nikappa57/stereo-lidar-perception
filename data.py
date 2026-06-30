@@ -67,10 +67,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.spatial import cKDTree
-
-import globals as G
-
 from py123d.api import SceneAPI, SceneFilter, get_filtered_scenes
 from py123d.common.runtime import DatasetPaths, setup_dataset_paths
 from py123d.datatypes.detections import BoxDetectionsSE3
@@ -78,11 +74,13 @@ from py123d.datatypes.sensors import Camera, CameraID, Lidar, LidarID
 from py123d.datatypes.time import Timestamp
 from py123d.datatypes.vehicle_state import EgoStateSE3
 from py123d.geometry.geometry_index import BoundingBoxSE3Index
-from py123d.geometry.transform import abs_to_rel_se3_array, rel_to_abs_points_3d_array
+from py123d.geometry.transform import (abs_to_rel_se3_array,
+                                       rel_to_abs_points_3d_array)
 from py123d.geometry.utils.bounding_box_utils import (
-    bbse3_array_to_corners_array,
-    points_3d_in_bbse3_array,
-)
+    bbse3_array_to_corners_array, points_3d_in_bbse3_array)
+from scipy.spatial import cKDTree
+
+import globals as G
 
 # Repo-local fallback: ``data/`` holds the converted ``logs/``, the original
 # ``sensor/`` blobs, and ``preprocessed/`` outputs, so it can serve as every
@@ -123,7 +121,8 @@ def configure_dataset_paths(data_root: str | Path | None = None) -> Path:
     look up sensor locations through the process-global dataset paths. It is
     invoked automatically by :class:`Py123dDataset`.
     """
-    resolved = Path(data_root or os.environ.get("PY123D_DATA_ROOT") or DEFAULT_DATA_ROOT).resolve()
+    resolved = Path(data_root or os.environ.get("PY123D_DATA_ROOT")
+                    or DEFAULT_DATA_ROOT).resolve()
 
     os.environ["PY123D_DATA_ROOT"] = str(resolved)
     for env_var in _DATASET_ROOT_ENV_VARS:
@@ -151,14 +150,16 @@ def _intrinsics_matrix(intrinsics) -> np.ndarray:
     values = np.asarray(intrinsics, dtype=np.float64).ravel()
     fx, fy, cx, cy = values[0], values[1], values[2], values[3]
     skew = values[4] if values.size > 4 else 0.0
-    return np.array([[fx, skew, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return np.array([[fx, skew, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                    dtype=np.float64)
 
 
 def _boxes_to_array(boxes: BoxDetectionsSE3 | None) -> np.ndarray:
     """Stack box poses+dims into ``(N, 10)`` (``BoundingBoxSE3Index``), global frame."""
     if boxes is None or not boxes.box_detections:
         return np.zeros((0, 10), dtype=np.float64)
-    return np.stack([d.bounding_box_se3.array for d in boxes.box_detections]).astype(np.float64)
+    return np.stack([d.bounding_box_se3.array
+                     for d in boxes.box_detections]).astype(np.float64)
 
 
 # Generous bound on how far a real label can sit from the ego vehicle, in
@@ -196,12 +197,12 @@ def boxes_global_to_ego(boxes_global: np.ndarray, ego_origin) -> np.ndarray:
     # SE3 == (x, y, z, qw, qx, qy, qz); same layout as PoseSE3Index, so the pose
     # transform applies directly. EXTENT (l, w, h) is left untouched.
     boxes_ego[:, BoundingBoxSE3Index.SE3] = abs_to_rel_se3_array(
-        ego_origin, boxes_global[:, BoundingBoxSE3Index.SE3]
-    )
+        ego_origin, boxes_global[:, BoundingBoxSE3Index.SE3])
     return boxes_ego
 
 
-def assert_boxes_in_sensor_range(boxes_ego: np.ndarray, max_radius_m: float = SENSOR_RANGE_M) -> None:
+def assert_boxes_in_sensor_range(boxes_ego: np.ndarray,
+                                 max_radius_m: float = SENSOR_RANGE_M) -> None:
     """Frame-mismatch guard: assert ego-frame box centres are sensor-scale.
 
     Cheap tripwire against silently feeding *global*-frame boxes where ego-frame
@@ -235,9 +236,11 @@ def _project_boxes_2d(camera: Camera, boxes_array: np.ndarray):
         dropped.
     """
     if boxes_array.shape[0] == 0:
-        return np.zeros((0, 4), dtype=np.float64), np.zeros((0,), dtype=np.int64)
+        return np.zeros((0, 4), dtype=np.float64), np.zeros((0, ),
+                                                            dtype=np.int64)
 
-    corners_global = bbse3_array_to_corners_array(boxes_array).reshape(-1, 3)  # (N*8, 3)
+    corners_global = bbse3_array_to_corners_array(boxes_array).reshape(
+        -1, 3)  # (N*8, 3)
     pixels, in_fov, depth = camera.project_points_global(corners_global)
     pixels = pixels.reshape(-1, 8, 2)
     in_fov = in_fov.reshape(-1, 8)
@@ -263,12 +266,12 @@ def _project_boxes_2d(camera: Camera, boxes_array: np.ndarray):
                     np.clip(y_max, 0, height),
                 ],
                 dtype=np.float64,
-            )
-        )
+            ))
         indices.append(i)
 
     if not boxes_2d:
-        return np.zeros((0, 4), dtype=np.float64), np.zeros((0,), dtype=np.int64)
+        return np.zeros((0, 4), dtype=np.float64), np.zeros((0, ),
+                                                            dtype=np.int64)
     return np.stack(boxes_2d), np.asarray(indices, dtype=np.int64)
 
 
@@ -311,7 +314,8 @@ class StereoSample:
     image_left: np.ndarray
     image_right: np.ndarray
     lidar_xyz: np.ndarray
-    lidar_features: dict[str, np.ndarray] | None  # e.g. intensity, channel, timestamps
+    lidar_features: dict[
+        str, np.ndarray] | None  # e.g. intensity, channel, timestamps
 
     # precomputed sparse depth (left image), may be None
     depth_left: np.ndarray | None
@@ -341,8 +345,7 @@ class StereoSample:
             f"StereoSample(dataset={self.dataset!r}, log={self.log_name!r}, "
             f"iter={self.iteration}, boxes_3d={len(self.boxes_3d)}, "
             f"boxes_2d={len(self.boxes_2d_left)}, lidar_pts={len(self.lidar_xyz)}, "
-            f"depth={'yes' if self.depth_left is not None else 'no'})"
-        )
+            f"depth={'yes' if self.depth_left is not None else 'no'})")
 
 
 @dataclass(frozen=True)
@@ -398,9 +401,13 @@ class Frame:
         """Return the :class:`Camera` (image + intrinsics/extrinsics) for ``camera_id``."""
         return self.scene.get_camera_at_iteration(self.iteration, camera_id)
 
-    def cameras(self, camera_ids: Sequence[CameraIdLike] | None = None) -> dict[CameraID, Camera]:
+    def cameras(
+        self,
+        camera_ids: Sequence[CameraIdLike] | None = None
+    ) -> dict[CameraID, Camera]:
         """Return ``{CameraID: Camera}`` for the requested (or all available) cameras."""
-        ids = list(camera_ids) if camera_ids is not None else self.available_camera_ids
+        ids = list(camera_ids
+                   ) if camera_ids is not None else self.available_camera_ids
         out: dict[CameraID, Camera] = {}
         for cid in ids:
             camera = self.camera(cid)
@@ -437,7 +444,8 @@ class Frame:
         """
         if self.depth_root is None:
             return None
-        path = Path(self.depth_root) / self.log_name / f"{self.iteration:05d}.npz"
+        path = Path(
+            self.depth_root) / self.log_name / f"{self.iteration:05d}.npz"
         if not path.exists():
             return None
         with np.load(path) as data:
@@ -464,23 +472,27 @@ class Frame:
             raise ValueError(
                 f"Stereo cameras {left_camera_id!r}/{right_camera_id!r} not available; "
                 f"this scene exposes {available}. Pass left_camera_id/right_camera_id "
-                f"for your dataset's stereo pair."
-            )
+                f"for your dataset's stereo pair.")
 
         lidar = self.lidar(lidar_id)
-        lidar_xyz = lidar.xyz.astype(np.float64) if lidar is not None else np.zeros((0, 3), dtype=np.float64)
+        lidar_xyz = lidar.xyz.astype(
+            np.float64) if lidar is not None else np.zeros(
+                (0, 3), dtype=np.float64)
         lidar_features = lidar.point_cloud_features if lidar is not None else None
 
         boxes = self.boxes()
         boxes_array = _boxes_to_array(boxes)
         detections = boxes.box_detections if boxes is not None else []
-        boxes_labels = [str(getattr(d.attributes.default_label, "name", d.attributes.default_label)) for d in detections]
+        boxes_labels = [
+            str(
+                getattr(d.attributes.default_label, "name",
+                        d.attributes.default_label)) for d in detections
+        ]
         boxes_tokens = [d.attributes.track_token for d in detections]
-        boxes_velocity = (
-            np.stack([np.asarray(d.velocity_3d, dtype=np.float64) for d in detections])
-            if detections
-            else np.zeros((0, 3), dtype=np.float64)
-        )
+        boxes_velocity = (np.stack(
+            [np.asarray(d.velocity_3d, dtype=np.float64)
+             for d in detections]) if detections else np.zeros(
+                 (0, 3), dtype=np.float64))
 
         # 2D boxes: project the 3D (global) boxes into the left image. The 2D
         # projection consumes global boxes, so ``boxes_array`` stays global.
@@ -499,17 +511,20 @@ class Frame:
             boxes_ego = np.zeros((0, 10), dtype=np.float64)
         if lidar_xyz.shape[0] and boxes_array.shape[0] and ego is not None:
             points_global = rel_to_abs_points_3d_array(ego.imu_se3, lidar_xyz)
-            inside = points_3d_in_bbse3_array(points_global.astype(np.float64), boxes_array)  # (N_boxes, P)
+            inside = points_3d_in_bbse3_array(points_global.astype(np.float64),
+                                              boxes_array)  # (N_boxes, P)
             in_any_box = inside.any(axis=0)
         else:
-            in_any_box = np.zeros((lidar_xyz.shape[0],), dtype=bool)
+            in_any_box = np.zeros((lidar_xyz.shape[0], ), dtype=bool)
         points_outside = lidar_xyz[~in_any_box]
 
         # Calibration.
-        ego_to_global = _pose_to_matrix(ego.imu_se3) if ego is not None else np.eye(4)
+        ego_to_global = _pose_to_matrix(
+            ego.imu_se3) if ego is not None else np.eye(4)
         left_to_ego = _pose_to_matrix(left.metadata.camera_to_imu_se3)
         right_to_ego = _pose_to_matrix(right.metadata.camera_to_imu_se3)
-        baseline = float(np.linalg.norm(left_to_ego[:3, 3] - right_to_ego[:3, 3]))
+        baseline = float(
+            np.linalg.norm(left_to_ego[:3, 3] - right_to_ego[:3, 3]))
         calibration = Calibration(
             left_intrinsics=_intrinsics_matrix(left.metadata.intrinsics),
             right_intrinsics=_intrinsics_matrix(right.metadata.intrinsics),
@@ -555,10 +570,8 @@ class Frame:
         return available[0]
 
     def __repr__(self) -> str:
-        return (
-            f"Frame(dataset={self.dataset!r}, log={self.log_name!r}, "
-            f"scene={self.scene_index}, iter={self.iteration})"
-        )
+        return (f"Frame(dataset={self.dataset!r}, log={self.log_name!r}, "
+                f"scene={self.scene_index}, iter={self.iteration})")
 
 
 class Py123dDataset:
@@ -594,17 +607,21 @@ class Py123dDataset:
         **filter_kwargs,
     ) -> None:
         self.data_root = configure_dataset_paths(data_root)
-        self.depth_root = Path(depth_root) if depth_root is not None else self.data_root / "preprocessed" / "depth_maps"
+        self.depth_root = Path(
+            depth_root
+        ) if depth_root is not None else self.data_root / "preprocessed" / "depth_maps"
 
         if scene_filter is None:
             scene_filter = SceneFilter(
                 datasets=list(datasets) if datasets is not None else None,
-                split_names=list(split_names) if split_names is not None else None,
+                split_names=list(split_names)
+                if split_names is not None else None,
                 **filter_kwargs,
             )
         self.scene_filter = scene_filter
 
-        self.scenes: list[SceneAPI] = get_filtered_scenes(scene_filter, data_root=self.data_root)
+        self.scenes: list[SceneAPI] = get_filtered_scenes(
+            scene_filter, data_root=self.data_root)
         # Flat index: one entry per (scene, iteration) so frames are addressable
         # by a single integer. ``number_of_iterations`` counts current + future.
         self._index: list[tuple[int, int]] = [
@@ -646,10 +663,8 @@ class Py123dDataset:
             yield self._make_frame(scene_index, iteration)
 
     def __repr__(self) -> str:
-        return (
-            f"Py123dDataset(data_root={str(self.data_root)!r}, "
-            f"scenes={self.scene_count}, frames={len(self)})"
-        )
+        return (f"Py123dDataset(data_root={str(self.data_root)!r}, "
+                f"scenes={self.scene_count}, frames={len(self)})")
 
 
 # ===========================================================================
@@ -659,6 +674,7 @@ class Py123dDataset:
 #  (those are the BEV branches in network.py). Operates on a StereoSample.
 # ===========================================================================
 # ===========================================================================
+
 
 # --------------------------------------------------------------------------- #
 # Geometry helpers
@@ -675,7 +691,8 @@ def _ego_to_cam(
               and the 4×4 inverse transform used internally.
     """
     ego_to_cam = np.linalg.inv(cam_to_ego)
-    pts_h = np.hstack([xyz_ego, np.ones((len(xyz_ego), 1), dtype=xyz_ego.dtype)])
+    pts_h = np.hstack(
+        [xyz_ego, np.ones((len(xyz_ego), 1), dtype=xyz_ego.dtype)])
     xyz_cam = (ego_to_cam @ pts_h.T).T[:, :3]
     return xyz_cam, ego_to_cam
 
@@ -690,7 +707,8 @@ def _cam_to_ego(
     :param cam_to_ego: ``(4, 4)`` camera → ego transform (from Calibration).
     :returns: ego-frame points ``(P, 3)``.
     """
-    pts_h = np.hstack([xyz_cam, np.ones((len(xyz_cam), 1), dtype=xyz_cam.dtype)])
+    pts_h = np.hstack(
+        [xyz_cam, np.ones((len(xyz_cam), 1), dtype=xyz_cam.dtype)])
     xyz_ego = (cam_to_ego @ pts_h.T).T[:, :3]
     return xyz_ego
 
@@ -709,14 +727,12 @@ def _project_to_image(
               mask of length P selecting the M valid points.
     """
     in_front = xyz_cam[:, 2] > 0.0
-    depth    = np.where(in_front, xyz_cam[:, 2], 1.0)  # avoid div-by-zero
-    uv       = (K @ xyz_cam.T).T
-    uv       = uv[:, :2] / depth[:, None]
-    valid    = (
-        in_front
-        & (uv[:, 0] >= 0) & (uv[:, 0] < img_w)
-        & (uv[:, 1] >= 0) & (uv[:, 1] < img_h)
-    )
+    depth = np.where(in_front, xyz_cam[:, 2], 1.0)  # avoid div-by-zero
+    uv = (K @ xyz_cam.T).T
+    uv = uv[:, :2] / depth[:, None]
+    valid = (in_front
+             & (uv[:, 0] >= 0) & (uv[:, 0] < img_w)
+             & (uv[:, 1] >= 0) & (uv[:, 1] < img_h))
     return uv, valid
 
 
@@ -733,19 +749,19 @@ class StereoSGBMConfig:
     """
 
     # ---- disparity search (FULL-res pixels; multiple of 16) ----
-    min_disparity:    int = 0
-    num_disparities:  int = 256
-    block_size:       int = 5      # odd, typically 3..11
+    min_disparity: int = 0
+    num_disparities: int = 256
+    block_size: int = 5  # odd, typically 3..11
     # ---- smoothness (P1 < P2) ----
-    p1_factor:        int = 8
-    p2_factor:        int = 32
+    p1_factor: int = 8
+    p2_factor: int = 32
     # ---- post-match consistency / cleanup ----
-    uniqueness_ratio:    int = 10
+    uniqueness_ratio: int = 10
     speckle_window_size: int = 100
-    speckle_range:       int = 2
-    disp12_max_diff:     int = 1
-    pre_filter_cap:      int = 63
-    mode:                int = cv2.STEREO_SGBM_MODE_SGBM_3WAY
+    speckle_range: int = 2
+    disp12_max_diff: int = 1
+    pre_filter_cap: int = 63
+    mode: int = cv2.STEREO_SGBM_MODE_SGBM_3WAY
 
     # ---- depth conversion / filtering ----
     min_depth_m: float = 0.5
@@ -769,11 +785,11 @@ class StereoGeomBEVConfig:
     classic, non-learned stereo BEV only.
     """
 
-    x_range:   tuple[float, float] = G.X_RANGE   # forward
-    y_range:   tuple[float, float] = G.Y_RANGE   # lateral
-    z_range:   tuple[float, float] = G.Z_RANGE   # height pre-filter
-    bev_res_m: float               = G.BEV_RES_M
-    append_rgb: bool               = True         # add mean RGB channels
+    x_range: tuple[float, float] = G.X_RANGE  # forward
+    y_range: tuple[float, float] = G.Y_RANGE  # lateral
+    z_range: tuple[float, float] = G.Z_RANGE  # height pre-filter
+    bev_res_m: float = G.BEV_RES_M
+    append_rgb: bool = True  # add mean RGB channels
 
 
 @dataclass
@@ -785,16 +801,16 @@ class Rectification:
     ``Q`` / ``fx_rect`` always describe the full-res rectified geometry.
     """
 
-    map_lx: np.ndarray            # left  remap x (for cv2.remap)
-    map_ly: np.ndarray            # left  remap y
-    map_rx: np.ndarray            # right remap x
-    map_ry: np.ndarray            # right remap y
-    Q:      np.ndarray            # (4, 4) disparity→3D reprojection matrix
-    R1:     np.ndarray            # (3, 3) rotates original-left cam → rectified-left cam
-    P1:     np.ndarray            # (3, 4) rectified-left projection matrix
-    size:   tuple[int, int]       # (W, H) of the rectified image
-    fx_rect:  float               # rectified focal length (pixels)
-    baseline_m: float             # stereo baseline (metres)
+    map_lx: np.ndarray  # left  remap x (for cv2.remap)
+    map_ly: np.ndarray  # left  remap y
+    map_rx: np.ndarray  # right remap x
+    map_ry: np.ndarray  # right remap y
+    Q: np.ndarray  # (4, 4) disparity→3D reprojection matrix
+    R1: np.ndarray  # (3, 3) rotates original-left cam → rectified-left cam
+    P1: np.ndarray  # (3, 4) rectified-left projection matrix
+    size: tuple[int, int]  # (W, H) of the rectified image
+    fx_rect: float  # rectified focal length (pixels)
+    baseline_m: float  # stereo baseline (metres)
 
 
 def build_rectification(
@@ -817,17 +833,33 @@ def build_rectification(
     T = T_l2r[:3, 3]
 
     R1, R2, P1, P2, Q, _roi1, _roi2 = cv2.stereoRectify(
-        KL, dist, KR, dist, (w, h), R, T,
-        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
+        KL,
+        dist,
+        KR,
+        dist,
+        (w, h),
+        R,
+        T,
+        flags=cv2.CALIB_ZERO_DISPARITY,
+        alpha=0,
     )
 
-    map_lx, map_ly = cv2.initUndistortRectifyMap(KL, dist, R1, P1, (w, h), cv2.CV_32FC1)
-    map_rx, map_ry = cv2.initUndistortRectifyMap(KR, dist, R2, P2, (w, h), cv2.CV_32FC1)
+    map_lx, map_ly = cv2.initUndistortRectifyMap(KL, dist, R1, P1, (w, h),
+                                                 cv2.CV_32FC1)
+    map_rx, map_ry = cv2.initUndistortRectifyMap(KR, dist, R2, P2, (w, h),
+                                                 cv2.CV_32FC1)
 
     return Rectification(
-        map_lx=map_lx, map_ly=map_ly, map_rx=map_rx, map_ry=map_ry,
-        Q=Q, R1=R1, P1=P1, size=(w, h),
-        fx_rect=float(P1[0, 0]), baseline_m=float(calib.stereo_baseline_m),
+        map_lx=map_lx,
+        map_ly=map_ly,
+        map_rx=map_rx,
+        map_ry=map_ry,
+        Q=Q,
+        R1=R1,
+        P1=P1,
+        size=(w, h),
+        fx_rect=float(P1[0, 0]),
+        baseline_m=float(calib.stereo_baseline_m),
     )
 
 
@@ -837,8 +869,8 @@ def _build_matcher(cfg: StereoSGBMConfig) -> "cv2.StereoSGBM":
         minDisparity=cfg.min_disparity,
         numDisparities=cfg.num_disparities,
         blockSize=cfg.block_size,
-        P1=cfg.p1_factor * ch * cfg.block_size ** 2,
-        P2=cfg.p2_factor * ch * cfg.block_size ** 2,
+        P1=cfg.p1_factor * ch * cfg.block_size**2,
+        P2=cfg.p2_factor * ch * cfg.block_size**2,
         disp12MaxDiff=cfg.disp12_max_diff,
         uniquenessRatio=cfg.uniqueness_ratio,
         speckleWindowSize=cfg.speckle_window_size,
@@ -862,18 +894,20 @@ def compute_disparity(
     """
     cfg = cfg or StereoSGBMConfig()
     if rect_left.ndim == 3:
-        gl = cv2.cvtColor(rect_left,  cv2.COLOR_RGB2GRAY)
+        gl = cv2.cvtColor(rect_left, cv2.COLOR_RGB2GRAY)
         gr = cv2.cvtColor(rect_right, cv2.COLOR_RGB2GRAY)
     else:
         gl, gr = rect_left, rect_right
 
     matcher = _build_matcher(cfg)
-    disp = matcher.compute(gl, gr).astype(np.float32) / 16.0  # SGBM fixed-point
+    disp = matcher.compute(gl, gr).astype(
+        np.float32) / 16.0  # SGBM fixed-point
     disp[disp < cfg.min_disparity + 1e-3] = 0.0
     return disp
 
 
-def disparity_to_depth(disp: np.ndarray, fx: float, baseline_m: float) -> np.ndarray:
+def disparity_to_depth(disp: np.ndarray, fx: float,
+                       baseline_m: float) -> np.ndarray:
     """Convert disparity (pixels) to metric depth ``z = fx · baseline / disp``.
 
     Invalid (``disp <= 0``) pixels map to ``0.0``.
@@ -888,11 +922,11 @@ def disparity_to_depth(disp: np.ndarray, fx: float, baseline_m: float) -> np.nda
 class StereoDepth:
     """Bundle returned by :func:`stereo_depth`."""
 
-    depth:        np.ndarray          # (H', W') metric depth, rectified-left frame, 0=invalid
-    disparity:    np.ndarray          # (H', W') disparity, pixels
-    rect_left:    np.ndarray          # (H', W', 3) rectified left image (for colour / debug)
-    rect:         Rectification       # rectification used (carries Q, R1, sizes)
-    depth_left:   np.ndarray          # (H, W) depth re-projected into the ORIGINAL left image
+    depth: np.ndarray  # (H', W') metric depth, rectified-left frame, 0=invalid
+    disparity: np.ndarray  # (H', W') disparity, pixels
+    rect_left: np.ndarray  # (H', W', 3) rectified left image (for colour / debug)
+    rect: Rectification  # rectification used (carries Q, R1, sizes)
+    depth_left: np.ndarray  # (H, W) depth re-projected into the ORIGINAL left image
 
 
 def stereo_depth(
@@ -912,14 +946,24 @@ def stereo_depth(
     rect = build_rectification(sample.calibration, (h, w))
 
     # ---- remap both views into the (full-res) rectified frame ----
-    rect_left  = cv2.remap(sample.image_left,  rect.map_lx, rect.map_ly, cv2.INTER_LINEAR)
-    rect_right = cv2.remap(sample.image_right, rect.map_rx, rect.map_ry, cv2.INTER_LINEAR)
+    rect_left = cv2.remap(sample.image_left, rect.map_lx, rect.map_ly,
+                          cv2.INTER_LINEAR)
+    rect_right = cv2.remap(sample.image_right, rect.map_rx, rect.map_ry,
+                           cv2.INTER_LINEAR)
 
     # ---- disparity (matched on the downscaled pair, scaled back to full res) ----
     s = cfg.downscale
     if s < 1.0:
-        lo = cv2.resize(rect_left,  None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-        ro = cv2.resize(rect_right, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        lo = cv2.resize(rect_left,
+                        None,
+                        fx=s,
+                        fy=s,
+                        interpolation=cv2.INTER_AREA)
+        ro = cv2.resize(rect_right,
+                        None,
+                        fx=s,
+                        fy=s,
+                        interpolation=cv2.INTER_AREA)
         nd = max(16, int(round(cfg.num_disparities * s / 16)) * 16)
         mcfg = replace(cfg, num_disparities=nd)
         disp_s = compute_disparity(lo, ro, mcfg)
@@ -932,10 +976,14 @@ def stereo_depth(
     depth[(depth < cfg.min_depth_m) | (depth > cfg.max_depth_m)] = 0.0
 
     # ---- re-project the dense depth into the ORIGINAL left image ----
-    depth_left = _depth_to_original_left(depth, rect, sample.calibration, (h, w), cfg)
+    depth_left = _depth_to_original_left(depth, rect, sample.calibration,
+                                         (h, w), cfg)
 
     return StereoDepth(
-        depth=depth, disparity=disp, rect_left=rect_left, rect=rect,
+        depth=depth,
+        disparity=disp,
+        rect_left=rect_left,
+        rect=rect,
         depth_left=depth_left,
     )
 
@@ -959,7 +1007,7 @@ def _depth_to_original_left(
         return np.zeros((h, w), dtype=np.float32)
 
     # rectified-left → original-left camera frame
-    xyz_left = (rect.R1.T @ xyz_rect.T).T              # (P, 3)
+    xyz_left = (rect.R1.T @ xyz_rect.T).T  # (P, 3)
     z = xyz_left[:, 2]
     front = z > cfg.min_depth_m
     xyz_left, z = xyz_left[front], z[front]
@@ -993,7 +1041,8 @@ def _reproject_to_3d(
     m = depth_rect > 0
     # invert depth back to disparity for cv2.reprojectImageTo3D (uses Q)
     disp[m] = (rect.fx_rect * rect.baseline_m) / depth_rect[m]
-    xyz = cv2.reprojectImageTo3D(disp.astype(np.float32), rect.Q.astype(np.float32))
+    xyz = cv2.reprojectImageTo3D(disp.astype(np.float32),
+                                 rect.Q.astype(np.float32))
     xyz = xyz.reshape(-1, 3)
     valid = m.reshape(-1) & np.isfinite(xyz).all(axis=1)
     return xyz[valid], valid
@@ -1019,8 +1068,8 @@ def stereo_point_cloud(
 
     # rectified-left → original-left → ego
     xyz_left = (sd.rect.R1.T @ xyz_rect.T).T
-    cam2ego  = sample.calibration.left_to_ego.astype(np.float64)
-    xyz_ego  = (cam2ego[:3, :3] @ xyz_left.T).T + cam2ego[:3, 3]
+    cam2ego = sample.calibration.left_to_ego.astype(np.float64)
+    xyz_ego = (cam2ego[:3, :3] @ xyz_left.T).T + cam2ego[:3, 3]
 
     rgb = sd.rect_left.reshape(-1, 3)[valid]
     return xyz_ego.astype(np.float32), rgb.astype(np.uint8)
@@ -1055,35 +1104,36 @@ def stereo_bev(
 
     nx = int(round((bcfg.x_range[1] - bcfg.x_range[0]) / bcfg.bev_res_m))
     ny = int(round((bcfg.y_range[1] - bcfg.y_range[0]) / bcfg.bev_res_m))
-    C  = 7 if bcfg.append_rgb else 4
+    C = 7 if bcfg.append_rgb else 4
     bev = np.zeros((C, nx, ny), dtype=np.float32)
     if xyz.shape[0] == 0:
         return bev
 
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    m = (
-        (x >= bcfg.x_range[0]) & (x < bcfg.x_range[1]) &
-        (y >= bcfg.y_range[0]) & (y < bcfg.y_range[1]) &
-        (z >= bcfg.z_range[0]) & (z < bcfg.z_range[1])
-    )
+    m = ((x >= bcfg.x_range[0]) & (x < bcfg.x_range[1]) &
+         (y >= bcfg.y_range[0]) & (y < bcfg.y_range[1]) &
+         (z >= bcfg.z_range[0]) & (z < bcfg.z_range[1]))
     x, y, z = x[m], y[m], z[m]
     if x.shape[0] == 0:
         return bev
 
-    ix = ((x - bcfg.x_range[0]) / bcfg.bev_res_m).astype(np.int64).clip(0, nx - 1)
-    iy = ((y - bcfg.y_range[0]) / bcfg.bev_res_m).astype(np.int64).clip(0, ny - 1)
+    ix = ((x - bcfg.x_range[0]) / bcfg.bev_res_m).astype(np.int64).clip(
+        0, nx - 1)
+    iy = ((y - bcfg.y_range[0]) / bcfg.bev_res_m).astype(np.int64).clip(
+        0, ny - 1)
 
-    z_norm = ((z - bcfg.z_range[0]) / (bcfg.z_range[1] - bcfg.z_range[0])).clip(0.0, 1.0)
+    z_norm = ((z - bcfg.z_range[0]) /
+              (bcfg.z_range[1] - bcfg.z_range[0])).clip(0.0, 1.0)
 
     count = np.zeros((nx, ny), dtype=np.float32)
     np.add.at(count, (ix, iy), 1.0)
     occ = count > 0
 
-    bev[0, occ] = 1.0                                   # occupancy
-    bev[1] = np.log1p(count) / np.log1p(count.max())    # log density
+    bev[0, occ] = 1.0  # occupancy
+    bev[1] = np.log1p(count) / np.log1p(count.max())  # log density
 
-    np.maximum.at(bev[2], (ix, iy), z_norm)             # max height
-    np.add.at(bev[3], (ix, iy), z_norm)                 # mean height (sum→/count)
+    np.maximum.at(bev[2], (ix, iy), z_norm)  # max height
+    np.add.at(bev[3], (ix, iy), z_norm)  # mean height (sum→/count)
     bev[3, occ] /= count[occ]
 
     if bcfg.append_rgb:
@@ -1101,17 +1151,17 @@ def stereo_bev(
 @dataclass
 class FrustumConfig:
     """Configuration for :func:`frustum_points`."""
-    append_rgb:         bool  = True    # append left-image RGB to XYZ
-    depth_normalise:    bool  = True    # normalise Z by frustum depth range
-    min_depth_m:        float = 0.5     # discard closer returns
-    max_depth_m:        float = 70.0    # discard farther returns
-    frustum_frame:      bool  = True    # rotate so centroid is at +Z axis
+    append_rgb: bool = True  # append left-image RGB to XYZ
+    depth_normalise: bool = True  # normalise Z by frustum depth range
+    min_depth_m: float = 0.5  # discard closer returns
+    max_depth_m: float = 70.0  # discard farther returns
+    frustum_frame: bool = True  # rotate so centroid is at +Z axis
 
 
 def frustum_points(
-    sample:     StereoSample,
-    box_index:  int = 0,
-    config:     FrustumConfig | None = None,
+    sample: StereoSample,
+    box_index: int = 0,
+    config: FrustumConfig | None = None,
 ) -> np.ndarray:
     """Extract a camera-frustum point cloud for one 2-D detection box.
 
@@ -1126,11 +1176,12 @@ def frustum_points(
               Returns an empty ``(0, D)`` array when no points fall inside.
     :raises IndexError: if ``box_index`` is out of range.
     """
-    cfg  = config or FrustumConfig()
+    cfg = config or FrustumConfig()
     calib = sample.calibration
-    D    = 6 if cfg.append_rgb else 3
+    D = 6 if cfg.append_rgb else 3
 
-    if sample.boxes_2d_left.shape[0] == 0 or box_index >= sample.boxes_2d_left.shape[0]:
+    if sample.boxes_2d_left.shape[
+            0] == 0 or box_index >= sample.boxes_2d_left.shape[0]:
         raise IndexError(
             f"box_index={box_index} but sample has {sample.boxes_2d_left.shape[0]} 2D boxes."
         )
@@ -1147,23 +1198,22 @@ def frustum_points(
     xyz_cam, _ = _ego_to_cam(xyz_ego, calib.left_to_ego)
 
     # --- depth filter ---
-    depth_mask = (xyz_cam[:, 2] >= cfg.min_depth_m) & (xyz_cam[:, 2] <= cfg.max_depth_m)
+    depth_mask = (xyz_cam[:, 2] >= cfg.min_depth_m) & (xyz_cam[:, 2]
+                                                       <= cfg.max_depth_m)
     xyz_cam = xyz_cam[depth_mask]
     xyz_ego = xyz_ego[depth_mask]
 
     # --- project & image-box filter ---
     K = calib.left_intrinsics.astype(np.float32)
     uv, valid = _project_to_image(xyz_cam, K, img_w, img_h)
-    in_box = (
-        valid
-        & (uv[:, 0] >= x1) & (uv[:, 0] <= x2)
-        & (uv[:, 1] >= y1) & (uv[:, 1] <= y2)
-    )
+    in_box = (valid
+              & (uv[:, 0] >= x1) & (uv[:, 0] <= x2)
+              & (uv[:, 1] >= y1) & (uv[:, 1] <= y2))
     if not in_box.any():
         return np.zeros((0, D), dtype=np.float32)
 
-    pts_cam = xyz_cam[in_box]   # (M, 3) camera frame
-    uv_sel  = uv[in_box]        # (M, 2) pixel coords
+    pts_cam = xyz_cam[in_box]  # (M, 3) camera frame
+    uv_sel = uv[in_box]  # (M, 2) pixel coords
 
     # --- optional frustum-local rotation ---
     if cfg.frustum_frame:
@@ -1174,10 +1224,14 @@ def frustum_points(
         s = np.linalg.norm(v)
         c = float(np.dot(centroid_dir, z_axis))
         if s > 1e-6:
-            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float32)
-            R  = np.eye(3, dtype=np.float32) + vx + vx @ vx * ((1 - c) / (s * s))
+            vx = np.array(
+                [[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]],
+                dtype=np.float32)
+            R = np.eye(3, dtype=np.float32) + vx + vx @ vx * ((1 - c) /
+                                                              (s * s))
         else:
-            R = np.eye(3, dtype=np.float32) if c > 0 else -np.eye(3, dtype=np.float32)
+            R = np.eye(
+                3, dtype=np.float32) if c > 0 else -np.eye(3, dtype=np.float32)
         pts_cam = (R @ pts_cam.T).T
 
     # --- depth normalisation ---
@@ -1191,7 +1245,7 @@ def frustum_points(
     if cfg.append_rgb:
         u_idx = np.clip(np.round(uv_sel[:, 0]).astype(np.int32), 0, img_w - 1)
         v_idx = np.clip(np.round(uv_sel[:, 1]).astype(np.int32), 0, img_h - 1)
-        rgb   = sample.image_left[v_idx, u_idx].astype(np.float32) / 255.0
+        rgb = sample.image_left[v_idx, u_idx].astype(np.float32) / 255.0
         return np.hstack([pts_cam, rgb])  # (M, 6)
 
     return pts_cam  # (M, 3)
@@ -1203,25 +1257,25 @@ def frustum_points(
 @dataclass
 class VoxelConfig:
     """Configuration for :func:`voxel_grid`."""
-    x_range:    tuple[float, float] = (-40.0, 40.0)
-    y_range:    tuple[float, float] = (-40.0, 40.0)
-    z_range:    tuple[float, float] = (-3.0,   1.0)
-    voxel_size: float               = 0.2      # metres per voxel (isotropic)
+    x_range: tuple[float, float] = (-40.0, 40.0)
+    y_range: tuple[float, float] = (-40.0, 40.0)
+    z_range: tuple[float, float] = (-3.0, 1.0)
+    voxel_size: float = 0.2  # metres per voxel (isotropic)
     #: Channels per voxel:
     #:  0 – binary occupancy
     #:  1 – mean height (normalised)
     #:  2 – point count (log1p-normalised)
     #:  3 – mean intensity (if available)
     num_channels: int = 4
-    max_points_per_voxel: int = 35   # cap for mean-feature computation
+    max_points_per_voxel: int = 35  # cap for mean-feature computation
 
 
 @dataclass
 class VoxelGrid:
     """Output of :func:`voxel_grid`."""
-    features:   np.ndarray          # (C, D, H, W) float32
-    coords:     np.ndarray          # (N_occupied, 3) int32  (d, h, w) indices
-    config:     VoxelConfig
+    features: np.ndarray  # (C, D, H, W) float32
+    coords: np.ndarray  # (N_occupied, 3) int32  (d, h, w) indices
+    config: VoxelConfig
 
 
 def voxel_grid(
@@ -1235,25 +1289,23 @@ def voxel_grid(
     :returns: :class:`VoxelGrid` with ``features`` shaped ``(C, D, H, W)``.
     """
     cfg = config or VoxelConfig()
-    vs  = cfg.voxel_size
+    vs = cfg.voxel_size
 
     D = int(round((cfg.z_range[1] - cfg.z_range[0]) / vs))
     H = int(round((cfg.y_range[1] - cfg.y_range[0]) / vs))
     W = int(round((cfg.x_range[1] - cfg.x_range[0]) / vs))
 
     empty_coords = np.zeros((0, 3), dtype=np.int32)
-    empty_feat   = np.zeros((cfg.num_channels, D, H, W), dtype=np.float32)
+    empty_feat = np.zeros((cfg.num_channels, D, H, W), dtype=np.float32)
 
     xyz = sample.lidar_xyz.astype(np.float32)
     if xyz.shape[0] == 0:
         return VoxelGrid(features=empty_feat, coords=empty_coords, config=cfg)
 
     # --- spatial filter ---
-    mask = (
-        (xyz[:, 0] >= cfg.x_range[0]) & (xyz[:, 0] < cfg.x_range[1])
-        & (xyz[:, 1] >= cfg.y_range[0]) & (xyz[:, 1] < cfg.y_range[1])
-        & (xyz[:, 2] >= cfg.z_range[0]) & (xyz[:, 2] < cfg.z_range[1])
-    )
+    mask = ((xyz[:, 0] >= cfg.x_range[0]) & (xyz[:, 0] < cfg.x_range[1])
+            & (xyz[:, 1] >= cfg.y_range[0]) & (xyz[:, 1] < cfg.y_range[1])
+            & (xyz[:, 2] >= cfg.z_range[0]) & (xyz[:, 2] < cfg.z_range[1]))
     xyz = xyz[mask]
 
     intensity: np.ndarray | None = None
@@ -1264,9 +1316,12 @@ def voxel_grid(
                 break
 
     # --- voxel indices ---
-    ix = np.floor((xyz[:, 0] - cfg.x_range[0]) / vs).astype(np.int32).clip(0, W - 1)
-    iy = np.floor((xyz[:, 1] - cfg.y_range[0]) / vs).astype(np.int32).clip(0, H - 1)
-    iz = np.floor((xyz[:, 2] - cfg.z_range[0]) / vs).astype(np.int32).clip(0, D - 1)
+    ix = np.floor(
+        (xyz[:, 0] - cfg.x_range[0]) / vs).astype(np.int32).clip(0, W - 1)
+    iy = np.floor(
+        (xyz[:, 1] - cfg.y_range[0]) / vs).astype(np.int32).clip(0, H - 1)
+    iz = np.floor(
+        (xyz[:, 2] - cfg.z_range[0]) / vs).astype(np.int32).clip(0, D - 1)
 
     feat = np.zeros((cfg.num_channels, D, H, W), dtype=np.float32)
 
@@ -1274,9 +1329,10 @@ def voxel_grid(
     feat[0, iz, iy, ix] = 1.0
 
     # Channel 1: mean height (normalised)
-    z_norm  = ((xyz[:, 2] - cfg.z_range[0]) / (cfg.z_range[1] - cfg.z_range[0])).clip(0.0, 1.0)
-    count   = np.zeros((D, H, W), dtype=np.float32)
-    np.add.at(count,   (iz, iy, ix), 1.0)
+    z_norm = ((xyz[:, 2] - cfg.z_range[0]) /
+              (cfg.z_range[1] - cfg.z_range[0])).clip(0.0, 1.0)
+    count = np.zeros((D, H, W), dtype=np.float32)
+    np.add.at(count, (iz, iy, ix), 1.0)
     np.add.at(feat[1], (iz, iy, ix), z_norm)
     occ_mask = count > 0
     feat[1, occ_mask] /= count[occ_mask]
@@ -1303,23 +1359,23 @@ def voxel_grid(
 @dataclass
 class ClusterConfig:
     """Configuration for :func:`cluster_points`."""
-    eps_m:          float = 0.5     # DBSCAN neighbourhood radius (metres)
-    min_samples:    int   = 5       # minimum cluster size
-    use_bev:        bool  = True    # cluster in 2-D (XY) instead of 3-D XYZ
+    eps_m: float = 0.5  # DBSCAN neighbourhood radius (metres)
+    min_samples: int = 5  # minimum cluster size
+    use_bev: bool = True  # cluster in 2-D (XY) instead of 3-D XYZ
     #: If True, cluster only background returns (points_outside_boxes_xyz).
     background_only: bool = False
-    z_range:        tuple[float, float] = (-3.0, 1.0)   # height pre-filter
+    z_range: tuple[float, float] = (-3.0, 1.0)  # height pre-filter
 
 
 @dataclass
 class ClusterStats:
     """Per-cluster statistics returned by :func:`cluster_points`."""
-    label:      int             # cluster id (0-based; -1 = noise)
+    label: int  # cluster id (0-based; -1 = noise)
     num_points: int
-    centroid:   np.ndarray      # (3,) ego-frame XYZ
-    extent:     np.ndarray      # (3,) axis-aligned bounding box extents (L,W,H)
-    bbox_min:   np.ndarray      # (3,) AABB minimum corner
-    bbox_max:   np.ndarray      # (3,) AABB maximum corner
+    centroid: np.ndarray  # (3,) ego-frame XYZ
+    extent: np.ndarray  # (3,) axis-aligned bounding box extents (L,W,H)
+    bbox_min: np.ndarray  # (3,) AABB minimum corner
+    bbox_max: np.ndarray  # (3,) AABB maximum corner
 
 
 def _dbscan(pts: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
@@ -1333,7 +1389,7 @@ def _dbscan(pts: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
     P = pts.shape[0]
     labels = np.full(P, -1, dtype=np.int32)
     visited = np.zeros(P, dtype=bool)
-    tree    = cKDTree(pts)
+    tree = cKDTree(pts)
 
     cluster_id = 0
     for i in range(P):
@@ -1343,7 +1399,7 @@ def _dbscan(pts: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
         neighbours = tree.query_ball_point(pts[i], eps)
         if len(neighbours) < min_samples:
             continue  # noise (label stays -1)
-        labels[i]  = cluster_id
+        labels[i] = cluster_id
         queue = list(neighbours)
         while queue:
             j = queue.pop()
@@ -1374,18 +1430,16 @@ def cluster_points(
     """
     cfg = config or ClusterConfig()
 
-    xyz_full = (
-        sample.points_outside_boxes_xyz.astype(np.float32)
-        if cfg.background_only
-        else sample.lidar_xyz.astype(np.float32)
-    )
+    xyz_full = (sample.points_outside_boxes_xyz.astype(np.float32) if
+                cfg.background_only else sample.lidar_xyz.astype(np.float32))
 
     if xyz_full.shape[0] == 0:
         return np.zeros(0, dtype=np.int32), []
 
     # height pre-filter
-    z_ok = (xyz_full[:, 2] >= cfg.z_range[0]) & (xyz_full[:, 2] <= cfg.z_range[1])
-    xyz  = xyz_full[z_ok]
+    z_ok = (xyz_full[:, 2] >= cfg.z_range[0]) & (xyz_full[:, 2]
+                                                 <= cfg.z_range[1])
+    xyz = xyz_full[z_ok]
 
     if xyz.shape[0] == 0:
         labels_out = np.full(xyz_full.shape[0], -1, dtype=np.int32)
@@ -1395,18 +1449,18 @@ def cluster_points(
     labels_filtered = _dbscan(pts_for_cluster, cfg.eps_m, cfg.min_samples)
 
     # map back to original indexing
-    labels_out              = np.full(xyz_full.shape[0], -1, dtype=np.int32)
-    labels_out[z_ok]        = labels_filtered
+    labels_out = np.full(xyz_full.shape[0], -1, dtype=np.int32)
+    labels_out[z_ok] = labels_filtered
 
     # --- per-cluster statistics ---
     unique_labels = sorted(set(labels_filtered.tolist()) - {-1})
     stats: list[ClusterStats] = []
     for lbl in unique_labels:
-        pts_lbl   = xyz[labels_filtered == lbl]
-        centroid  = pts_lbl.mean(axis=0)
-        bbox_min  = pts_lbl.min(axis=0)
-        bbox_max  = pts_lbl.max(axis=0)
-        extent    = bbox_max - bbox_min
+        pts_lbl = xyz[labels_filtered == lbl]
+        centroid = pts_lbl.mean(axis=0)
+        bbox_min = pts_lbl.min(axis=0)
+        bbox_max = pts_lbl.max(axis=0)
+        extent = bbox_max - bbox_min
         stats.append(
             ClusterStats(
                 label=lbl,
@@ -1415,8 +1469,7 @@ def cluster_points(
                 extent=extent,
                 bbox_min=bbox_min,
                 bbox_max=bbox_max,
-            )
-        )
+            ))
     stats.sort(key=lambda s: s.num_points, reverse=True)
     return labels_out, stats
 
@@ -1426,16 +1479,22 @@ def cluster_points(
 # ===========================================================================
 if __name__ == "__main__":
 
-    sample = Py123dDataset(split_names=["av2-sensor_val"])[0].to_stereo_sample()
-    sd  = stereo_depth(sample)
+    sample = Py123dDataset(
+        split_names=["av2-sensor_val"])[0].to_stereo_sample()
+    print(dir(sample))
+    sd = stereo_depth(sample)
     bev = stereo_bev(sample)
 
     d = sd.depth[sd.depth > 0]
     print(f"Frame      : {sample.dataset}  iter={sample.iteration}")
-    print(f"Rect size  : {sd.rect.size}  fx_rect={sd.rect.fx_rect:.1f}  base={sd.rect.baseline_m:.4f} m")
+    print(
+        f"Rect size  : {sd.rect.size}  fx_rect={sd.rect.fx_rect:.1f}  base={sd.rect.baseline_m:.4f} m"
+    )
     print(f"Disparity  : valid={float((sd.disparity > 0).mean())*100:.1f}%")
     print(f"Depth      : valid={float((sd.depth > 0).mean())*100:.1f}%  "
           f"min={d.min():.1f} med={np.median(d):.1f} max={d.max():.1f} m")
     xyz, _ = stereo_point_cloud(sample)
     print(f"Point cloud: {xyz.shape[0]} ego-frame points")
-    print(f"Stereo BEV : {bev.shape}  occupancy={float(bev[0].mean())*100:.1f}% cells")
+    print(
+        f"Stereo BEV : {bev.shape}  occupancy={float(bev[0].mean())*100:.1f}% cells"
+    )
