@@ -79,8 +79,17 @@ py123d-download dataset=av2-sensor \
 `py123d` uses Apache Arrow for fast loading. Convert the downloaded data:
 
 ```bash
-py123d-conversion dataset=av2-sensor
+py123d-conversion dataset=av2-sensor \
+    'dataset.parser.splits=[av2-sensor_val]'
 ```
+
+> **`AV2_DATA_ROOT` must still be exported** (step 2) — the conversion CLI reads it
+> to locate the raw `sensor/` directory and fails with `av2_sensor_root … None/sensor`
+> otherwise.
+>
+> **Restrict `dataset.parser.splits` to what you actually downloaded.** The parser
+> scans `train`/`val`/`test` by default; with only `av2-sensor_val` on disk, the
+> override above avoids a `No such file or directory: …/sensor/train` error.
 
 > The `dataset=av2-sensor-stream` option downloads and parses logs on the fly if disk space is limited.
 
