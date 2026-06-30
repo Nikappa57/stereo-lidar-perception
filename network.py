@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ultralytics import YOLO
 
 import globals as G
 
@@ -45,7 +46,7 @@ if TYPE_CHECKING:  # type-only — avoids importing py123d at module load
 # Stage A output channels — re-exported from globals for back-compat. Keep the
 # branches in sync: camera -> context_channels, lidar -> BEVBackbone2D out.
 CAMERA_BEV_CHANNELS = G.CAMERA_BEV_CHANNELS  # 64
-LIDAR_BEV_CHANNELS = G.LIDAR_BEV_CHANNELS    # 128
+LIDAR_BEV_CHANNELS = G.LIDAR_BEV_CHANNELS  # 128
 
 
 def _as_batched(x: torch.Tensor) -> torch.Tensor:
@@ -73,29 +74,110 @@ class _EfficientNetBackbone(nn.Module):
         # Stride-2 stem
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.SiLU(inplace=True),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
         )
         # Three stride-2 blocks  (1/2 → 1/4 → 1/8)
         self.block1 = nn.Sequential(
             nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.SiLU(inplace=True),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
             nn.Conv2d(64, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.SiLU(inplace=True),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
         )
         self.block2 = nn.Sequential(
             nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.SiLU(inplace=True),
+            nn.BatchNorm2d(128),
+            nn.SiLU(inplace=True),
             nn.Conv2d(128, 128, 3, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.SiLU(inplace=True),
+            nn.BatchNorm2d(128),
+            nn.SiLU(inplace=True),
         )
         self.proj = nn.Sequential(
             nn.Conv2d(128, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch), nn.SiLU(inplace=True),
+            nn.BatchNorm2d(out_ch),
+            nn.SiLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 3, H, W)  →  (B, out_ch, H/8, W/8)"""
         return self.proj(self.block2(self.block1(self.stem(x))))
+
+
+class YOLOBackbone(nn.Module):
+    """YOLO26 backbone+neck tapped at P3 (stride 8), RGB only.
+
+    A drop-in replacement for :class:`_EfficientNetBackbone`: same 1/8 stride and
+    the same ``(B, out_dim, H/8, W/8)`` output contract, so the dynamic
+    ``stride = image.shape[-1] // shared.shape[-1]`` in the camera branches keeps
+    working unchanged. Pass ``out_dim=cfg.img_backbone_out`` (256) — the depth /
+    context heads expect that width, not :data:`globals.CAM_FEAT_DIM`.
+
+    The Detect head runs but is ignored; a forward pre-hook on it captures the
+    ``[P3, P4, P5]`` feature list and we keep P3. A 1×1 conv (sized lazily from
+    P3's channel count via one dummy pass) projects to ``out_dim``.
+    """
+
+    def __init__(
+        self,
+        weights: str = "yolo26n.pt",
+        freeze: bool = False,
+        out_dim: int = G.CAM_FEAT_DIM,
+    ):
+        super().__init__()
+        self.det = YOLO(weights).model        # the DetectionModel (an nn.Module)
+        self.head = self.det.model[-1]        # the Detect head (last layer)
+        self.stride = 8                        # P3
+        self._feats: list[torch.Tensor] | None = None
+
+        # the Detect head receives [P3, P4, P5]; capture them before it runs
+        self.head.register_forward_pre_hook(self._grab)
+
+        if freeze:
+            for p in self.det.parameters():
+                p.requires_grad_(False)
+
+        # discover P3's channel count with one dummy pass, then size the 1x1
+        with torch.no_grad():
+            self.det(torch.zeros(1, 3, 320, 320))
+        c3 = self._feats[0].shape[1]
+        self.proj = nn.Conv2d(c3, out_dim, 1)
+
+    def _grab(self, module: nn.Module, args: tuple) -> None:
+        self._feats = args[0]                  # args[0] == [P3, P4, P5]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, 3, H, W)  →  (B, out_dim, H/8, W/8)"""
+        self._feats = None
+        self.det(x)                            # runs backbone+neck+head; hook grabs P3
+        return self.proj(self._feats[0])       # P3 -> (B, out_dim, H/8, W/8)
+
+
+def build_camera_backbone(
+    name: str,
+    out_ch: int,
+    *,
+    weights: str = "yolo26n.pt",
+    freeze: bool = False,
+) -> nn.Module:
+    """Factory for the Stage 1 camera backbone (the one swappable image stem).
+
+    ``name`` is the value of ``MonoBEVConfig.img_backbone`` / ``StereoBEVConfig``:
+
+    * ``"efficientnet"`` (default) → :class:`_EfficientNetBackbone`
+    * ``"yolo26"`` / ``"yolo"``    → :class:`YOLOBackbone` (``weights``/``freeze``)
+
+    Both honour the same ``(B, out_ch, H/8, W/8)`` contract.
+    """
+    key = name.lower()
+    if key in ("efficientnet", "effnet", "default"):
+        return _EfficientNetBackbone(out_ch=out_ch)
+    if key in ("yolo", "yolo26"):
+        return YOLOBackbone(weights=weights, freeze=freeze, out_dim=out_ch)
+    raise ValueError(
+        f"unknown camera backbone {name!r}; expected 'efficientnet' or 'yolo26'"
+    )
 
 
 class BEVBackbone2D(nn.Module):
@@ -110,11 +192,14 @@ class BEVBackbone2D(nn.Module):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
             nn.Conv2d(64, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, bev: torch.Tensor) -> torch.Tensor:
@@ -125,12 +210,12 @@ class BEVBackbone2D(nn.Module):
 # Stage 2 — Splat to BEV (lift the camera features onto the ground plane)
 # ===========================================================================
 def build_frustum_points(
-    depth_dist: torch.Tensor,   # (B, D, H', W')  softmax probabilities
-    context:    torch.Tensor,   # (B, C, H', W')  semantic features
-    K:          torch.Tensor,   # (B, 3, 3)  or (3, 3) intrinsics
-    T_cam2ego:  torch.Tensor,   # (B, 4, 4)  or (4, 4) camera→ego
-    stride:     int,            # backbone downsample factor
-    depth_bins: torch.Tensor,   # (D,) depth bin centres
+        depth_dist: torch.Tensor,  # (B, D, H', W')  softmax probabilities
+        context: torch.Tensor,  # (B, C, H', W')  semantic features
+        K: torch.Tensor,  # (B, 3, 3)  or (3, 3) intrinsics
+        T_cam2ego: torch.Tensor,  # (B, 4, 4)  or (4, 4) camera→ego
+        stride: int,  # backbone downsample factor
+        depth_bins: torch.Tensor,  # (D,) depth bin centres
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the frustum feature cloud (MonoBEV / predicted-depth path).
 
@@ -144,47 +229,51 @@ def build_frustum_points(
     device = depth_dist.device
 
     # ---- outer product per pixel: feats × depth_prob ----
-    ctx_exp  = context.unsqueeze(2)     # (B, C,  1, Hf, Wf)
-    dep_exp  = depth_dist.unsqueeze(1)  # (B,  1, D, Hf, Wf)
-    frustum_feats = ctx_exp * dep_exp   # (B, C, D, Hf, Wf)  — outer product
+    ctx_exp = context.unsqueeze(2)  # (B, C,  1, Hf, Wf)
+    dep_exp = depth_dist.unsqueeze(1)  # (B,  1, D, Hf, Wf)
+    frustum_feats = ctx_exp * dep_exp  # (B, C, D, Hf, Wf)  — outer product
 
     # ---- pixel-grid in image space (centre of each pixel) ----
     us = (torch.arange(Wf, device=device).float() + 0.5) * stride  # (Wf,)
     vs = (torch.arange(Hf, device=device).float() + 0.5) * stride  # (Hf,)
-    vs_g, us_g = torch.meshgrid(vs, us, indexing="ij")              # (Hf, Wf)
+    vs_g, us_g = torch.meshgrid(vs, us, indexing="ij")  # (Hf, Wf)
 
     # depth centres for each bin — shape (D,)
     d = depth_bins  # (D,)
 
     # ---- unproject to camera frame ----
-    ones = torch.ones_like(us_g).reshape(-1)           # (Hf*Wf,)
-    uvh  = torch.stack([us_g.reshape(-1), vs_g.reshape(-1), ones], dim=0)  # (3, Hf*Wf)
+    ones = torch.ones_like(us_g).reshape(-1)  # (Hf*Wf,)
+    uvh = torch.stack(
+        [us_g.reshape(-1), vs_g.reshape(-1), ones], dim=0)  # (3, Hf*Wf)
 
     # Broadcast K across batch if needed
     if K.dim() == 2:
-        K = K.unsqueeze(0).expand(B, -1, -1)           # (B, 3, 3)
+        K = K.unsqueeze(0).expand(B, -1, -1)  # (B, 3, 3)
     if T_cam2ego.dim() == 2:
         T_cam2ego = T_cam2ego.unsqueeze(0).expand(B, -1, -1)  # (B, 4, 4)
 
     # Invert K on CPU (LAPACK, always available) to avoid torch.linalg.solve
     # loading libtorch_cuda_linalg.so which may have a cuSolver version mismatch.
     # K is only 3×3, so the CPU round-trip is negligible.
-    K_inv_np = np.linalg.inv(K.detach().cpu().numpy())          # (B, 3, 3) float64
-    K_inv    = torch.from_numpy(K_inv_np.astype(np.float32)).to(device)  # (B, 3, 3)
+    K_inv_np = np.linalg.inv(K.detach().cpu().numpy())  # (B, 3, 3) float64
+    K_inv = torch.from_numpy(K_inv_np.astype(np.float32)).to(
+        device)  # (B, 3, 3)
 
     # rays_cam: (B, 3, Hf*Wf) — un-normalised camera rays
-    rays_cam = torch.bmm(K_inv, uvh.unsqueeze(0).expand(B, -1, -1))  # (B, 3, Hf*Wf)
+    rays_cam = torch.bmm(K_inv,
+                         uvh.unsqueeze(0).expand(B, -1, -1))  # (B, 3, Hf*Wf)
 
     # Scale by depth bins: xyz_cam (B, 3, D, Hf*Wf)
     xyz_cam = rays_cam.unsqueeze(2) * d.view(1, 1, D, 1)  # (B, 3, D, Hf*Wf)
 
     # ---- camera → ego ----
-    R = T_cam2ego[:, :3, :3]   # (B, 3, 3)
-    t = T_cam2ego[:, :3,  3]   # (B, 3)
+    R = T_cam2ego[:, :3, :3]  # (B, 3, 3)
+    t = T_cam2ego[:, :3, 3]  # (B, 3)
 
     # (B, 3, D*Hf*Wf)
     xyz_cam_flat = xyz_cam.reshape(B, 3, D * Hf * Wf)
-    xyz_ego_flat = torch.bmm(R, xyz_cam_flat) + t.unsqueeze(-1)  # (B, 3, D*Hf*Wf)
+    xyz_ego_flat = torch.bmm(R, xyz_cam_flat) + t.unsqueeze(
+        -1)  # (B, 3, D*Hf*Wf)
     xyz_ego = xyz_ego_flat.permute(0, 2, 1)  # (B, D*Hf*Wf, 3)
 
     # ---- reshape frustum features to (B, N, C) ----
@@ -194,11 +283,11 @@ def build_frustum_points(
 
 
 def _build_grounded_frustum(
-    depth_map:  torch.Tensor,   # (B, 1, H', W')  metric depth at backbone stride
-    context:    torch.Tensor,   # (B, C, H', W')  semantic features
-    K:          torch.Tensor,   # (B, 3, 3)  intrinsics (scaled to backbone res)
-    T_cam2ego:  torch.Tensor,   # (B, 4, 4)  camera → ego SE(3)
-    stride:     int,            # backbone down-sample factor (e.g. 8)
+    depth_map: torch.Tensor,  # (B, 1, H', W')  metric depth at backbone stride
+    context: torch.Tensor,  # (B, C, H', W')  semantic features
+    K: torch.Tensor,  # (B, 3, 3)  intrinsics (scaled to backbone res)
+    T_cam2ego: torch.Tensor,  # (B, 4, 4)  camera → ego SE(3)
+    stride: int,  # backbone down-sample factor (e.g. 8)
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Back-project every valid depth pixel into ego-frame 3-D + carry its feature.
 
@@ -216,44 +305,46 @@ def _build_grounded_frustum(
     device = context.device
 
     # pixel grid centre coordinates in the backbone feature frame
-    us = (torch.arange(Wf, device=device).float() + 0.5)   # (Wf,)
-    vs = (torch.arange(Hf, device=device).float() + 0.5)   # (Hf,)
-    vs_g, us_g = torch.meshgrid(vs, us, indexing="ij")      # (Hf, Wf)
+    us = (torch.arange(Wf, device=device).float() + 0.5)  # (Wf,)
+    vs = (torch.arange(Hf, device=device).float() + 0.5)  # (Hf,)
+    vs_g, us_g = torch.meshgrid(vs, us, indexing="ij")  # (Hf, Wf)
 
-    ones = torch.ones_like(us_g).reshape(-1)                 # (Hf*Wf,)
-    uvh  = torch.stack([us_g.reshape(-1), vs_g.reshape(-1), ones], dim=0)  # (3, N)
+    ones = torch.ones_like(us_g).reshape(-1)  # (Hf*Wf,)
+    uvh = torch.stack(
+        [us_g.reshape(-1), vs_g.reshape(-1), ones], dim=0)  # (3, N)
     N = Hf * Wf
 
     # invert K on CPU (avoids cuSolver dependency, same trick as build_frustum_points)
-    K_inv_np = np.linalg.inv(K.detach().cpu().numpy())               # (B, 3, 3)
-    K_inv    = torch.from_numpy(K_inv_np.astype(np.float32)).to(device)
+    K_inv_np = np.linalg.inv(K.detach().cpu().numpy())  # (B, 3, 3)
+    K_inv = torch.from_numpy(K_inv_np.astype(np.float32)).to(device)
 
     # un-normalised rays in camera frame
-    rays = torch.bmm(K_inv, uvh.unsqueeze(0).expand(B, -1, -1))     # (B, 3, N)
+    rays = torch.bmm(K_inv, uvh.unsqueeze(0).expand(B, -1, -1))  # (B, 3, N)
 
     # scale rays by grounded metric depth — depth_map is at stride resolution
     # but K is already scaled, so depth values are correct as-is
-    d = depth_map.reshape(B, N)                                      # (B, N)
+    d = depth_map.reshape(B, N)  # (B, N)
 
     # xyz_cam = ray_direction * depth  (direction already has z=1 in camera frame)
-    xyz_cam = rays * d.unsqueeze(1)                                  # (B, 3, N)
+    xyz_cam = rays * d.unsqueeze(1)  # (B, 3, N)
 
     # camera → ego
-    R = T_cam2ego[:, :3, :3]   # (B, 3, 3)
-    t = T_cam2ego[:, :3,  3]   # (B, 3)
-    xyz_ego = (torch.bmm(R, xyz_cam) + t.unsqueeze(-1)).permute(0, 2, 1)  # (B, N, 3)
+    R = T_cam2ego[:, :3, :3]  # (B, 3, 3)
+    t = T_cam2ego[:, :3, 3]  # (B, 3)
+    xyz_ego = (torch.bmm(R, xyz_cam) + t.unsqueeze(-1)).permute(0, 2,
+                                                                1)  # (B, N, 3)
 
-    feats = context.permute(0, 2, 3, 1).reshape(B, N, C)             # (B, N, C)
-    valid = d > 0                                                     # (B, N)
+    feats = context.permute(0, 2, 3, 1).reshape(B, N, C)  # (B, N, C)
+    valid = d > 0  # (B, N)
 
     return xyz_ego, feats, valid
 
 
 def splat(
     xyz_ego: torch.Tensor,  # (B, N, 3)
-    feats:   torch.Tensor,  # (B, N, C)
-    nx:      int,
-    ny:      int,
+    feats: torch.Tensor,  # (B, N, C)
+    nx: int,
+    ny: int,
     x_range: tuple[float, float],
     y_range: tuple[float, float],
     bev_res_m: float,
@@ -268,7 +359,7 @@ def splat(
     bev : (B, C, nx, ny)
     """
     B, N, C = feats.shape
-    device  = feats.device
+    device = feats.device
 
     # ---- BEV cell indices ----
     x = xyz_ego[..., 0]  # (B, N)
@@ -278,25 +369,23 @@ def splat(
     iy = ((y - y_range[0]) / bev_res_m).long()  # (B, N)
 
     # mask: only points landing inside the BEV grid
-    valid = (
-        (ix >= 0) & (ix < nx) &
-        (iy >= 0) & (iy < ny)
-    )  # (B, N)
+    valid = ((ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny))  # (B, N)
 
     # flat cell index within the BEV canvas
     cell_idx = ix * ny + iy  # (B, N)  — only meaningful where valid
 
     # batch index broadcast
-    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)  # (B, N)
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B,
+                                                                   N)  # (B, N)
 
     # collapse batch & point dims
-    cell_flat  = cell_idx.reshape(-1)   # (B*N,)
+    cell_flat = cell_idx.reshape(-1)  # (B*N,)
     batch_flat = batch_idx.reshape(-1)  # (B*N,)
-    valid_flat = valid.reshape(-1)      # (B*N,)
+    valid_flat = valid.reshape(-1)  # (B*N,)
     feats_flat = feats.reshape(B * N, C)
 
     # keep only in-bounds points
-    cell_flat  = cell_flat[valid_flat]
+    cell_flat = cell_flat[valid_flat]
     batch_flat = batch_flat[valid_flat]
     feats_flat = feats_flat[valid_flat]  # (M, C)
 
@@ -304,28 +393,33 @@ def splat(
         return torch.zeros(B, C, nx, ny, device=device)
 
     # ---- sort by (batch_idx, cell_idx) ----
-    sort_key = batch_flat * (nx * ny) + cell_flat   # unique rank
-    order    = torch.argsort(sort_key)
-    cell_s   = cell_flat[order]    # sorted cell indices
-    batch_s  = batch_flat[order]   # sorted batch indices
-    feats_s  = feats_flat[order]   # (M, C) sorted features
+    sort_key = batch_flat * (nx * ny) + cell_flat  # unique rank
+    order = torch.argsort(sort_key)
+    cell_s = cell_flat[order]  # sorted cell indices
+    batch_s = batch_flat[order]  # sorted batch indices
+    feats_s = feats_flat[order]  # (M, C) sorted features
 
     # global flat index combining batch and cell
-    global_idx = batch_s * (nx * ny) + cell_s      # (M,)
+    global_idx = batch_s * (nx * ny) + cell_s  # (M,)
 
     # ---- cumsum trick: prefix-sum → boundary diffs = group sums ----
-    feats_pad  = torch.cat([torch.zeros(1, C, device=device), feats_s], dim=0)  # (M+1, C)
-    cumsum     = feats_pad.cumsum(dim=0)                                         # (M+1, C)
+    feats_pad = torch.cat([torch.zeros(1, C, device=device), feats_s],
+                          dim=0)  # (M+1, C)
+    cumsum = feats_pad.cumsum(dim=0)  # (M+1, C)
 
-    key_pad    = torch.cat([
-        torch.full((1,), -1, device=device, dtype=global_idx.dtype),
+    key_pad = torch.cat([
+        torch.full((1, ), -1, device=device, dtype=global_idx.dtype),
         global_idx
-    ])                                                                             # (M+1,)
-    boundaries = torch.where(key_pad[1:] != key_pad[:-1])[0]  # (G,) start of each group
+    ])  # (M+1,)
+    boundaries = torch.where(
+        key_pad[1:] != key_pad[:-1])[0]  # (G,) start of each group
 
-    unique_gidx = global_idx[boundaries]         # (G,) global index for each unique cell
-    ends        = torch.cat([boundaries[1:], torch.tensor([feats_s.shape[0]], device=device)])
-    group_sums  = cumsum[ends] - cumsum[boundaries]  # (G, C)  sum-pool per cell
+    unique_gidx = global_idx[
+        boundaries]  # (G,) global index for each unique cell
+    ends = torch.cat(
+        [boundaries[1:],
+         torch.tensor([feats_s.shape[0]], device=device)])
+    group_sums = cumsum[ends] - cumsum[boundaries]  # (G, C)  sum-pool per cell
 
     # ---- scatter into BEV canvas ----
     canvas = torch.zeros(B * nx * ny, C, device=device)
@@ -345,18 +439,21 @@ class MonoBEVConfig:
     pixel-aligned with the LiDAR branch before fusion.
     """
     # ---- BEV grid (shared, globals.py) ----
-    x_range:     tuple[float, float] = G.X_RANGE   # forward
-    y_range:     tuple[float, float] = G.Y_RANGE   # lateral
-    bev_res_m:   float               = G.BEV_RES_M  # metres / BEV cell
+    x_range: tuple[float, float] = G.X_RANGE  # forward
+    y_range: tuple[float, float] = G.Y_RANGE  # lateral
+    bev_res_m: float = G.BEV_RES_M  # metres / BEV cell
 
     # ---- depth bins ----
-    d_min:       float = 1.0    # metres
-    d_max:       float = 60.0   # metres
-    num_depth_bins: int = 41    # D   (LSS uses 41 on nuScenes)
-    log_depth:   bool  = False  # True → log-spaced, False → linear
+    d_min: float = 1.0  # metres
+    d_max: float = 60.0  # metres
+    num_depth_bins: int = 41  # D   (LSS uses 41 on nuScenes)
+    log_depth: bool = False  # True → log-spaced, False → linear
 
     # ---- backbone / heads ----
-    img_backbone_out: int = 256                  # channels out of shared backbone
+    img_backbone: str = "efficientnet"  # "efficientnet" | "yolo26"
+    yolo_weights: str = "yolo26n.pt"  # used when img_backbone == "yolo26"
+    yolo_freeze: bool = False  # freeze YOLO backbone+neck weights
+    img_backbone_out: int = 256  # channels out of shared backbone
     context_channels: int = G.CAMERA_BEV_CHANNELS  # C  semantic feature depth
 
 
@@ -393,30 +490,35 @@ class MonoBEV(nn.Module):
         # ---- depth bins (D,) ---- registered as buffer so they move with .to(device)
         if c.log_depth:
             bins = torch.exp(
-                torch.linspace(np.log(c.d_min), np.log(c.d_max), c.num_depth_bins)
-            )
+                torch.linspace(np.log(c.d_min), np.log(c.d_max),
+                               c.num_depth_bins))
         else:
             bins = torch.linspace(c.d_min, c.d_max, c.num_depth_bins)
         self.register_buffer("depth_bins", bins)  # (D,)
 
         # ---- shared backbone ----
-        self.backbone = _EfficientNetBackbone(out_ch=c.img_backbone_out)
+        self.backbone = build_camera_backbone(
+            c.img_backbone, out_ch=c.img_backbone_out,
+            weights=c.yolo_weights, freeze=c.yolo_freeze,
+        )
 
         mid = c.img_backbone_out
-        D   = c.num_depth_bins
-        C   = c.context_channels
+        D = c.num_depth_bins
+        C = c.context_channels
 
         # ---- depth head → (B, D, H', W') ----
         self.depth_head = nn.Sequential(
             nn.Conv2d(mid, mid, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
             nn.Conv2d(mid, D, 1),
         )
 
         # ---- context head → (B, C, H', W') ----
         self.context_head = nn.Sequential(
             nn.Conv2d(mid, mid, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
             nn.Conv2d(mid, C, 1),
         )
 
@@ -424,31 +526,32 @@ class MonoBEV(nn.Module):
         self.bev_backbone = BEVBackbone2D(in_channels=C, out_channels=C)
 
     def forward(
-        self,
-        image:      torch.Tensor,   # (B, 3, H, W)  normalised RGB
-        K:          torch.Tensor,   # (B, 3, 3) or (3, 3)  camera intrinsics
-        T_cam2ego:  torch.Tensor,   # (B, 4, 4) or (4, 4)  camera→ego SE(3)
+            self,
+            image: torch.Tensor,  # (B, 3, H, W)  normalised RGB
+            K: torch.Tensor,  # (B, 3, 3) or (3, 3)  camera intrinsics
+            T_cam2ego: torch.Tensor,  # (B, 4, 4) or (4, 4)  camera→ego SE(3)
     ) -> torch.Tensor:
         """Run the full Lift-Splat-Shoot pipeline."""
         # ---- Step 1: shared backbone ----
-        shared = self.backbone(image)                          # (B, mid, H', W')
-        stride = image.shape[-1] // shared.shape[-1]          # e.g. 8
+        shared = self.backbone(image)  # (B, mid, H', W')
+        stride = image.shape[-1] // shared.shape[-1]  # e.g. 8
 
         # ---- Step 2: depth distribution + context features ----
-        depth_logits = self.depth_head(shared)                 # (B, D, H', W')
-        depth_dist   = depth_logits.softmax(dim=1)             # (B, D, H', W')
-        context      = self.context_head(shared)               # (B, C, H', W')
+        depth_logits = self.depth_head(shared)  # (B, D, H', W')
+        depth_dist = depth_logits.softmax(dim=1)  # (B, D, H', W')
+        context = self.context_head(shared)  # (B, C, H', W')
 
         # ---- Steps 3-5: outer product + unproject ----
         xyz_ego, feats = build_frustum_points(
-            depth_dist, context, K, T_cam2ego, stride, self.depth_bins
-        )                                                      # (B, N, 3), (B, N, C)
+            depth_dist, context, K, T_cam2ego, stride,
+            self.depth_bins)  # (B, N, 3), (B, N, C)
 
         # ---- Step 6: voxel-pool onto BEV grid ----
-        bev = splat(xyz_ego, feats, self.nx, self.ny, self.cfg.x_range, self.cfg.y_range, self.cfg.bev_res_m)                      # (B, C, nx, ny)
+        bev = splat(xyz_ego, feats, self.nx, self.ny, self.cfg.x_range,
+                    self.cfg.y_range, self.cfg.bev_res_m)  # (B, C, nx, ny)
 
         # ---- Step 7: BEV CNN refinement ----
-        bev = self.bev_backbone(bev)                           # (B, C, nx, ny)
+        bev = self.bev_backbone(bev)  # (B, C, nx, ny)
 
         return bev
 
@@ -461,12 +564,15 @@ class StereoBEVConfig:
     maps are pixel-aligned before fusion.
     """
     # ---- BEV grid (shared, globals.py) ----
-    x_range:     tuple[float, float] = G.X_RANGE
-    y_range:     tuple[float, float] = G.Y_RANGE
-    bev_res_m:   float               = G.BEV_RES_M
+    x_range: tuple[float, float] = G.X_RANGE
+    y_range: tuple[float, float] = G.Y_RANGE
+    bev_res_m: float = G.BEV_RES_M
 
     # ---- backbone / feature channels ----
-    img_backbone_out: int = 256                  # channels out of shared backbone
+    img_backbone: str = "efficientnet"  # "efficientnet" | "yolo26"
+    yolo_weights: str = "yolo26n.pt"  # used when img_backbone == "yolo26"
+    yolo_freeze: bool = False  # freeze YOLO backbone+neck weights
+    img_backbone_out: int = 256  # channels out of shared backbone
     context_channels: int = G.CAMERA_BEV_CHANNELS  # C  — feature depth splatted to BEV
 
     # ---- depth filtering ----
@@ -505,15 +611,19 @@ class StereoBEV(nn.Module):
         self.ny = int(round((c.y_range[1] - c.y_range[0]) / c.bev_res_m))
 
         mid = c.img_backbone_out
-        C   = c.context_channels
+        C = c.context_channels
 
         # shared image backbone — same architecture as MonoBEV (1/8 resolution)
-        self.backbone = _EfficientNetBackbone(out_ch=mid)
+        self.backbone = build_camera_backbone(
+            c.img_backbone, out_ch=mid,
+            weights=c.yolo_weights, freeze=c.yolo_freeze,
+        )
 
         # context head: (B, mid, H', W') → (B, C, H', W')
         self.context_head = nn.Sequential(
             nn.Conv2d(mid, mid, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
             nn.Conv2d(mid, C, 1),
         )
 
@@ -521,11 +631,12 @@ class StereoBEV(nn.Module):
         self.bev_backbone = BEVBackbone2D(in_channels=C, out_channels=C)
 
     def forward(
-        self,
-        image:     torch.Tensor,   # (B, 3, H, W)  normalised left-rectified RGB
-        depth:     torch.Tensor,   # (B, 1, H, W)  metric depth (0 = invalid)
-        K:         torch.Tensor,   # (B, 3, 3) or (3, 3)  left-cam intrinsics
-        T_cam2ego: torch.Tensor,   # (B, 4, 4) or (4, 4)  left-cam → ego SE(3)
+            self,
+            image: torch.Tensor,  # (B, 3, H, W)  normalised left-rectified RGB
+            depth: torch.Tensor,  # (B, 1, H, W)  metric depth (0 = invalid)
+            K: torch.Tensor,  # (B, 3, 3) or (3, 3)  left-cam intrinsics
+            T_cam2ego: torch.
+        Tensor,  # (B, 4, 4) or (4, 4)  left-cam → ego SE(3)
     ) -> torch.Tensor:
         """Run the grounded stereo-depth BEV pipeline.
 
@@ -540,41 +651,43 @@ class StereoBEV(nn.Module):
             T_cam2ego = T_cam2ego.unsqueeze(0).expand(B, -1, -1)
 
         # Step 1: backbone (1/8 resolution)
-        shared = self.backbone(image)                      # (B, mid, H', W')
-        stride = image.shape[-1] // shared.shape[-1]      # e.g. 8
+        shared = self.backbone(image)  # (B, mid, H', W')
+        stride = image.shape[-1] // shared.shape[-1]  # e.g. 8
 
         # Step 2: context features
-        context = self.context_head(shared)               # (B, C, H', W')
+        context = self.context_head(shared)  # (B, C, H', W')
 
         # Step 3: downsample depth to backbone resolution
         _, _, Hf, Wf = shared.shape
-        depth_small = F.interpolate(
-            depth, size=(Hf, Wf), mode="nearest"
-        )                                                 # (B, 1, H', W')
+        depth_small = F.interpolate(depth, size=(Hf, Wf),
+                                    mode="nearest")  # (B, 1, H', W')
 
         # Step 4: scale K to backbone feature resolution
         K_small = K.clone()
-        K_small[:, 0] /= stride   # fx, cx
-        K_small[:, 1] /= stride   # fy, cy
+        K_small[:, 0] /= stride  # fx, cx
+        K_small[:, 1] /= stride  # fy, cy
 
         # Step 5: grounded back-projection
         xyz_ego, feats, valid = _build_grounded_frustum(
-            depth_small, context, K_small, T_cam2ego, stride
-        )                                                 # (B, N, 3), (B, N, C), (B, N)
+            depth_small, context, K_small, T_cam2ego,
+            stride)  # (B, N, 3), (B, N, C), (B, N)
 
         # zero out invalid points so they don't pollute the BEV
         feats = feats * valid.unsqueeze(-1).float()
 
         # Step 6: splat onto BEV grid
         bev = splat(
-            xyz_ego, feats,
-            self.nx, self.ny,
-            self.cfg.x_range, self.cfg.y_range,
+            xyz_ego,
+            feats,
+            self.nx,
+            self.ny,
+            self.cfg.x_range,
+            self.cfg.y_range,
             self.cfg.bev_res_m,
-        )                                                 # (B, C, nx, ny)
+        )  # (B, C, nx, ny)
 
         # Step 7: BEV CNN refinement
-        bev = self.bev_backbone(bev)                      # (B, C, nx, ny)
+        bev = self.bev_backbone(bev)  # (B, C, nx, ny)
 
         return bev
 
@@ -597,21 +710,21 @@ class StereoBEVBranch(nn.Module):
     """
 
     def __init__(
-        self,
-        cfg:       StereoBEVConfig | None = None,
-        sgbm_cfg:  "StereoSGBMConfig | None" = None,
-        target_hw: tuple[int, int] = (192, 640),
+            self,
+            cfg: StereoBEVConfig | None = None,
+            sgbm_cfg: "StereoSGBMConfig | None" = None,
+            target_hw: tuple[int, int] = (192, 640),
     ):
         super().__init__()
-        self.cfg      = cfg or StereoBEVConfig()
-        self.sgbm_cfg = sgbm_cfg           # None = stereo_depth uses its defaults
+        self.cfg = cfg or StereoBEVConfig()
+        self.sgbm_cfg = sgbm_cfg  # None = stereo_depth uses its defaults
         self.target_hw = target_hw
-        self.model    = StereoBEV(self.cfg)
+        self.model = StereoBEV(self.cfg)
 
     def forward(
-        self,
-        sample: "StereoSample",
-        device: torch.device = torch.device("cpu"),
+            self,
+            sample: "StereoSample",
+            device: torch.device = torch.device("cpu"),
     ) -> torch.Tensor:
         """Run the full stereo BEV branch on one sample.
 
@@ -619,49 +732,53 @@ class StereoBEVBranch(nn.Module):
         -------
         bev : (C, nx, ny) float32 tensor on *device*.
         """
-        import torchvision.transforms.functional as TF
         import torch.nn.functional as _F
+        import torchvision.transforms.functional as TF
+
         from data import stereo_depth as _stereo_depth
 
         target_h, target_w = self.target_hw
 
         # 1. stereo depth (rectified frame)
-        sd       = _stereo_depth(sample, self.sgbm_cfg)
-        img_np   = sd.rect_left          # (H, W, 3) uint8, rectified-left
-        depth_np = sd.depth              # (H, W) float32, 0 = invalid
+        sd = _stereo_depth(sample, self.sgbm_cfg)
+        img_np = sd.rect_left  # (H, W, 3) uint8, rectified-left
+        depth_np = sd.depth  # (H, W) float32, 0 = invalid
         img_h, img_w = img_np.shape[:2]
 
         # 2. image → normalised tensor
-        img_t = TF.to_tensor(img_np)
-        img_t = TF.resize(img_t, [target_h, target_w])
-        img_t = TF.normalize(img_t,
-                             mean=[0.485, 0.456, 0.406],
-                             std =[0.229, 0.224, 0.225])
-        img_batch = img_t.unsqueeze(0).to(device)              # (1, 3, H, W)
+        img_t = TF.to_tensor(img_np)  # HWC uint8 → CHW float in [0, 1]
+        img_t = TF.resize(img_t, [target_h, target_w])  # exact size, no letterbox
+        # Backbone-specific normalisation: ImageNet stats for the CNN backbone,
+        # plain [0, 1] for YOLO (which expects /255 with no mean/std subtraction).
+        if self.cfg.img_backbone == "efficientnet":
+            img_t = TF.normalize(img_t,
+                                 mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        img_batch = img_t.unsqueeze(0).to(device)  # (1, 3, H, W)
 
         # 3. depth → tensor, resize
         depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0)
-        depth_t = _F.interpolate(depth_t, size=(target_h, target_w), mode="nearest")
-        depth_batch = depth_t.to(device)                       # (1, 1, H, W)
+        depth_t = _F.interpolate(depth_t,
+                                 size=(target_h, target_w),
+                                 mode="nearest")
+        depth_batch = depth_t.to(device)  # (1, 1, H, W)
 
         # 4. intrinsics: rectified P1[:3,:3], scaled to target resolution
         K_np = sd.rect.P1[:3, :3].astype(np.float32)
-        K_np[0] *= target_w / img_w   # fx, cx
-        K_np[1] *= target_h / img_h   # fy, cy
-        K = torch.from_numpy(K_np).to(device)                  # (3, 3)
+        K_np[0] *= target_w / img_w  # fx, cx
+        K_np[1] *= target_h / img_h  # fy, cy
+        K = torch.from_numpy(K_np).to(device)  # (3, 3)
 
         # 5. extrinsic: rectified-left → ego  (T_left2ego @ R1^T)
         R1T_4x4 = np.eye(4)
         R1T_4x4[:3, :3] = sd.rect.R1.T
-        T_cam2ego = torch.from_numpy(
-            (sample.calibration.left_to_ego.astype(np.float64) @ R1T_4x4)
-            .astype(np.float32)
-        ).to(device)                                           # (4, 4)
+        T_cam2ego = torch.from_numpy((sample.calibration.left_to_ego.astype(
+            np.float64) @ R1T_4x4).astype(np.float32)).to(device)  # (4, 4)
 
         self.model.to(device).eval()
         with torch.no_grad():
             bev = self.model(img_batch, depth_batch, K, T_cam2ego)
-        return bev.squeeze(0)                                  # (C, nx, ny)
+        return bev.squeeze(0)  # (C, nx, ny)
 
 
 # ===========================================================================
@@ -698,22 +815,22 @@ def pillarize(points: np.ndarray, cfg: PillarConfig):
     nx, ny = cfg.grid_size
 
     # 1. filter points within the volume of interest
-    mask = (
-        (points[:, 0] >= x_min) & (points[:, 0] < x_max) &
-        (points[:, 1] >= y_min) & (points[:, 1] < y_max) &
-        (points[:, 2] >= z_min) & (points[:, 2] < z_max)
-    )
+    mask = ((points[:, 0] >= x_min) & (points[:, 0] < x_max) &
+            (points[:, 1] >= y_min) & (points[:, 1] < y_max) &
+            (points[:, 2] >= z_min) & (points[:, 2] < z_max))
     pts = points[mask]
     if pts.shape[0] == 0:
         return (
             np.zeros((0, cfg.max_points_per_pillar, 9), dtype=np.float32),
             np.zeros((0, 2), dtype=np.int64),
-            np.zeros((0,), dtype=np.int64),
+            np.zeros((0, ), dtype=np.int64),
         )
 
     # 2. assign each point to its cell (ix, iy)
-    ix = np.clip(((pts[:, 0] - x_min) / cfg.pillar_size).astype(np.int64), 0, nx - 1)
-    iy = np.clip(((pts[:, 1] - y_min) / cfg.pillar_size).astype(np.int64), 0, ny - 1)
+    ix = np.clip(((pts[:, 0] - x_min) / cfg.pillar_size).astype(np.int64), 0,
+                 nx - 1)
+    iy = np.clip(((pts[:, 1] - y_min) / cfg.pillar_size).astype(np.int64), 0,
+                 ny - 1)
     pillar_keys = ix * ny + iy  # unique scalar id per cell
 
     # 3. group points per pillar (sort by key, then take contiguous blocks)
@@ -722,23 +839,25 @@ def pillarize(points: np.ndarray, cfg: PillarConfig):
     ix_sorted, iy_sorted = ix[order], iy[order]
     keys_sorted = pillar_keys[order]
 
-    unique_keys, start_idx, counts = np.unique(
-        keys_sorted, return_index=True, return_counts=True
-    )
+    unique_keys, start_idx, counts = np.unique(keys_sorted,
+                                               return_index=True,
+                                               return_counts=True)
 
     # if there are too many non-empty pillars, keep the most populated ones
     if unique_keys.shape[0] > cfg.max_pillars:
-        top = np.sort(np.argsort(-counts)[: cfg.max_pillars])
-        unique_keys, start_idx, counts = unique_keys[top], start_idx[top], counts[top]
+        top = np.sort(np.argsort(-counts)[:cfg.max_pillars])
+        unique_keys, start_idx, counts = unique_keys[top], start_idx[
+            top], counts[top]
 
     P = unique_keys.shape[0]
-    pillar_points = np.zeros((P, cfg.max_points_per_pillar, 9), dtype=np.float32)
+    pillar_points = np.zeros((P, cfg.max_points_per_pillar, 9),
+                             dtype=np.float32)
     pillar_coords = np.zeros((P, 2), dtype=np.int64)
-    npoints = np.zeros((P,), dtype=np.int64)
+    npoints = np.zeros((P, ), dtype=np.int64)
 
     for i, (start, count) in enumerate(zip(start_idx, counts)):
         n = min(count, cfg.max_points_per_pillar)
-        sl = pts_sorted[start : start + n]  # (n, 4) -> x, y, z, intensity
+        sl = pts_sorted[start:start + n]  # (n, 4) -> x, y, z, intensity
 
         cell_ix, cell_iy = ix_sorted[start], iy_sorted[start]
         x_center = x_min + (cell_ix + 0.5) * cfg.pillar_size
@@ -752,7 +871,8 @@ def pillarize(points: np.ndarray, cfg: PillarConfig):
         xc, yc, zc = x - mean_xyz[0], y - mean_xyz[1], z - mean_xyz[2]
         xp, yp = x - x_center, y - y_center
 
-        feat = np.stack([x, y, z, intensity, xc, yc, zc, xp, yp], axis=1)  # (n, 9)
+        feat = np.stack([x, y, z, intensity, xc, yc, zc, xp, yp],
+                        axis=1)  # (n, 9)
         pillar_points[i, :n] = feat
         pillar_coords[i] = (cell_ix, cell_iy)
         npoints[i] = n
@@ -769,7 +889,8 @@ class PillarFeatureNet(nn.Module):
         self.bn = nn.BatchNorm1d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, pillar_points: torch.Tensor, npoints: torch.Tensor) -> torch.Tensor:
+    def forward(self, pillar_points: torch.Tensor,
+                npoints: torch.Tensor) -> torch.Tensor:
         """
         pillar_points: (P, N, 9)
         npoints:       (P,) real points per pillar (the rest is zero-padding)
@@ -777,8 +898,9 @@ class PillarFeatureNet(nn.Module):
         """
         P, N, D = pillar_points.shape
 
-        idx = torch.arange(N, device=pillar_points.device).unsqueeze(0)  # (1, N)
-        valid_mask = idx < npoints.unsqueeze(1)                          # (P, N)
+        idx = torch.arange(N,
+                           device=pillar_points.device).unsqueeze(0)  # (1, N)
+        valid_mask = idx < npoints.unsqueeze(1)  # (P, N)
 
         x = self.linear(pillar_points.reshape(P * N, D))
         x = self.bn(x)
@@ -787,7 +909,8 @@ class PillarFeatureNet(nn.Module):
         # padding points should not contribute to the max-pool
         x = x.masked_fill(~valid_mask.unsqueeze(-1), float("-inf"))
         pooled, _ = x.max(dim=1)
-        pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+        pooled = torch.where(torch.isfinite(pooled), pooled,
+                             torch.zeros_like(pooled))
         return pooled
 
 
@@ -799,15 +922,18 @@ class PointPillarsScatter(nn.Module):
         self.nx, self.ny = grid_size
         self.channels = channels
 
-    def forward(self, pillar_features: torch.Tensor, pillar_coords: torch.Tensor) -> torch.Tensor:
+    def forward(self, pillar_features: torch.Tensor,
+                pillar_coords: torch.Tensor) -> torch.Tensor:
         """
         pillar_features: (P, C)
         pillar_coords:   (P, 2) indices (ix, iy)
         return:          (C, nx, ny)
         """
         canvas = torch.zeros(
-            self.channels, self.nx * self.ny,
-            dtype=pillar_features.dtype, device=pillar_features.device,
+            self.channels,
+            self.nx * self.ny,
+            dtype=pillar_features.dtype,
+            device=pillar_features.device,
         )
         flat_idx = pillar_coords[:, 0] * self.ny + pillar_coords[:, 1]
         canvas[:, flat_idx] = pillar_features.t()
@@ -817,16 +943,24 @@ class PointPillarsScatter(nn.Module):
 class PointPillarsBranch(nn.Module):
     """End-to-end module: raw point cloud -> BEV LiDAR feature map."""
 
-    def __init__(self, cfg: PillarConfig, pillar_feat_channels: int = 64, use_backbone: bool = True):
+    def __init__(self,
+                 cfg: PillarConfig,
+                 pillar_feat_channels: int = 64,
+                 use_backbone: bool = True):
         super().__init__()
         self.cfg = cfg
-        self.pfn = PillarFeatureNet(in_channels=9, out_channels=pillar_feat_channels)
-        self.scatter = PointPillarsScatter(cfg.grid_size, channels=pillar_feat_channels)
+        self.pfn = PillarFeatureNet(in_channels=9,
+                                    out_channels=pillar_feat_channels)
+        self.scatter = PointPillarsScatter(cfg.grid_size,
+                                           channels=pillar_feat_channels)
         self.use_backbone = use_backbone
         if use_backbone:
-            self.backbone = BEVBackbone2D(in_channels=pillar_feat_channels, out_channels=LIDAR_BEV_CHANNELS)
+            self.backbone = BEVBackbone2D(in_channels=pillar_feat_channels,
+                                          out_channels=LIDAR_BEV_CHANNELS)
 
-    def forward(self, points: np.ndarray, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    def forward(
+        self, points: np.ndarray, device: torch.device = torch.device("cpu")
+    ) -> torch.Tensor:
         pillar_points, pillar_coords, npoints = pillarize(points, self.cfg)
         nx, ny = self.cfg.grid_size
 
@@ -857,16 +991,16 @@ class BEVFusionConfig:
     """
 
     camera_channels: int = G.CAMERA_BEV_CHANNELS  # C_cam Stage A must emit
-    lidar_channels: int = G.LIDAR_BEV_CHANNELS    # C_lidar Stage A must emit
-    out_channels: int = G.FUSED_CHANNELS          # fused feature depth -> head
-    grid_size: tuple[int, int] = G.GRID_SIZE      # (nx, ny), shared by both branches
-    num_classes: int = G.NUM_CLASSES              # set by the class filter (doc §05)
+    lidar_channels: int = G.LIDAR_BEV_CHANNELS  # C_lidar Stage A must emit
+    out_channels: int = G.FUSED_CHANNELS  # fused feature depth -> head
+    grid_size: tuple[int,
+                     int] = G.GRID_SIZE  # (nx, ny), shared by both branches
+    num_classes: int = G.NUM_CLASSES  # set by the class filter (doc §05)
     head_channels: int = 64
 
     @classmethod
-    def from_bev_maps(
-        cls, bev_camera: torch.Tensor, bev_lidar: torch.Tensor, **overrides
-    ) -> "BEVFusionConfig":
+    def from_bev_maps(cls, bev_camera: torch.Tensor, bev_lidar: torch.Tensor,
+                      **overrides) -> "BEVFusionConfig":
         """Read the contract straight off the two Stage A BEV tensors.
 
         This is the "go back to Stage A" loop: whatever channels/grid the
@@ -894,13 +1028,14 @@ class BEVFusion(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-    def forward(self, bev_camera: torch.Tensor, bev_lidar: torch.Tensor) -> torch.Tensor:
+    def forward(self, bev_camera: torch.Tensor,
+                bev_lidar: torch.Tensor) -> torch.Tensor:
         cam, lid = _as_batched(bev_camera), _as_batched(bev_lidar)
-        assert cam.shape[0] == lid.shape[0], f"batch mismatch: {cam.shape[0]} vs {lid.shape[0]}"
+        assert cam.shape[0] == lid.shape[
+            0], f"batch mismatch: {cam.shape[0]} vs {lid.shape[0]}"
         assert cam.shape[-2:] == lid.shape[-2:], (
             f"BEV grids not aligned: camera {tuple(cam.shape[-2:])} vs lidar "
-            f"{tuple(lid.shape[-2:])} — cannot fuse cell-by-cell (doc §02)"
-        )
+            f"{tuple(lid.shape[-2:])} — cannot fuse cell-by-cell (doc §02)")
         assert cam.shape[1] == self.cfg.camera_channels, (
             f"camera BEV has {cam.shape[1]} ch, fusion expects {self.cfg.camera_channels}"
         )
@@ -925,13 +1060,20 @@ class ConcatConvFusion(BEVFusion):
         c_in = cfg.camera_channels + cfg.lidar_channels
         self.block = nn.Sequential(
             nn.Conv2d(c_in, cfg.out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(cfg.out_channels), nn.ReLU(inplace=True),
-            nn.Conv2d(cfg.out_channels, cfg.out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(cfg.out_channels), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(cfg.out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(cfg.out_channels,
+                      cfg.out_channels,
+                      3,
+                      padding=1,
+                      bias=False),
+            nn.BatchNorm2d(cfg.out_channels),
+            nn.ReLU(inplace=True),
         )
 
     def _fuse(self, cam: torch.Tensor, lid: torch.Tensor) -> torch.Tensor:
-        return self.block(torch.cat([cam, lid], dim=1))  # (B, out_channels, nx, ny)
+        return self.block(torch.cat([cam, lid],
+                                    dim=1))  # (B, out_channels, nx, ny)
 
 
 class CrossAttentionFusion(BEVFusion):
@@ -943,7 +1085,8 @@ class CrossAttentionFusion(BEVFusion):
     """
 
     def _fuse(self, cam: torch.Tensor, lid: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Pipeline C cross-attention fusion: TODO (P4).")
+        raise NotImplementedError(
+            "Pipeline C cross-attention fusion: TODO (P4).")
 
 
 # ===========================================================================
@@ -966,11 +1109,15 @@ class CenterPointHead(nn.Module):
     (dx, dy) of the centre within its grid cell.
     """
 
-    def __init__(self, in_channels: int, num_classes: int, head_channels: int = 64):
+    def __init__(self,
+                 in_channels: int,
+                 num_classes: int,
+                 head_channels: int = 64):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Conv2d(in_channels, head_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(head_channels), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(head_channels),
+            nn.ReLU(inplace=True),
         )
         self.heatmap = nn.Conv2d(head_channels, num_classes, 1)
         self.offset = nn.Conv2d(head_channels, 2, 1)
@@ -996,11 +1143,15 @@ class BEVDetector(nn.Module):
     swappable concern. Feed it the two branch outputs.
     """
 
-    def __init__(self, cfg: BEVFusionConfig | None = None, fusion_cls: type[BEVFusion] = ConcatConvFusion):
+    def __init__(self,
+                 cfg: BEVFusionConfig | None = None,
+                 fusion_cls: type[BEVFusion] = ConcatConvFusion):
         super().__init__()
         self.cfg = cfg or BEVFusionConfig()
         self.fusion = fusion_cls(self.cfg)
-        self.head = CenterPointHead(self.cfg.out_channels, self.cfg.num_classes, self.cfg.head_channels)
+        self.head = CenterPointHead(self.cfg.out_channels,
+                                    self.cfg.num_classes,
+                                    self.cfg.head_channels)
 
     @classmethod
     def from_bev_maps(
@@ -1012,10 +1163,14 @@ class BEVDetector(nn.Module):
         **overrides,
     ) -> "BEVDetector":
         """Build a detector whose fusion inputs match the given Stage A outputs."""
-        cfg = BEVFusionConfig.from_bev_maps(bev_camera, bev_lidar, num_classes=num_classes, **overrides)
+        cfg = BEVFusionConfig.from_bev_maps(bev_camera,
+                                            bev_lidar,
+                                            num_classes=num_classes,
+                                            **overrides)
         return cls(cfg, fusion_cls=fusion_cls)
 
-    def forward(self, bev_camera: torch.Tensor, bev_lidar: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, bev_camera: torch.Tensor,
+                bev_lidar: torch.Tensor) -> dict[str, torch.Tensor]:
         return self.head(self.fusion(bev_camera, bev_lidar))
 
 
@@ -1027,7 +1182,9 @@ def describe(detector: BEVDetector) -> None:
     print(f"  camera BEV : (B, {c.camera_channels}, {nx}, {ny})")
     print(f"  lidar  BEV : (B, {c.lidar_channels}, {nx}, {ny})")
     print(f"  fused      : (B, {c.out_channels}, {nx}, {ny})")
-    print(f"  head out   : heatmap (B, {c.num_classes}, {nx}, {ny}) + offset (B, 2, {nx}, {ny})")
+    print(
+        f"  head out   : heatmap (B, {c.num_classes}, {nx}, {ny}) + offset (B, 2, {nx}, {ny})"
+    )
     print("parameters:")
     print(f"  fusion : {num_parameters(detector.fusion):,}")
     print(f"  head   : {num_parameters(detector.head):,}")
@@ -1046,11 +1203,11 @@ def _lidar_bev(
     z_range=G.Z_RANGE,
 ) -> torch.Tensor:
     """Run the PointPillars branch on one StereoSample → (C, nx, ny)."""
-    cfg    = PillarConfig(x_range=x_range, y_range=y_range, z_range=z_range)
+    cfg = PillarConfig(x_range=x_range, y_range=y_range, z_range=z_range)
     branch = PointPillarsBranch(cfg).to(device).eval()
-    pts    = sample.lidar_xyz.astype(np.float32)
-    inten  = sample.lidar_features["intensity"][:, None].astype(np.float32)
-    pts    = np.concatenate([pts, inten], axis=1)
+    pts = sample.lidar_xyz.astype(np.float32)
+    inten = sample.lidar_features["intensity"][:, None].astype(np.float32)
+    pts = np.concatenate([pts, inten], axis=1)
     with torch.no_grad():
         return branch(pts, device=device)
 
@@ -1074,7 +1231,7 @@ def _camera_bev(
     img_t = TF.resize(img_t, [target_h, target_w])
     img_t = TF.normalize(img_t,
                          mean=[0.485, 0.456, 0.406],
-                         std =[0.229, 0.224, 0.225])
+                         std=[0.229, 0.224, 0.225])
     img_batch = img_t.unsqueeze(0).to(device)
 
     # scale K to the resized resolution
@@ -1084,10 +1241,9 @@ def _camera_bev(
     K = torch.from_numpy(K_np).to(device)
 
     T_cam2ego = torch.from_numpy(
-        sample.calibration.left_to_ego.astype(np.float32)
-    ).to(device)
+        sample.calibration.left_to_ego.astype(np.float32)).to(device)
 
-    cfg   = MonoBEVConfig(x_range=x_range, y_range=y_range)
+    cfg = MonoBEVConfig(x_range=x_range, y_range=y_range)
     model = MonoBEV(cfg).to(device).eval()
     with torch.no_grad():
         bev = model(img_batch, K, T_cam2ego)
@@ -1102,7 +1258,7 @@ def _stereo_bev(
     y_range=G.Y_RANGE,
 ) -> torch.Tensor:
     """Run the StereoBEVBranch on one StereoSample → (C, nx, ny)."""
-    cfg    = StereoBEVConfig(x_range=x_range, y_range=y_range)
+    cfg = StereoBEVConfig(x_range=x_range, y_range=y_range)
     branch = StereoBEVBranch(cfg=cfg, target_hw=target_hw)
     return branch(sample, device)
 

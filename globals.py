@@ -19,14 +19,17 @@ name, and ``import globals`` binds the module, not the builtin.
 """
 from __future__ import annotations
 
+# Camera
+
+CAM_FEAT_DIM = 64
 
 # --------------------------------------------------------------------------- #
 # Shared BEV grid (must be identical across every branch and the fusion)
 # --------------------------------------------------------------------------- #
-X_RANGE: tuple[float, float] = (0.0, 50.0)    # forward (ego +x)
+X_RANGE: tuple[float, float] = (0.0, 50.0)  # forward (ego +x)
 Y_RANGE: tuple[float, float] = (-20.0, 20.0)  # lateral (ego +y)
-Z_RANGE: tuple[float, float] = (-3.0, 1.0)    # height pre-filter
-BEV_RES_M: float = 0.25                       # metres per BEV cell
+Z_RANGE: tuple[float, float] = (-3.0, 1.0)  # height pre-filter
+BEV_RES_M: float = 0.25  # metres per BEV cell
 
 
 def grid_size(
@@ -45,12 +48,13 @@ GRID_SIZE: tuple[int, int] = grid_size()  # (200, 160) with defaults
 # --------------------------------------------------------------------------- #
 # Channel contract between Stage A (the two branches) and the fusion + head
 # --------------------------------------------------------------------------- #
-CAMERA_BEV_CHANNELS: int = 64   # C_cam — StereoBEV/MonoBEV context width
-LIDAR_BEV_CHANNELS: int = 128   # C_lidar — PointPillars BEVBackbone2D output
-FUSED_CHANNELS: int = 128       # fused feature depth fed to the head
+CAMERA_BEV_CHANNELS: int = 64  # C_cam — StereoBEV/MonoBEV context width
+LIDAR_BEV_CHANNELS: int = 128  # C_lidar — PointPillars BEVBackbone2D output
+FUSED_CHANNELS: int = 128  # fused feature depth fed to the head
 
 # --------------------------------------------------------------------------- #
 # Classes (design doc §05) — placeholder until the class filter pins the set
 # --------------------------------------------------------------------------- #
-CLASSES: tuple[str, ...] = ("REGULAR_VEHICLE", "PEDESTRIAN", "CONSTRUCTION_CONE")
+CLASSES: tuple[str,
+               ...] = ("REGULAR_VEHICLE", "PEDESTRIAN", "CONSTRUCTION_CONE")
 NUM_CLASSES: int = len(CLASSES)
