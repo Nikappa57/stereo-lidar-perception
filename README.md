@@ -1,24 +1,75 @@
 # stereo-lidar-perception
 
+**Stereo + LiDAR fusion for 3D object detection in bird's-eye view.**
+
+A Computer Vision course project (AIRO master's program, Sapienza University of Rome) by three members of the [Fast Charge](https://fastcharge.diag.uniroma1.it/) Formula Student Driverless team. The method is developed and benchmarked on **Argoverse 2** and designed to port to the team's driverless car for cone detection.
+
+---
+
+## Idea
+
+Combine a stereo camera and a LiDAR into a single top-down (bird's-eye-view) detector that outputs each object's ground position `(x, y)` and class — exactly what mapping, SLAM and motion planning consume.
+
+Two principles drive the design:
+
+- **Fuse only where data are aligned.** RGB and stereo depth share the image plane, so they fuse in 2D; the LiDAR lives in its own frame, so the two sensors only meet in a common **bird's-eye-view (BEV)** grid.
+- **Use measured depth, not predicted depth.** Most camera–LiDAR detectors fuse LiDAR with a *monocular* camera and must estimate per-pixel depth to lift features into 3D — an error-prone step. We have **stereo** depth, so each camera feature is placed into its correct BEV cell by geometry rather than by a learned guess. This is the core novelty.
+
+## Architecture
+
+<div align="center">
+  <img src="docs/img/network.svg" width="560" alt="Network architecture in six stages">
+</div>
+
+The main pipeline (mid fusion) has two branches that meet once, in BEV:
+
+1. **Camera backbone** — turns the left image into a grid of semantic features.
+2. **Splat to BEV** — places those features on the ground plane using stereo depth (no learnable parameters; pure geometry).
+3. **LiDAR stem** — encodes the LiDAR BEV map into features (already top-down).
+4. **Fusion** — both branches now share the grid, so they are stacked and convolved. This block is swappable (cross-attention drops in here).
+5. **BEV backbone** — 2D context reasoning over the fused grid.
+6. **Center head** — per-class heatmap + sub-cell offset, decoded into an object list.
+
+## Architectures explored
+
+We compare four fusion strategies along a single axis — *where the two sensors meet*. The lower the purple block, the later the fusion and the more independent the branches.
+
+| A — Mid fusion: image + BEV *(primary)* | B — + painted LiDAR range |
+| :---: | :---: |
+| <img src="docs/img/pipeline_a.svg" width="380"> | <img src="docs/img/pipeline_b.svg" width="380"> |
+| **C — Cross-attention fusion** | **D — Late fusion (baseline)** |
+| <img src="docs/img/pipeline_c.svg" width="380"> | <img src="docs/img/pipeline_d.svg" width="380"> |
+
+## Dataset
+
+We use **Argoverse 2** through the [`py123d`](https://pypi.org/project/py123d/) loader. Among large autonomous-driving datasets it is the only one that combines everything this project needs:
+
+- a real **stereo** camera pair (most AV datasets are mono-camera),
+- a dense **LiDAR** (two aggregated 32-beam sweeps),
+- a genuine small-object class — **`CONSTRUCTION_CONE`** — the closest available proxy to Formula Student track cones,
+- a **distance-based** detection metric that matches a centre-mapping task and transfers cleanly to cones.
+
+**Classes used:** `REGULAR_VEHICLE` (development and stability), `PEDESTRIAN`, and `CONSTRUCTION_CONE` (transfer-relevant small object).
+
 ## Installation
 
-### 1. Install Dataset Library
+### 1. Install the dataset library
 
-Install the `py123d` library with the specific dataset support (e.g., Argoverse 2):
+Install `py123d` with the dataset backend (Argoverse 2):
 
 ```bash
 pip install "py123d[av2]"
 ```
 
-### 2. Download Dataset
+### 2. Download the dataset
 
-Set the destination directory for the dataset:
+Set the destination directory:
 
 ```bash
 export AV2_DATA_ROOT=/path/to/argoverse
 ```
 
-Download a subset of logs (e.g., 5 logs from the validation set) to test your code:
+Download a subset of logs (e.g. 5 from the validation split) to test the code:
 
 ```bash
 py123d-download dataset=av2-sensor \
@@ -26,130 +77,57 @@ py123d-download dataset=av2-sensor \
     dataset.downloader.num_logs=5
 ```
 
-### 3. Convert Data
+### 3. Convert the data
 
-The `py123d` library uses Apache Arrow for fast data loading. Convert the downloaded data to this unified format:
+`py123d` uses Apache Arrow for fast loading. Convert the downloaded data:
 
 ```bash
 py123d-conversion dataset=av2-sensor
 ```
 
-*Note: The `dataset=av2-sensor-stream` option can be used to download and parse logs on the fly if disk space is limited.*
+> The `dataset=av2-sensor-stream` option downloads and parses logs on the fly if disk space is limited.
 
 ## Usage
 
-Set the workspace environment variable before running the code:
+Set the workspace path before running:
 
 ```bash
 export PY123D_DATA_ROOT="/your/data/path"
 ```
 
-### Scene API
-
-The `py123d` Scene API allows access to frame-by-frame data. Key methods include:
-
-- **Lidar (Depth):** `scene_api.get_lidar_at_iteration(iteration, "lidar_top")`
-- **Cameras:** `scene_api.get_camera_at_iteration(iteration, "pcam_f0")`
-- **Bounding Boxes (3D Labels):** `scene_api.get_box_detections_se3_at_iteration(iteration)`
-- **Vehicle Position:** `scene_api.get_ego_state_se3_at_iteration(iteration)`
-
-## Code Structure
-
-- **Imports:** Package dependencies.
-- **Globals:** Globally accessible configuration variables.
-- **Utils:** Helper and support functions.
-- **Data:** Dataset loading and preprocessing components.
-- **Network:** Neural network architecture definition.
-- **Train:** Training loop and optimization procedures.
-- **Evaluation:** Model testing and validation routines.
-
-## Perception Pipeline
-
-### Preprocessing (`preprocessing.py`)
-The preprocessing module is responsible for transforming raw stereo and LiDAR data into structured representations:
-- **Bird's-Eye-View (BEV):** Three pixel-aligned BEV branches on the same grid:
-  - **LiDAR BEV** — PointPillars (pillarize → PFN → scatter → BEV backbone).
-  - **Camera BEV (MonoBEV)** — Lift-Splat-Shoot from a single RGB image with a *predicted* depth distribution.
-  - **Stereo BEV (StereoBEV)** — Lift-Splat from the left-rectified image with a *grounded* SGBM depth map; the camera branch for Pipelines A & C.
-- **Camera Frustum:** Extracts LiDAR returns that fall inside a 2D camera detection box, lifted into a local frustum frame, optionally with RGB colors appended.
-- **Voxel Grid:** Builds a volumetric occupancy and feature grid from the ego-frame point cloud. Includes features like mean height, point density, and intensity.
-- **Clustering:** Euclidean-distance DBSCAN clustering of the point cloud, providing per-point labels and cluster statistics (centroids, extents).
-
-### PointPillars (`pointpillars.py`)
-The LiDAR branch utilizes a PointPillars architecture to encode raw point clouds into a Bird's-Eye-View (BEV) feature map. The pipeline includes:
-1. **Pillarization:** Bins the 3D point cloud into vertical columns (pillars) on an x-y grid. Points are augmented with offsets to their pillar centroid and geometric cell center.
-2. **Pillar Feature Net (PFN):** A simplified PointNet (shared MLP and max-pooling) that computes a single feature vector for each pillar.
-3. **Scatter:** Scatters the extracted pillar features back onto the dense 2D grid to form a pseudo-image.
-4. **BEV Backbone 2D:** A lightweight 2D CNN that refines the pseudo-image, adding spatial context among neighbouring pillars.
-
-### MonoBEV — Camera Branch (`monobev.py`)
-The camera branch implements the **Lift-Splat-Shoot** paradigm to produce a BEV feature map from a single calibrated RGB image, pixel-aligned with the LiDAR BEV for direct fusion:
-1. **Shared CNN backbone** (EfficientNet-style, stride 8×) extracts dense image features.
-2. **Depth head** predicts a softmax distribution over D=41 depth bins per pixel.
-3. **Context head** predicts a C=64 semantic feature vector per pixel.
-4. **Outer product** — `context ⊗ depth_dist` — weights each depth bin's feature by its predicted probability, building a `H'×W'×D` frustum cloud.
-5. **Lift to 3D:** Every frustum point is unprojected to ego frame via `K⁻¹` and the camera-to-ego extrinsic `T_cam2ego`.
-6. **Voxel pooling (Splat):** Frustum features are sum-pooled into BEV cells using the sort + cumulative-sum boundary trick — O(M log M), fully vectorised.
-7. **BEV Backbone 2D** refines the splatted map.
-
-**Output:** `(B, C, nx, ny)` aligned with the LiDAR BEV and ready for channel-wise fusion.
-
-### StereoBEV — Grounded Stereo-Depth Branch (`stereobev.py` + `preprocessing.py`)
- Structurally identical to MonoBEV but uses **grounded SGBM metric depth** instead of a predicted depth distribution — no outer product, no depth-bin dimension:
-1. Compute metric depth via SGBM (`stereo.stereo_depth`) in the rectified-left frame.
-2. Resize rectified left image + depth map to the backbone input resolution.
-3. Scale the rectified intrinsics (`P1[:3,:3]`) and build the rectified-left → ego extrinsic (`T_left2ego @ R1ᵀ`).
-4. **Shared CNN backbone** (same `_EfficientNetBackbone`) + **context head** → `(B, C, H', W')`.
-5. **Grounded back-projection** (`_build_grounded_frustum`): each pixel ray is scaled by its SGBM depth directly; pixels with invalid depth (0) are masked out.
-6. **Splat** — same sort+cumsum pooling from `monobev.splat`.
-7. **BEV Backbone 2D** refinement.
-
-**Output:** `(B, C, nx, ny)` with `C=64`, pixel-aligned with the LiDAR and MonoBEV BEVs.
-
-| | LiDAR BEV | MonoBEV | StereoBEV |
-|---|---|---|---|
-| Depth source | measured | predicted | measured (stereo) |
-| Frustum | — | `H'×W'×D` | `H'×W'` |
-| Output ch | 128 | 64 | 64 |
-
-### Stereo — Depth Branch (`stereo.py`)
-The stereo branch turns the raw left/right image pair into metric geometry with classic block matching (no learning):
-1. **Rectify** — `cv2.stereoRectify` removes the small residual rotation / principal-point offset between `pcam_stereo_l` and `pcam_stereo_r` so epipolar lines are horizontal.
-2. **Disparity** — `cv2.StereoSGBM` matches the rectified pair (matched on a downscaled copy for speed, then scaled back to full res).
-3. **Depth** — `depth = fx · baseline / disparity` (fx ≈ 1724 rect, baseline ≈ 0.4996 m).
-4. **Lift** — `cv2.reprojectImageTo3D` → 3-D points, transformed rectified-left → left → **ego**, giving a coloured point cloud in the same frame as `lidar_xyz`.
-5. **Stereo BEV** — the cloud is binned into a geometric BEV (occupancy, density, max/mean height, mean RGB) on the **same grid** as the LiDAR / camera BEVs.
-
-**Output:** `StereoDepth` (disparity + metric depth) and a `(C, nx, ny)` stereo BEV. Validated against the sparse LiDAR depth: **median error ≈ 0.4 m, ~82 % of pixels within 2 m**.
-
-> **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for the full step-by-step explanation with equations and implementation notes.
-
-### Quick start — running all branches
+The `py123d` Scene API gives frame-by-frame access:
 
 ```python
-from preprocessing import (
-    PointPillarsBranch, MonoBEV, StereoBEVBranch,
-    _lidar_bev, _camera_bev, _stereo_bev, _print_bev_stats,
-)
-from data import Py123dDataset
-import torch
-
-dataset = Py123dDataset(split_names=["av2-sensor_val"])
-sample  = dataset[0].to_stereo_sample()
-device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-bev_lidar  = _lidar_bev(sample, device)   # (128, 200, 160)  LiDAR BEV
-bev_camera = _camera_bev(sample, device)  # ( 64, 200, 160)  MonoBEV camera BEV
-bev_stereo = _stereo_bev(sample, device)  # ( 64, 200, 160)  StereoBEV camera BEV
-
-_print_bev_stats("LiDAR BEV",  bev_lidar.cpu().numpy())
-_print_bev_stats("Camera BEV", bev_camera.cpu().numpy())
-_print_bev_stats("Stereo BEV", bev_stereo.cpu().numpy())
+scene_api.get_lidar_at_iteration(iteration, "lidar_top")        # LiDAR point cloud
+scene_api.get_camera_at_iteration(iteration, "pcam_stereo_l")   # stereo camera
+scene_api.get_box_detections_se3_at_iteration(iteration)        # 3D box labels
+scene_api.get_ego_state_se3_at_iteration(iteration)             # ego pose
 ```
 
-All three tensors share the same `(nx=200, ny=160)` spatial grid at 0.25 m/cell, covering `x∈[0,50] m` forward and `y∈[-20,20] m` lateral — ready for channel-wise concatenation in Pipeline A or cross-attention fusion in Pipeline C.
+## Code structure
 
-### BEV Fusion — Detection Head (`network.py`)
-The two BEV maps are fused (`ConcatConvFusion` — concat + conv) and read by a 2D `CenterPointHead` that outputs a per-class centre heatmap + sub-cell `(x, y)` offset (no yaw/z). The fusion block has a fixed interface (two BEV maps in, one out), so Pipeline C swaps in `CrossAttentionFusion` as a drop-in replacement.
+| File | Role |
+| --- | --- |
+| `globals.py` | Configuration: BEV grid, classes, feature dimensions. |
+| `utils.py` | Helpers and preprocessing visualizations. |
+| `data.py` | Dataset loading; produces a per-frame `StereoSample`. |
+| `preprocessing.py` | Input representations: BEV map, voxel grid, frustum points, clustering. |
+| `pointpillars.py` | LiDAR pillar encoding and grid configuration. |
+| `network.py` | Network architecture (camera / LiDAR / fusion). |
+| `train.py` | Training loop and optimization. |
+| `evaluation.py` | Testing and validation. |
 
-> **See** [`docs/perception_pipeline.md`](docs/perception_pipeline.md) for full step-by-step explanations with equations and implementation notes, and [`docs/bev_fusion.md`](docs/bev_fusion.md) for the BEV fusion input contract (what Stage A must emit, and why).
+## Evaluation
+
+Two single-sensor baselines (camera-only and LiDAR-only) set the floor — fusion must beat both. Detection is scored with the Argoverse 2 **distance-AP** metric (true positives at 0.5 / 1 / 2 / 4 m) plus the composite detection score, reported per class and stratified by range.
+
+## References
+
+- **BEVFusion** — Multi-Task Multi-Sensor Fusion with Unified BEV Representation. [arXiv:2205.13542](https://arxiv.org/abs/2205.13542)
+- **SLBEVFusion** — 3D detection using stereo camera and LiDAR fusion with BEV (Neurocomputing, 2024).
+- **FutrTrack** — Camera-LiDAR Fusion Transformer for 3D MOT. [arXiv:2510.19981](https://arxiv.org/abs/2510.19981)
+- **Argoverse 2** — Next Generation Datasets for Self-Driving Perception and Forecasting. [arXiv:2301.00493](https://arxiv.org/abs/2301.00493)
+
+## Authors
+
+Leonardo Galgano · Lorenzo Gaudino · Vittorio Cava — Sapienza University of Rome, Fast Charge Driverless.
