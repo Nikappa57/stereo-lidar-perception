@@ -1,4 +1,4 @@
-"""Tests + a runnable comparison for the stereo branch (``stereo.py``).
+"""Tests + a runnable comparison for the stereo depth (``data.py``).
 
 Two ways to use this file:
 
@@ -21,16 +21,16 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
 # Make the repo root importable so ``data`` / ``stereo`` resolve from anywhere.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data import Py123dDataset, StereoSample  # noqa: E402
-from pointpillars import PillarConfig  # noqa: E402
-from stereo import (  # noqa: E402
+from data import (  # noqa: E402
+    Py123dDataset,
+    StereoSample,
     StereoSGBMConfig,
     build_rectification,
     disparity_to_depth,
@@ -38,6 +38,7 @@ from stereo import (  # noqa: E402
     stereo_depth,
     stereo_point_cloud,
 )
+from network import PillarConfig  # noqa: E402
 
 DEFAULT_SPLIT = "av2-sensor_val"
 
@@ -48,10 +49,10 @@ def build_dataset(max_num_scenes: int = 1, split: str = DEFAULT_SPLIT) -> Py123d
 
 def compare_depth_to_lidar(
     sample: StereoSample,
-    cfg: Optional[StereoSGBMConfig] = None,
+    cfg: StereoSGBMConfig | None = None,
     min_m: float = 1.0,
     max_m: float = 60.0,
-) -> Optional[Dict[str, float]]:
+) -> dict[str, float] | None:
     """Stereo depth vs. the sparse LiDAR depth on their shared pixels.
 
     Both depths live in the **original left image** frame: ``sample.depth_left``
@@ -200,7 +201,7 @@ def test_depth_matches_lidar_depth(sample: StereoSample):
 # --------------------------------------------------------------------------- #
 # Runnable comparison / visualisation
 # --------------------------------------------------------------------------- #
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Compare stereo depth against LiDAR depth.")
     parser.add_argument("--split", default=DEFAULT_SPLIT, help="py123d split to load")
     parser.add_argument("--frames", type=int, nargs="+", default=[0, 50, 100],

@@ -1,13 +1,10 @@
 # Visualize preprocessing results
 
-from typing import Tuple
-
 import numpy as np
 import matplotlib.pyplot as plt
 
-from data import StereoSample
-from preprocessing import frustum_points, voxel_grid, cluster_points
-from pointpillars import PillarConfig
+from data import StereoSample, frustum_points, voxel_grid, cluster_points
+from network import PillarConfig
 
 
 

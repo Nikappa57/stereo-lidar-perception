@@ -16,7 +16,8 @@ raw dataset ─► py123d (unified Arrow format) ─► data.py ─► preproces
 
 `data.py` is the *data* stage. It reads raw sensors, calibration and labels
 through the unified `py123d` **Scene API** and assembles a per-frame
-**`StereoSample`** that is handed to the (not-yet-written) preprocessing module.
+**`StereoSample`**, then provides the geometric preprocessing representations
+(stereo depth/BEV, frustum, voxel, clustering) built from it.
 
 Because everything goes through `py123d.api.SceneAPI`, the loader is
 **dataset-agnostic**: switching from Argoverse 2 to nuPlan / nuScenes / Waymo /

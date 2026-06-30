@@ -114,7 +114,7 @@ def save_fusion_figure(save_path: str = "docs/img/bev_fusion_test_output.png") -
     import matplotlib.pyplot as plt
 
     from data import Py123dDataset
-    from preprocessing import _lidar_bev, _stereo_bev
+    from network import _lidar_bev, _stereo_bev
 
     dataset = Py123dDataset(split_names=["av2-sensor_val"], max_num_scenes=1)
     frame = dataset.get_frame(0, dataset.scenes[0].number_of_history_iterations + 13)

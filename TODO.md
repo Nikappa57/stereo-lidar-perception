@@ -12,12 +12,13 @@ Legend: `critical` / `high` / `medium` / `low` = §11 priority.
 
 - **Data** (`data.py`): py123d loader → per-frame `StereoSample`; 2D boxes auto-projected from 3D; calibration/extrinsics exposed.
 - **Frame fix** (`data.py`): global→ego box conversion (`boxes_3d_ego`) + frame-consistency guard (`assert_boxes_in_sensor_range`). — §11 critical (half) + medium.
-- **Preprocessing** (`preprocessing.py`): BEV / voxel / frustum / DBSCAN representations.
+- **Preprocessing** (`data.py`): stereo depth/BEV / voxel / frustum / DBSCAN representations.
 - **Stereo depth** (`stereo.py`): SGBM rectification + disparity → metric depth, wired into the stereo branch. — §11 critical (SGBM path; RAFT-Stereo still optional, §14).
 - **Camera→BEV splat**: `MonoBEV` (predicted-depth LSS) and `StereoBEV` (grounded stereo-depth splat). — §11 critical.
 - **LiDAR BEV**: `PointPillars` branch → `(128, 200, 160)`.
 - **BEV fusion + head** (`network.py`): `ConcatConvFusion` (A/B) + `CrossAttentionFusion` stub (C) behind a fixed `BEVFusion` interface; `CenterPointHead` (heatmap + offset, 2D only); `BEVDetector`. See [`docs/bev_fusion.md`](docs/bev_fusion.md).
 - **Notebooks**: `pipeline_a.ipynb`, `pipeline_b.ipynb` (imports/globals/utils/data/network/train/test, calling the `.py` modules).
+- **Restructure** → the prescribed **6-file layout** (`data` / `evaluation` / `globals` / `network` / `train` / `utils`): `network.py` is now the whole architecture, one block per diagram node (camera backbone → splat → branches → LiDAR stem → fusion → BEV backbone → head), absorbing `monobev.py`, `stereobev.py`, and `pointpillars.py`. All geometric preprocessing (SGBM stereo depth/BEV, frustum, voxel, clustering) folded into `data.py`. Type hints modernized to PEP 604 (`X | None`, builtin generics).
 
 ---
 
@@ -28,7 +29,7 @@ Legend: `critical` / `high` / `medium` / `low` = §11 priority.
 - [ ] `critical` **BEV target encoder** — rasterise `boxes_3d_ego[:, :2]` (centres) + class into the **same** tensors the head emits: `heatmap (num_classes, 200, 160)` + `offset (2, 200, 160)`. Gaussian splat per centre, sub-cell offset, class index. *This is the last thing missing before any training.*
 - [ ] `high` **Class selection & remap** — filter the 26–30 AV2 categories to the working subset (`REGULAR_VEHICLE` + `CONSTRUCTION_CONE` + one small class) and define a fixed label map; plan the AV2→FS cone remap for deployment. Sets `num_classes`.
 - [ ] `high` **Beam-downsampling util** — use the per-point channel in `lidar_features` to drop beams (64→32→16). One small function; unlocks the §08 density ablation.
-- [ ] `medium` **`globals.py`** — consolidate the shared grid/config (x/y range, resolution, class map) into one source of truth (currently duplicated across `PillarConfig` / `StereoBEVConfig` / `MonoBEVConfig`). Also rename to avoid shadowing the builtin `globals()`.
+- [x] `medium` **`globals.py`** — shared grid/config (x/y range, resolution, channel contract, class set) consolidated into one source of truth; `PillarConfig` / `StereoBEVConfig` / `MonoBEVConfig` / `BEVFusionConfig` now default to it. (Kept the `globals.py` name per the project layout; the module-vs-builtin shadowing caveat is documented in its docstring.)
 - [ ] `low` **Confirm stereo timing** — AV2 stereo runs slower than LiDAR; verify the sync the loader returns and that left/right are the same exposure.
 - [ ] **Pipeline B wiring** — inject the painted-range channel (`depth_left`) into the Stage A image fusion, behind a toggle (sparsity-aware conv). The BEV fusion block is unchanged.
 

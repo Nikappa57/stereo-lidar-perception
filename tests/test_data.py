@@ -23,7 +23,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -298,7 +298,7 @@ def _draw_frame(axes_flat: Sequence, frame: Frame, camera_ids: Sequence) -> int:
     return 0 if boxes is None else len(boxes.box_detections)
 
 
-def render_frame(frame: Frame, camera_ids: Optional[Sequence] = None, cols: int = 3):
+def render_frame(frame: Frame, camera_ids: Sequence | None = None, cols: int = 3):
     """Build a standalone figure for a single frame (used by ``--save``)."""
     ids: List = list(camera_ids) if camera_ids is not None else frame.available_camera_ids
     fig, axes_flat = _make_grid(ids, cols)
@@ -331,7 +331,7 @@ class FrameViewer:
         self,
         dataset: Py123dDataset,
         start_index: int = 0,
-        camera_ids: Optional[Sequence] = None,
+        camera_ids: Sequence | None = None,
     ) -> None:
         if len(dataset) == 0:
             raise ValueError("dataset has no frames to display")
@@ -430,7 +430,7 @@ def _flat_start_index(dataset: Py123dDataset, scene_index: int, iteration: int) 
     return start + iteration
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scroll through py123d frames with 3D bounding boxes.")
     parser.add_argument("--split", default=DEFAULT_SPLIT, help="py123d split name to load")
     parser.add_argument("--scene", type=int, default=0, help="scene index to start at")

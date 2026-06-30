@@ -17,11 +17,8 @@ Two principles drive the design:
 
 ## Architecture
 
-<div align="center">
-  <img src="docs/img/network.svg" width="560" alt="Network architecture in six stages">
-</div>
-
-The main pipeline (mid fusion) has two branches that meet once, in BEV:
+The main pipeline (mid fusion) has two branches that meet once, in BEV. Each
+stage below maps to one block in [`network.py`](network.py):
 
 1. **Camera backbone** — turns the left image into a grid of semantic features.
 2. **Splat to BEV** — places those features on the ground plane using stereo depth (no learnable parameters; pure geometry).
@@ -106,16 +103,16 @@ scene_api.get_ego_state_se3_at_iteration(iteration)             # ego pose
 
 ## Code structure
 
+Six modules (the prescribed layout):
+
 | File | Role |
 | --- | --- |
-| `globals.py` | Configuration: BEV grid, classes, feature dimensions. |
-| `utils.py` | Helpers and preprocessing visualizations. |
-| `data.py` | Dataset loading; produces a per-frame `StereoSample`. |
-| `preprocessing.py` | Input representations: BEV map, voxel grid, frustum points, clustering. |
-| `pointpillars.py` | LiDAR pillar encoding and grid configuration. |
-| `network.py` | Network architecture (camera / LiDAR / fusion). |
-| `train.py` | Training loop and optimization. |
-| `evaluation.py` | Testing and validation. |
+| `globals.py` | Single source of truth: shared BEV grid, channel contract, classes. |
+| `utils.py` | Visualization helpers (LiDAR density BEV + GT boxes, frustum, clusters). |
+| `data.py` | Dataset loading (`StereoSample`) **and** the geometric preprocessing representations: stereo depth/BEV, voxel grid, frustum points, clustering. |
+| `network.py` | Full architecture — one block per diagram node: camera branch (Mono/Stereo BEV), LiDAR stem (PointPillars), fusion, BEV backbone, CenterPoint head. |
+| `train.py` | Training loop and optimization *(stub)*. |
+| `evaluation.py` | Testing and validation *(stub)*. |
 
 ## Evaluation
 

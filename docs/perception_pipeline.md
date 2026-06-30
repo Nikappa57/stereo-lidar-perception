@@ -2,7 +2,7 @@
 
 This document provides an in-depth overview of the data preprocessing routines and the two BEV encoder architectures used within the stereo-LiDAR perception pipeline: the **LiDAR branch** (PointPillars) and the **Camera branch** (MonoBEV / Lift-Splat-Shoot).
 
-## 1. Preprocessing (`preprocessing.py`)
+## 1. Preprocessing (`data.py`)
 
 The preprocessing module converts raw multimodal sensor data (LiDAR point clouds and stereo camera images) into structured, computation-ready formats.
 
@@ -33,7 +33,7 @@ The preprocessing module converts raw multimodal sensor data (LiDAR point clouds
 
 ---
 
-## 2. PointPillars Architecture (`pointpillars.py`)
+## 2. PointPillars Architecture (`network.py`)
 
 The LiDAR branch leverages the PointPillars architecture, a fast encoder designed to process raw point clouds into dense BEV feature maps for accurate 3D object detection.
 
@@ -63,7 +63,7 @@ The LiDAR branch leverages the PointPillars architecture, a fast encoder designe
 
 ---
 
-## 3. MonoBEV — Lift-Splat-Shoot Camera Branch (`monobev.py` + `preprocessing.py`)
+## 3. MonoBEV — Lift-Splat-Shoot Camera Branch (`network.py`)
 
 The camera branch converts a single calibrated RGB image into a BEV feature map using the **Lift-Splat-Shoot (LSS)** paradigm (Philion & Fidler, NeurIPS 2020). The output grid is pixel-aligned with the LiDAR PointPillars BEV, enabling direct channel-wise fusion.
 
@@ -156,7 +156,7 @@ The triangular frustum shape and the Y-axis centering at y=0 m are a geometry sa
 
 ---
 
-## 4. Stereo Depth Branch (`stereo.py`)
+## 4. Stereo Depth Branch (`data.py`)
 
 The stereo branch recovers metric geometry from the raw left/right pair using **classic block matching** (`cv2.StereoSGBM`) — no learning, no training. It is the depth source that feeds the *stereo BEV* (and can supervise/replace the MonoBEV depth head).
 
@@ -229,7 +229,7 @@ The fan-shaped BEV footprint (single forward-camera FOV cone, centred on `y = 0`
 
 ---
 
-## 5. StereoBEV — Grounded Stereo-Depth Splat Branch (`stereobev.py` + `preprocessing.py`)
+## 5. StereoBEV — Grounded Stereo-Depth Splat Branch (`network.py`)
 
 The StereoBEV branch is the **camera branch for Pipelines A and C** (design doc §07). It is structurally identical to MonoBEV but replaces the *predicted* depth distribution with a **hard, metric depth** from the SGBM stereo matcher — grounding the splat in real geometry.
 
@@ -296,11 +296,11 @@ left-rectified image  depth map (SGBM)
 
 | Layer | Location | Role |
 |---|---|---|
-| `StereoBEVConfig` | `stereobev.py` | All hyper-parameters |
-| `_build_grounded_frustum` | `stereobev.py` | Back-projection kernel |
-| `StereoBEV` | `stereobev.py` | Core `nn.Module` (backbone → context → lift → splat → BEV CNN) |
-| `StereoBEVBranch` | `preprocessing.py` | End-to-end interface: takes a `StereoSample`, runs SGBM, preps tensors, calls `StereoBEV` |
-| `_stereo_bev` | `preprocessing.py` | Demo helper (instantiates `StereoBEVBranch`) |
+| `StereoBEVConfig` | `network.py` | All hyper-parameters |
+| `_build_grounded_frustum` | `network.py` | Back-projection kernel |
+| `StereoBEV` | `network.py` | Core `nn.Module` (backbone → context → lift → splat → BEV CNN) |
+| `StereoBEVBranch` | `network.py` | End-to-end interface: takes a `StereoSample`, runs SGBM, preps tensors, calls `StereoBEV` |
+| `_stereo_bev` | `network.py` | Demo helper (instantiates `StereoBEVBranch`) |
 
 ### 5.4 Comparison: the three BEV branches
 
