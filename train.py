@@ -1,5 +1,7 @@
 """Target generation utilities for BEV object detection training."""
 
+import math
+
 import torch
 
 import globals as G
@@ -10,6 +12,36 @@ _X, _Y = 0, 1
 _LENGTH, _WIDTH = 7, 8
 
 
+def gaussian_radius(det_size: tuple[float, float],
+                    min_overlap: float = 0.7) -> float:
+    """CornerNet/CenterPoint Gaussian radius (in cells).
+
+    The largest radius such that a predicted box equal to ``det_size``
+    ``(height, width)`` in cells, but shifted by that radius, still overlaps the
+    GT box with IoU >= ``min_overlap``. Solves the three shift cases (inside /
+    outside / straddling) and takes the tightest. Larger objects → larger
+    radius; small ones get a sensible non-trivial spread instead of one cell.
+    """
+    height, width = det_size
+
+    a1 = 1
+    b1 = height + width
+    c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
+    r1 = (b1 - math.sqrt(max(0.0, b1 * b1 - 4 * a1 * c1))) / (2 * a1)
+
+    a2 = 4
+    b2 = 2 * (height + width)
+    c2 = (1 - min_overlap) * width * height
+    r2 = (b2 - math.sqrt(max(0.0, b2 * b2 - 4 * a2 * c2))) / (2 * a2)
+
+    a3 = 4 * min_overlap
+    b3 = -2 * min_overlap * (height + width)
+    c3 = (min_overlap - 1) * width * height
+    r3 = (b3 + math.sqrt(max(0.0, b3 * b3 - 4 * a3 * c3))) / (2 * a3)
+
+    return min(r1, r2, r3)
+
+
 class TargetEncoder:
     """Generates ground truth heatmaps and offsets from 3D bounding boxes.
 
@@ -18,8 +50,20 @@ class TargetEncoder:
     **dim 1 = y** (lateral, ``ny``); the flat index is ``ix * ny + iy``.
     """
 
-    def __init__(self, num_classes: int = G.NUM_CLASSES):
+    def __init__(self, num_classes: int = G.NUM_CLASSES,
+                 radius_mode: str = "proportional",
+                 min_overlap: float = 0.1, min_radius: int = 2):
+        # radius_mode:
+        #   "proportional" — radius = max(length, width)/2 in cells, so the blob
+        #     roughly covers the footprint (big cars, small cones). Best on this
+        #     fine 0.25 m grid where the IoU radius saturates (~3 cells for a car
+        #     regardless of min_overlap).
+        #   "iou" — CornerNet/CenterPoint gaussian_radius at `min_overlap`
+        #     (=0.1, the mmdet3d BEV convention; 0.7 collapses to min_radius here).
         self.num_classes = num_classes
+        self.radius_mode = radius_mode
+        self.min_overlap = min_overlap  # IoU floor for gaussian_radius
+        self.min_radius = min_radius    # never shrink below this many cells
         self.x_min = G.X_RANGE[0]
         self.y_min = G.Y_RANGE[0]
         self.res = G.BEV_RES_M
@@ -30,7 +74,7 @@ class TargetEncoder:
         """Draw a 2D Gaussian into ``heatmap`` (shape ``(nx, ny)``) peaked at
         ``center = (ix, iy)``. dim 0 is x (``nx``), dim 1 is y (``ny``)."""
         ix, iy = center
-        sigma = radius / 3.0
+        sigma = (2 * radius + 1) / 6.0  # CenterNet draw_umich convention
 
         x_lo = int(max(0, ix - radius))
         x_hi = int(min(self.nx, ix + radius + 1))
@@ -63,9 +107,14 @@ class TargetEncoder:
             gx = (boxes_3d[i, _X] - self.x_min) / self.res
             gy = (boxes_3d[i, _Y] - self.y_min) / self.res
 
-            # 2. radius (cells) from the box footprint (max of length/width)
-            radius_m = max(boxes_3d[i, _LENGTH], boxes_3d[i, _WIDTH]) / 2.0
-            radius_cells = max(1, int(radius_m / self.res))
+            # 2. Gaussian radius (cells) from the box footprint
+            l_cells = float(boxes_3d[i, _LENGTH]) / self.res
+            w_cells = float(boxes_3d[i, _WIDTH]) / self.res
+            if self.radius_mode == "iou":
+                radius = gaussian_radius((l_cells, w_cells), self.min_overlap)
+            else:  # "proportional": blob ~ covers the footprint
+                radius = max(l_cells, w_cells) / 2.0
+            radius_cells = max(self.min_radius, int(round(radius)))
 
             ix, iy = int(gx), int(gy)
             if 0 <= ix < self.nx and 0 <= iy < self.ny:
