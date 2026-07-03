@@ -1,8 +1,11 @@
-"""Target generation utilities for BEV object detection training."""
+"""Target generation and loss utilities for BEV object detection training."""
 
 import math
 
+import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import globals as G
 
@@ -126,3 +129,144 @@ class TargetEncoder:
                 offset[1, ix, iy] = gy - iy
 
         return heatmap, offset
+
+
+# =========================================================================== #
+# Loss — CenterPoint 2D: Gaussian-focal heatmap + masked L1 centre offset
+# =========================================================================== #
+def gaussian_focal_loss(pred: torch.Tensor, target: torch.Tensor,
+                        alpha: float = 2.0, beta: float = 4.0,
+                        eps: float = 1e-4) -> torch.Tensor:
+    """Penalty-reduced ('Gaussian') focal loss for CenterNet heatmaps.
+
+    ``pred`` are probabilities in (0, 1); ``target`` is the Gaussian heatmap in
+    [0, 1] with an exact 1.0 at each object centre. Both ``(B, C, H, W)``.
+    Only exact-centre cells are positives; every other cell is a negative whose
+    penalty is scaled by ``(1 - target)**beta``, so cells near a centre barely
+    contribute. Normalised by the number of positives (CenterNet convention).
+    """
+    pred = pred.clamp(eps, 1 - eps)
+    pos = target.eq(1).float()
+    neg = 1.0 - pos
+    neg_weight = (1 - target).pow(beta)
+
+    pos_loss = torch.log(pred) * (1 - pred).pow(alpha) * pos
+    neg_loss = torch.log(1 - pred) * pred.pow(alpha) * neg_weight * neg
+
+    n_pos = pos.sum()
+    pos_loss, neg_loss = pos_loss.sum(), neg_loss.sum()
+    if n_pos == 0:  # no objects in view → only the (down-weighted) negatives
+        return -neg_loss
+    return -(pos_loss + neg_loss) / n_pos
+
+
+class CenterPointLoss(nn.Module):
+    """CenterPoint 2D loss: Gaussian-focal heatmap + masked L1 centre offset.
+
+    Classification is *implicit* — one heatmap channel per class — so there is
+    no separate cross-entropy term. ``pred`` is the head's output dict of
+    **logits** (``heatmap`` + ``offset``); ``target_heatmap`` / ``target_offset``
+    are the :class:`TargetEncoder` tensors with a leading batch dim.
+
+    The offset is regressed **only at positive centre cells** (an empty cell has
+    no centre to correct), masked from ``target_heatmap == 1``.
+    """
+
+    def __init__(self, offset_weight: float = 1.0, alpha: float = 2.0,
+                 beta: float = 4.0):
+        super().__init__()
+        self.offset_weight = offset_weight
+        self.alpha, self.beta = alpha, beta
+
+    def forward(self, pred: dict[str, torch.Tensor],
+                target_heatmap: torch.Tensor,
+                target_offset: torch.Tensor
+                ) -> tuple[torch.Tensor, dict[str, float]]:
+        hm = pred["heatmap"].sigmoid()
+        hm_loss = gaussian_focal_loss(hm, target_heatmap, self.alpha, self.beta)
+
+        # positive (centre) cells: any class channel at its exact peak
+        pos = target_heatmap.eq(1).any(dim=1, keepdim=True).float()  # (B,1,H,W)
+        off_l1 = F.l1_loss(pred["offset"], target_offset, reduction="none")
+        off_loss = (off_l1 * pos).sum() / pos.sum().clamp(min=1.0)
+
+        total = hm_loss + self.offset_weight * off_loss
+        return total, {"heatmap": float(hm_loss), "offset": float(off_loss)}
+
+
+# =========================================================================== #
+# Trainable LiDAR-only detector + single-frame overfit loop (P1 baseline)
+# =========================================================================== #
+class LidarOnlyDetector(nn.Module):
+    """LiDAR-only BEV detector (TODO P1 baseline): PointPillars → CenterPoint head.
+
+    The simplest **fully differentiable** path — no camera prep, no fusion — so
+    it validates the training loop (encoder → head → loss → backward) end to end.
+    ``forward`` returns the head dict ``{heatmap, offset}`` with a batch dim of 1.
+    """
+
+    def __init__(self, pillar_cfg=None, num_classes: int = G.NUM_CLASSES):
+        super().__init__()
+        # lazy import keeps the encoder/loss path free of the network+ultralytics deps
+        from network import CenterPointHead, PillarConfig, PointPillarsBranch
+        self.branch = PointPillarsBranch(pillar_cfg or PillarConfig())
+        self.head = CenterPointHead(G.LIDAR_BEV_CHANNELS, num_classes)
+
+    def forward(self, points: np.ndarray,
+                device: torch.device = torch.device("cpu")
+                ) -> dict[str, torch.Tensor]:
+        bev = self.branch(points, device=device)  # (C, nx, ny), grad-enabled
+        return self.head(bev.unsqueeze(0))         # {heatmap,(1,C,H,W); offset,(1,2,H,W)}
+
+
+def encode_sample(sample, encoder: "TargetEncoder"
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """StereoSample → batched ``(heatmap, offset)`` targets.
+
+    Applies the globals class remap (dropping ignored classes) and the BEV-grid
+    filter, then encodes — the same recipe the consistency test/visualiser use.
+    """
+    boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)
+    idx = [G.class_index(l) for l in sample.boxes_3d_labels]
+    x, y = boxes[:, 0], boxes[:, 1]
+    inside = ((x >= G.X_RANGE[0]) & (x < G.X_RANGE[1]) &
+              (y >= G.Y_RANGE[0]) & (y < G.Y_RANGE[1]))
+    keep = torch.tensor([c is not None for c in idx]) & inside
+    bx = boxes[keep]
+    lab = torch.tensor([c for c, k in zip(idx, keep.tolist()) if k],
+                       dtype=torch.long)
+    hm, off = encoder.encode(bx, lab)
+    return hm.unsqueeze(0), off.unsqueeze(0)
+
+
+def lidar_points(sample) -> np.ndarray:
+    """StereoSample → ``(N, 4)`` ``[x, y, z, intensity]`` for the LiDAR branch."""
+    return np.concatenate(
+        [sample.lidar_xyz, sample.lidar_features["intensity"][:, None]],
+        axis=1).astype(np.float32)
+
+
+def overfit_one_frame(model: nn.Module, points: np.ndarray,
+                      target_heatmap: torch.Tensor, target_offset: torch.Tensor,
+                      steps: int = 150, lr: float = 1e-3,
+                      device: torch.device = torch.device("cpu")
+                      ) -> list[float]:
+    """Overfit a single frame — the sanity check that the whole loop learns.
+
+    Returns the per-step total-loss history. A healthy loop drives it steadily
+    down; decoding the final prediction should then land on the GT centres.
+    """
+    model.to(device).train()
+    loss_fn = CenterPointLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    tgt_hm, tgt_off = target_heatmap.to(device), target_offset.to(device)
+
+    history = []
+    for _ in range(steps):
+        opt.zero_grad()
+        pred = model(points, device=device)
+        loss, _ = loss_fn(pred, tgt_hm, tgt_off)
+        loss.backward()
+        opt.step()
+        history.append(float(loss))
+    return history
