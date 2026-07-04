@@ -108,4 +108,6 @@ out = detector(bev_camera, bev_lidar)
 
 ## 7. What's next
 
-The remaining gap before training is the **BEV target encoder**: rasterise the ego-frame GT boxes (`StereoSample.boxes_3d_ego[:, :2]` centres + class) into the **same** `heatmap (num_classes, nx, ny)` + `offset (2, nx, ny)` tensors the head produces, so there is a target to train against.
+The target side of this contract is now in place: `train.TargetEncoder` rasterises the ego-frame GT boxes (`StereoSample.boxes_3d_ego` centres + class) into the **same** `heatmap (num_classes, nx, ny)` + `offset (2, nx, ny)` tensors the head produces, `train.CenterPointLoss` scores them (Gaussian-focal heatmap + masked L1 offset), and `evaluation.CenterPointDecoder` inverts the head output back to metric ego `(x, y)` + class. The encode→decode round-trip is covered by `tests/test_encoder_decoder.py`, and `train.overfit_one_frame` drives the whole loop (encoder → head → loss → backward → decode) on one frame.
+
+The remaining gap is the **multi-frame training loop + AP/CDS evaluation harness** (TODO P1): batch the branches over a real train split, then score the single-sensor baselines and the fused detector with distance-AP.

@@ -54,15 +54,16 @@ class TargetEncoder:
     """
 
     def __init__(self, num_classes: int = G.NUM_CLASSES,
-                 radius_mode: str = "proportional",
+                 radius_mode: str = "iou",
                  min_overlap: float = 0.1, min_radius: int = 2):
         # radius_mode:
+        #   "iou" (default) — CornerNet/CenterPoint gaussian_radius at
+        #     `min_overlap` (=0.1 + min_radius=2, the mmdet3d BEV convention).
+        #     The tighter blob keeps near-centre negatives supervised, so the
+        #     decoded peak stays sharp — matters for distance-AP @0.5 m.
         #   "proportional" — radius = max(length, width)/2 in cells, so the blob
-        #     roughly covers the footprint (big cars, small cones). Best on this
-        #     fine 0.25 m grid where the IoU radius saturates (~3 cells for a car
-        #     regardless of min_overlap).
-        #   "iou" — CornerNet/CenterPoint gaussian_radius at `min_overlap`
-        #     (=0.1, the mmdet3d BEV convention; 0.7 collapses to min_radius here).
+        #     roughly covers the footprint (big cars ~9 cells → flat top, peak
+        #     can wander ±1-2 cells). Kept as an ablation option.
         self.num_classes = num_classes
         self.radius_mode = radius_mode
         self.min_overlap = min_overlap  # IoU floor for gaussian_radius
@@ -119,7 +120,10 @@ class TargetEncoder:
                 radius = max(l_cells, w_cells) / 2.0
             radius_cells = max(self.min_radius, int(round(radius)))
 
-            ix, iy = int(gx), int(gy)
+            # floor, not int(): int() truncates toward zero, so a centre just
+            # below the grid edge (gx = -0.4) would alias into cell 0 with a
+            # negative offset instead of being rejected by the bounds check.
+            ix, iy = math.floor(gx), math.floor(gy)
             if 0 <= ix < self.nx and 0 <= iy < self.ny:
                 cls = int(classes[i])
                 # 3. Gaussian peak on this class' channel
@@ -219,6 +223,47 @@ class LidarOnlyDetector(nn.Module):
         return self.head(bev.unsqueeze(0))         # {heatmap,(1,C,H,W); offset,(1,2,H,W)}
 
 
+class FusedDetector(nn.Module):
+    """Pipeline A end-to-end: PointPillars + StereoBEV → fusion → CenterPoint head.
+
+    The full trainable network (Stage A branches + `BEVDetector`). ``forward``
+    takes a :class:`~data.StereoSample` — the camera branch needs the images +
+    calibration, the LiDAR branch the point cloud — and returns the head dict
+    with a batch dim of 1. Gradients flow through both branches (the camera
+    context head / backbone train through the splat).
+
+    The SGBM stereo depth of the last-seen frame is cached: it is CPU-expensive,
+    depends only on the images (never on the weights), so an overfit loop or a
+    multi-epoch pass over a frame pays for it once. Replace with the planned
+    on-disk depth cache for real multi-frame training (TODO P1).
+    """
+
+    def __init__(self, num_classes: int = G.NUM_CLASSES):
+        super().__init__()
+        # lazy import keeps the encoder/loss path free of the network deps
+        from network import (BEVDetector, BEVFusionConfig, PillarConfig,
+                             PointPillarsBranch, StereoBEVBranch)
+        self.lidar_branch = PointPillarsBranch(PillarConfig())
+        self.camera_branch = StereoBEVBranch()
+        self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes))
+        self._sd_key, self._sd = None, None  # single-frame stereo-depth cache
+
+    def _stereo_depth_cached(self, sample):
+        from data import stereo_depth
+        key = (sample.log_name, sample.iteration)
+        if self._sd_key != key:
+            self._sd = stereo_depth(sample, self.camera_branch.sgbm_cfg)
+            self._sd_key = key
+        return self._sd
+
+    def forward(self, sample, device: torch.device = torch.device("cpu")
+                ) -> dict[str, torch.Tensor]:
+        bev_lidar = self.lidar_branch(lidar_points(sample), device=device)
+        bev_camera = self.camera_branch(sample, device=device,
+                                        sd=self._stereo_depth_cached(sample))
+        return self.detector(bev_camera, bev_lidar)
+
+
 def encode_sample(sample, encoder: "TargetEncoder"
                   ) -> tuple[torch.Tensor, torch.Tensor]:
     """StereoSample → batched ``(heatmap, offset)`` targets.
@@ -246,12 +291,16 @@ def lidar_points(sample) -> np.ndarray:
         axis=1).astype(np.float32)
 
 
-def overfit_one_frame(model: nn.Module, points: np.ndarray,
+def overfit_one_frame(model: nn.Module, inputs,
                       target_heatmap: torch.Tensor, target_offset: torch.Tensor,
                       steps: int = 150, lr: float = 1e-3,
                       device: torch.device = torch.device("cpu")
                       ) -> list[float]:
     """Overfit a single frame — the sanity check that the whole loop learns.
+
+    ``inputs`` is whatever ``model`` consumes: the ``(N, 4)`` point array for
+    :class:`LidarOnlyDetector`, the whole ``StereoSample`` for
+    :class:`FusedDetector`.
 
     Returns the per-step total-loss history. A healthy loop drives it steadily
     down; decoding the final prediction should then land on the GT centres.
@@ -264,7 +313,7 @@ def overfit_one_frame(model: nn.Module, points: np.ndarray,
     history = []
     for _ in range(steps):
         opt.zero_grad()
-        pred = model(points, device=device)
+        pred = model(inputs, device=device)
         loss, _ = loss_fn(pred, tgt_hm, tgt_off)
         loss.backward()
         opt.step()

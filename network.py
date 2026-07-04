@@ -36,7 +36,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics import YOLO
 
 import globals as G
 
@@ -111,21 +110,26 @@ class YOLOBackbone(nn.Module):
     A drop-in replacement for :class:`_EfficientNetBackbone`: same 1/8 stride and
     the same ``(B, out_dim, H/8, W/8)`` output contract, so the dynamic
     ``stride = image.shape[-1] // shared.shape[-1]`` in the camera branches keeps
-    working unchanged. Pass ``out_dim=cfg.img_backbone_out`` (256) — the depth /
-    context heads expect that width, not :data:`globals.CAM_FEAT_DIM`.
+    working unchanged. ``out_dim`` defaults to the 256 the depth / context heads
+    expect (``MonoBEVConfig.img_backbone_out``).
 
     The Detect head runs but is ignored; a forward pre-hook on it captures the
     ``[P3, P4, P5]`` feature list and we keep P3. A 1×1 conv (sized lazily from
     P3's channel count via one dummy pass) projects to ``out_dim``.
+
+    ``ultralytics`` is imported lazily here so the rest of the network (fusion,
+    head, EfficientNet path) stays importable without it installed.
     """
 
     def __init__(
         self,
         weights: str = "yolo26n.pt",
         freeze: bool = False,
-        out_dim: int = G.CAM_FEAT_DIM,
+        out_dim: int = 256,
     ):
         super().__init__()
+        from ultralytics import YOLO  # lazy: only the YOLO path needs it
+
         self.det = YOLO(weights).model        # the DetectionModel (an nn.Module)
         self.head = self.det.model[-1]        # the Detect head (last layer)
         self.stride = 8                        # P3
@@ -725,8 +729,17 @@ class StereoBEVBranch(nn.Module):
             self,
             sample: "StereoSample",
             device: torch.device = torch.device("cpu"),
+            sd=None,
     ) -> torch.Tensor:
         """Run the full stereo BEV branch on one sample.
+
+        Parameters
+        ----------
+        sd : data.StereoDepth, optional
+            Precomputed SGBM output for this sample. SGBM is CPU-expensive and
+            depends only on the images, so training loops that revisit a frame
+            should compute it once (or load it from a disk cache) and pass it
+            here instead of paying for it every forward.
 
         Returns
         -------
@@ -739,8 +752,9 @@ class StereoBEVBranch(nn.Module):
 
         target_h, target_w = self.target_hw
 
-        # 1. stereo depth (rectified frame)
-        sd = _stereo_depth(sample, self.sgbm_cfg)
+        # 1. stereo depth (rectified frame) — reuse the precomputed one if given
+        if sd is None:
+            sd = _stereo_depth(sample, self.sgbm_cfg)
         img_np = sd.rect_left  # (H, W, 3) uint8, rectified-left
         depth_np = sd.depth  # (H, W) float32, 0 = invalid
         img_h, img_w = img_np.shape[:2]
@@ -775,9 +789,11 @@ class StereoBEVBranch(nn.Module):
         T_cam2ego = torch.from_numpy((sample.calibration.left_to_ego.astype(
             np.float64) @ R1T_4x4).astype(np.float32)).to(device)  # (4, 4)
 
-        self.model.to(device).eval()
-        with torch.no_grad():
-            bev = self.model(img_batch, depth_batch, K, T_cam2ego)
+        # Train/eval mode and grad tracking are the *caller's* choice: wrap in
+        # ``torch.no_grad()`` + ``.eval()`` for inference, leave as-is to train
+        # the context head / backbone through the splat (P1 camera baseline, P2).
+        self.model.to(device)
+        bev = self.model(img_batch, depth_batch, K, T_cam2ego)
         return bev.squeeze(0)  # (C, nx, ny)
 
 
@@ -1259,8 +1275,9 @@ def _stereo_bev(
 ) -> torch.Tensor:
     """Run the StereoBEVBranch on one StereoSample → (C, nx, ny)."""
     cfg = StereoBEVConfig(x_range=x_range, y_range=y_range)
-    branch = StereoBEVBranch(cfg=cfg, target_hw=target_hw)
-    return branch(sample, device)
+    branch = StereoBEVBranch(cfg=cfg, target_hw=target_hw).eval()
+    with torch.no_grad():
+        return branch(sample, device)
 
 
 if __name__ == "__main__":

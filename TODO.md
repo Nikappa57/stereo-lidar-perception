@@ -13,12 +13,18 @@ Legend: `critical` / `high` / `medium` / `low` = §11 priority.
 - **Data** (`data.py`): py123d loader → per-frame `StereoSample`; 2D boxes auto-projected from 3D; calibration/extrinsics exposed.
 - **Frame fix** (`data.py`): global→ego box conversion (`boxes_3d_ego`) + frame-consistency guard (`assert_boxes_in_sensor_range`). — §11 critical (half) + medium.
 - **Preprocessing** (`data.py`): stereo depth/BEV / voxel / frustum / DBSCAN representations.
-- **Stereo depth** (`stereo.py`): SGBM rectification + disparity → metric depth, wired into the stereo branch. — §11 critical (SGBM path; RAFT-Stereo still optional, §14).
+- **Stereo depth** (`data.py`): SGBM rectification + disparity → metric depth, wired into the stereo branch. — §11 critical (SGBM path; RAFT-Stereo still optional, §14).
 - **Camera→BEV splat**: `MonoBEV` (predicted-depth LSS) and `StereoBEV` (grounded stereo-depth splat). — §11 critical.
 - **LiDAR BEV**: `PointPillars` branch → `(128, 200, 160)`.
 - **BEV fusion + head** (`network.py`): `ConcatConvFusion` (A/B) + `CrossAttentionFusion` stub (C) behind a fixed `BEVFusion` interface; `CenterPointHead` (heatmap + offset, 2D only); `BEVDetector`. See [`docs/bev_fusion.md`](docs/bev_fusion.md).
 - **Notebooks**: `pipeline_a.ipynb`, `pipeline_b.ipynb` (imports/globals/utils/data/network/train/test, calling the `.py` modules).
 - **Restructure** → the prescribed **6-file layout** (`data` / `evaluation` / `globals` / `network` / `train` / `utils`): `network.py` is now the whole architecture, one block per diagram node (camera backbone → splat → branches → LiDAR stem → fusion → BEV backbone → head), absorbing `monobev.py`, `stereobev.py`, and `pointpillars.py`. All geometric preprocessing (SGBM stereo depth/BEV, frustum, voxel, clustering) folded into `data.py`. Type hints modernized to PEP 604 (`X | None`, builtin generics).
+- **BEV target encoder** (`train.py`): `TargetEncoder` rasterises `boxes_3d_ego` centres + class into `heatmap (num_classes, 200, 160)` + sub-cell `offset (2, 200, 160)`; CornerNet/CenterPoint IoU Gaussian radius (default, mmdet3d convention) with a footprint-proportional mode kept as an ablation. — §11 critical, was the last gap before training.
+- **Class selection & remap** (`globals.py`): py123d's unified taxonomy → 3-class subset `VEHICLE / PERSON / TRAFFIC_CONE` (`CLASSES` + `class_index`, everything else ignored); sets `num_classes=3`. AV2→FS cone remap still planned for deployment. — §11 high.
+- **CenterPoint loss** (`train.py`): `gaussian_focal_loss` (penalty-reduced heatmap focal) + masked L1 centre offset in `CenterPointLoss`; classification implicit via per-class channels (no separate CE).
+- **Decoder** (`evaluation.py`): `CenterPointDecoder` — sigmoid → 3×3 max-pool NMS → threshold/top-k → sub-cell offset → metric ego `(x, y)` + class + score.
+- **LiDAR-only overfit harness** (`train.py`): `LidarOnlyDetector` (pillars → head) + `encode_sample` + `overfit_one_frame` — validates encoder → head → loss → backward → decode on one frame.
+- **Tests**: encoder→decoder consistency on real data (`tests/test_encoder_decoder.py`) + the sanity panel `utils.visualize_encoded_targets`.
 
 ---
 
@@ -91,7 +97,9 @@ Legend: `critical` / `high` / `medium` / `low` = §11 priority.
 
 ## Open decisions (§14, settle as a team)
 
-- Stereo matcher: SGM (current) vs RAFT-Stereo / learned.
+- Stereo matcher: SGM (current) vs RAFT-Stereo / learned — check if SGBM is
+  enough once the P3 StereoBEV-vs-MonoBEV ablation gives per-range numbers;
+  only invest in a learned matcher if depth quality is the bottleneck.
 - Class subset size (cones in either way).
 - BEV grid extent & resolution vs latency (AV2 reaches 150 m+; current default 50 m / 0.25 m).
 - Attention scope for Pipeline C (candidate-cell vs windowed full-grid).

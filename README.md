@@ -120,8 +120,8 @@ Six modules (the prescribed layout):
 | `utils.py` | Visualization helpers (LiDAR density BEV + GT boxes, frustum, clusters). |
 | `data.py` | Dataset loading (`StereoSample`) **and** the geometric preprocessing representations: stereo depth/BEV, voxel grid, frustum points, clustering. |
 | `network.py` | Full architecture — one block per diagram node: camera branch (Mono/Stereo BEV), LiDAR stem (PointPillars), fusion, BEV backbone, CenterPoint head. |
-| `train.py` | Training loop and optimization *(stub)*. |
-| `evaluation.py` | Testing and validation *(stub)*. |
+| `train.py` | BEV target encoder (`TargetEncoder`), CenterPoint loss (Gaussian-focal heatmap + masked L1 offset), LiDAR-only detector + single-frame overfit harness. Multi-frame training loop *(TODO)*. |
+| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score). Distance-AP / CDS metrics *(TODO)*. |
 
 ## Evaluation
 

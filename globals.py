@@ -19,10 +19,6 @@ name, and ``import globals`` binds the module, not the builtin.
 """
 from __future__ import annotations
 
-# Camera
-
-CAM_FEAT_DIM = 64
-
 # --------------------------------------------------------------------------- #
 # Shared BEV grid (must be identical across every branch and the fusion)
 # --------------------------------------------------------------------------- #

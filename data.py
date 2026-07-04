@@ -82,10 +82,10 @@ from scipy.spatial import cKDTree
 
 import globals as G
 
-# Repo-local fallback: ``data/`` holds the converted ``logs/``, the original
+# Repo-local fallback: ``dataset/`` holds the converted ``logs/``, the original
 # ``sensor/`` blobs, and ``preprocessed/`` outputs, so it can serve as every
-# root at once.
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "data"
+# root at once (no env vars needed for the repo-local layout).
+DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "dataset"
 
 # Default stereo pair (Argoverse 2). Override for other datasets.
 DEFAULT_LEFT_CAMERA = "pcam_stereo_l"
@@ -585,7 +585,7 @@ class Py123dDataset:
 
     :param data_root: Root holding converted ``logs/`` (and ``maps/``,
         ``preprocessed/``). Defaults to ``PY123D_DATA_ROOT`` or the repo
-        ``data/`` dir.
+        ``dataset/`` dir.
     :param split_names: Split filter, e.g. ``["av2-sensor_val"]``.
     :param datasets: Dataset-name filter, e.g. ``["av2-sensor"]``.
     :param depth_root: Directory of precomputed depth maps. Defaults to
