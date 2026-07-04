@@ -2,7 +2,6 @@
 
 import math
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -199,71 +198,10 @@ class CenterPointLoss(nn.Module):
 
 
 # =========================================================================== #
-# Trainable LiDAR-only detector + single-frame overfit loop (P1 baseline)
+# Single-frame overfit loop (P1 sanity harness)
 # =========================================================================== #
-class LidarOnlyDetector(nn.Module):
-    """LiDAR-only BEV detector (TODO P1 baseline): PointPillars → CenterPoint head.
-
-    The simplest **fully differentiable** path — no camera prep, no fusion — so
-    it validates the training loop (encoder → head → loss → backward) end to end.
-    ``forward`` returns the head dict ``{heatmap, offset}`` with a batch dim of 1.
-    """
-
-    def __init__(self, pillar_cfg=None, num_classes: int = G.NUM_CLASSES):
-        super().__init__()
-        # lazy import keeps the encoder/loss path free of the network+ultralytics deps
-        from network import CenterPointHead, PillarConfig, PointPillarsBranch
-        self.branch = PointPillarsBranch(pillar_cfg or PillarConfig())
-        self.head = CenterPointHead(G.LIDAR_BEV_CHANNELS, num_classes)
-
-    def forward(self, points: np.ndarray,
-                device: torch.device = torch.device("cpu")
-                ) -> dict[str, torch.Tensor]:
-        bev = self.branch(points, device=device)  # (C, nx, ny), grad-enabled
-        return self.head(bev.unsqueeze(0))         # {heatmap,(1,C,H,W); offset,(1,2,H,W)}
-
-
-class FusedDetector(nn.Module):
-    """Pipeline A end-to-end: PointPillars + StereoBEV → fusion → CenterPoint head.
-
-    The full trainable network (Stage A branches + `BEVDetector`). ``forward``
-    takes a :class:`~data.StereoSample` — the camera branch needs the images +
-    calibration, the LiDAR branch the point cloud — and returns the head dict
-    with a batch dim of 1. Gradients flow through both branches (the camera
-    context head / backbone train through the splat).
-
-    The SGBM stereo depth of the last-seen frame is cached: it is CPU-expensive,
-    depends only on the images (never on the weights), so an overfit loop or a
-    multi-epoch pass over a frame pays for it once. Replace with the planned
-    on-disk depth cache for real multi-frame training (TODO P1).
-    """
-
-    def __init__(self, num_classes: int = G.NUM_CLASSES):
-        super().__init__()
-        # lazy import keeps the encoder/loss path free of the network deps
-        from network import (BEVDetector, BEVFusionConfig, PillarConfig,
-                             PointPillarsBranch, StereoBEVBranch)
-        self.lidar_branch = PointPillarsBranch(PillarConfig())
-        self.camera_branch = StereoBEVBranch()
-        self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes))
-        self._sd_key, self._sd = None, None  # single-frame stereo-depth cache
-
-    def _stereo_depth_cached(self, sample):
-        from data import stereo_depth
-        key = (sample.log_name, sample.iteration)
-        if self._sd_key != key:
-            self._sd = stereo_depth(sample, self.camera_branch.sgbm_cfg)
-            self._sd_key = key
-        return self._sd
-
-    def forward(self, sample, device: torch.device = torch.device("cpu")
-                ) -> dict[str, torch.Tensor]:
-        bev_lidar = self.lidar_branch(lidar_points(sample), device=device)
-        bev_camera = self.camera_branch(sample, device=device,
-                                        sd=self._stereo_depth_cached(sample))
-        return self.detector(bev_camera, bev_lidar)
-
-
+# The trainable assemblies live in network.py: LidarOnlyDetector (baseline),
+# PipelineA / PipelineB / PipelineC (branches + fusion + head, end-to-end).
 def encode_sample(sample, encoder: "TargetEncoder"
                   ) -> tuple[torch.Tensor, torch.Tensor]:
     """StereoSample → batched ``(heatmap, offset)`` targets.
@@ -284,13 +222,6 @@ def encode_sample(sample, encoder: "TargetEncoder"
     return hm.unsqueeze(0), off.unsqueeze(0)
 
 
-def lidar_points(sample) -> np.ndarray:
-    """StereoSample → ``(N, 4)`` ``[x, y, z, intensity]`` for the LiDAR branch."""
-    return np.concatenate(
-        [sample.lidar_xyz, sample.lidar_features["intensity"][:, None]],
-        axis=1).astype(np.float32)
-
-
 def overfit_one_frame(model: nn.Module, inputs,
                       target_heatmap: torch.Tensor, target_offset: torch.Tensor,
                       steps: int = 150, lr: float = 1e-3,
@@ -299,8 +230,8 @@ def overfit_one_frame(model: nn.Module, inputs,
     """Overfit a single frame — the sanity check that the whole loop learns.
 
     ``inputs`` is whatever ``model`` consumes: the ``(N, 4)`` point array for
-    :class:`LidarOnlyDetector`, the whole ``StereoSample`` for
-    :class:`FusedDetector`.
+    :class:`network.LidarOnlyDetector`, the whole ``StereoSample`` for the
+    :class:`network.Pipeline` classes.
 
     Returns the per-step total-loss history. A healthy loop drives it steadily
     down; decoding the final prediction should then land on the GT centres.

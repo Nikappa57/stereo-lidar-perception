@@ -7,9 +7,9 @@ Two ways to use this file:
   CenterPointDecoder on a single real Argoverse 2 frame):
 
   - ``test_overfit_lidar_only`` — the cheapest differentiable path
-    (:class:`train.LidarOnlyDetector`: pillars -> head).
+    (:class:`network.LidarOnlyDetector`: pillars -> head).
   - ``test_overfit_fused_pipeline_a`` — the **whole network**
-    (:class:`train.FusedDetector`: PointPillars + StereoBEV -> ConcatConvFusion
+    (:class:`network.PipelineA`: PointPillars + StereoBEV -> ConcatConvFusion
     -> head), asserting the camera branch actually receives gradients.
 
 * ``python tests/test_overfit.py`` — overfits the fused Pipeline A on one frame
@@ -32,8 +32,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data import Py123dDataset  # noqa: E402
 from evaluation import CenterPointDecoder  # noqa: E402
-from train import (FusedDetector, LidarOnlyDetector, TargetEncoder,  # noqa: E402
-                   encode_sample, lidar_points, overfit_one_frame)
+from network import LidarOnlyDetector, PipelineA, lidar_points  # noqa: E402
+from train import (TargetEncoder, encode_sample,  # noqa: E402
+                   overfit_one_frame)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -89,7 +90,7 @@ def test_overfit_fused_pipeline_a():
     tgt_hm, tgt_off = encode_sample(sample, TargetEncoder())
     assert int(tgt_hm.eq(1).sum()) > 0, "no positive centre cells in this frame"
 
-    model = FusedDetector()
+    model = PipelineA()
     history = overfit_one_frame(model, sample, tgt_hm, tgt_off, steps=150,
                                 lr=1e-3, device=DEVICE)
 
@@ -109,7 +110,7 @@ def test_overfit_fused_pipeline_a():
 # --------------------------------------------------------------------------- #
 def save_overfit_figure(save_path: str = "docs/img/overfit_fused_output.png",
                         steps: int = 150) -> str:
-    """Overfit :class:`train.FusedDetector` on one frame and plot the result.
+    """Overfit :class:`network.PipelineA` on one frame and plot the result.
 
     Panels (all BEV panels in the ego frame, Y lateral / X forward):
     left RGB | encoded target heatmap | learned heatmap after ``steps`` |
@@ -125,7 +126,7 @@ def save_overfit_figure(save_path: str = "docs/img/overfit_fused_output.png",
     sample = _load_sample()
     tgt_hm, tgt_off = encode_sample(sample, TargetEncoder())
 
-    model = FusedDetector()
+    model = PipelineA()
     history = overfit_one_frame(model, sample, tgt_hm, tgt_off, steps=steps,
                                 lr=1e-3, device=DEVICE)
 

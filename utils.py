@@ -1,10 +1,132 @@
-# Visualize preprocessing results
+# Visualize preprocessing results + network debugging helpers
+
+from contextlib import contextmanager
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 from data import StereoSample, frustum_points, voxel_grid, cluster_points
 from network import PillarConfig
+
+
+# --------------------------------------------------------------------------- #
+# Network debugging — capture and plot intermediate outputs
+# --------------------------------------------------------------------------- #
+@contextmanager
+def record_activations(model, layer_names):
+    """Capture submodule outputs by dotted path during forward passes.
+
+    Registers forward hooks on each named submodule (``model.get_submodule``
+    path, e.g. ``"camera_branch.model.context_head"``) and stores a detached
+    CPU copy of its output under that name; hooks are removed on exit, so the
+    model is untouched afterwards. Works on any ``nn.Module``. Usage::
+
+        pipe = PipelineA().eval()
+        with record_activations(pipe, [
+                "camera_branch.model.backbone",      # (1, 256, H/8, W/8)
+                "camera_branch.model.context_head",  # (1, 64, H/8, W/8)
+                "lidar_branch.pfn",                  # (P, 64) pillar features
+                "detector.fusion",                   # (1, 128, nx, ny)
+        ]) as acts:
+            with torch.no_grad():
+                pipe(sample, device=device)
+        acts["detector.fusion"].shape
+
+    Print ``dict(model.named_modules()).keys()`` to discover valid paths.
+    """
+    acts, handles = {}, []
+
+    def _make_hook(name):
+        def _hook(module, args, output):
+            out = output[0] if isinstance(output, (tuple, list)) else output
+            if isinstance(out, dict):  # e.g. CenterPointHead returns a dict
+                acts[name] = {k: v.detach().cpu() for k, v in out.items()}
+            else:
+                acts[name] = out.detach().cpu()
+        return _hook
+
+    for name in layer_names:
+        module = model.get_submodule(name)
+        handles.append(module.register_forward_hook(_make_hook(name)))
+    try:
+        yield acts
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def visualize_pipeline_debug(pipeline, sample, device=None,
+                             save_path: str | None = None):
+    """One debug forward of a :class:`network.Pipeline` → panel of every stage.
+
+    Panels (BEV ones on the shared ego grid, GT centres overlaid): left RGB |
+    camera BEV | LiDAR BEV | fused BEV (channel-collapsed to |mean|) | head
+    heatmap (sigmoid, max class) | offset magnitude. Untrained weights give
+    structured-but-meaningless maps — the point is checking data flow, grid
+    alignment and where activations live, not detection quality.
+
+    Pass ``save_path`` to write a PNG instead of showing interactively.
+    """
+    import torch
+
+    import globals as G
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline.debug = True
+    pipeline.to(device).eval()
+    with torch.no_grad():
+        pipeline(sample, device=device)
+    inter = pipeline.intermediates
+
+    (x_min, x_max), (y_min, y_max) = G.X_RANGE, G.Y_RANGE
+    extent = [y_min, y_max, x_min, x_max]
+
+    # in-grid GT centres, for the alignment check
+    centres = sample.boxes_3d_ego[:, :2] if len(sample.boxes_3d_ego) else np.zeros((0, 2))
+    m = ((centres[:, 0] >= x_min) & (centres[:, 0] < x_max) &
+         (centres[:, 1] >= y_min) & (centres[:, 1] < y_max))
+    centres = centres[m]
+
+    def _panel(ax, feat, title, cmap):
+        lo, hi = float(np.percentile(feat, 1)), float(np.percentile(feat, 99))
+        if hi <= lo:
+            lo, hi = float(feat.min()), float(feat.max()) + 1e-9
+        im = ax.imshow(feat, origin="lower", cmap=cmap, vmin=lo, vmax=hi,
+                       extent=extent, aspect="auto")
+        if len(centres):
+            ax.scatter(centres[:, 1], centres[:, 0], s=40, facecolors="none",
+                       edgecolors="cyan", lw=1.0)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Y lateral (m)")
+        ax.set_ylabel("X forward (m)")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig, ax = plt.subplots(2, 3, figsize=(17, 11))
+    fig.suptitle(f"{type(pipeline).__name__} debug forward | "
+                 f"{sample.dataset} iter={sample.iteration} | GT rings = "
+                 f"ego-frame box centres", fontsize=13, fontweight="bold")
+
+    ax[0, 0].imshow(sample.image_left)
+    ax[0, 0].set_title("Left RGB", fontsize=10)
+    ax[0, 0].axis("off")
+
+    _panel(ax[0, 1], inter["bev_camera"].abs().mean(0).numpy(),
+           f"Camera BEV ({inter['bev_camera'].shape[0]} ch, |mean|)", "plasma")
+    _panel(ax[0, 2], inter["bev_lidar"].abs().mean(0).numpy(),
+           f"LiDAR BEV ({inter['bev_lidar'].shape[0]} ch, |mean|)", "viridis")
+    _panel(ax[1, 0], inter["fused"].abs().mean(0).numpy(),
+           f"Fused BEV ({inter['fused'].shape[0]} ch, |mean|)", "magma")
+    _panel(ax[1, 1], inter["heatmap"].sigmoid().amax(0).numpy(),
+           "Head heatmap (max class, σ)", "inferno")
+    _panel(ax[1, 2], inter["offset"].norm(dim=0).numpy(),
+           "Offset magnitude", "cividis")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_path:
+        fig.savefig(save_path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        return save_path
+    plt.show()
 
 
 

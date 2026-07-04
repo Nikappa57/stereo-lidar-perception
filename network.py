@@ -16,7 +16,10 @@ it follows the data flow:
     │  Stage 5  BEV backbone ──────────────  shared BEVBackbone2D (per-branch);
     │                                        post-fusion context in the fusion conv
     └─ Stage 6  Center head ───────────────  CenterPointHead
-       Assembly ──────────────────────────  BEVDetector
+       Assembly ──────────────────────────  BEVDetector (fusion + head);
+                                            PipelineA / PipelineB / PipelineC
+                                            (branches + detector, end-to-end)
+                                            + LidarOnlyDetector baseline
 
 The two branches (Stage A) emit grid-aligned ``(C, nx, ny)`` BEV maps; the
 fusion + head (Stage B) consume them. Output is **2D only** — centre (x, y) +
@@ -1208,6 +1211,144 @@ def describe(detector: BEVDetector) -> None:
 
 
 # ===========================================================================
+# Pipelines — one trainable end-to-end class per design pipeline (doc §07)
+# ===========================================================================
+def lidar_points(sample) -> np.ndarray:
+    """StereoSample → ``(N, 4)`` ``[x, y, z, intensity]`` for the LiDAR branch."""
+    return np.concatenate(
+        [sample.lidar_xyz, sample.lidar_features["intensity"][:, None]],
+        axis=1).astype(np.float32)
+
+
+class LidarOnlyDetector(nn.Module):
+    """LiDAR-only baseline (TODO P1): PointPillars → CenterPoint head, no fusion.
+
+    The simplest **fully differentiable** path — no camera prep, no fusion — so
+    it validates the training loop (encoder → head → loss → backward) end to
+    end. ``forward`` returns the head dict ``{heatmap, offset}``, batch dim 1.
+    """
+
+    def __init__(self, pillar_cfg: PillarConfig | None = None,
+                 num_classes: int = G.NUM_CLASSES):
+        super().__init__()
+        self.branch = PointPillarsBranch(pillar_cfg or PillarConfig())
+        self.head = CenterPointHead(LIDAR_BEV_CHANNELS, num_classes)
+
+    def forward(self, points: np.ndarray,
+                device: torch.device = torch.device("cpu")
+                ) -> dict[str, torch.Tensor]:
+        bev = self.branch(points, device=device)  # (C, nx, ny), grad-enabled
+        return self.head(bev.unsqueeze(0))
+
+
+class Pipeline(nn.Module):
+    """Base assembly: the two Stage A branches + BEV fusion + CenterPoint head.
+
+    One subclass per design pipeline — the subclass picks the fusion block (and
+    any Stage A variation), everything else is shared:
+
+    ========== ============================= ================================
+    class      fusion                        Stage A difference vs A
+    ========== ============================= ================================
+    PipelineA  :class:`ConcatConvFusion`     —
+    PipelineB  :class:`ConcatConvFusion`     painted LiDAR-range channel in
+                                             the camera branch (TODO P0)
+    PipelineC  :class:`CrossAttentionFusion` — (fusion swap only, TODO P4)
+    ========== ============================= ================================
+
+    ``forward(sample, device)`` → ``{"heatmap": (1, C, nx, ny),
+    "offset": (1, 2, nx, ny)}``. Gradients flow through both branches.
+
+    **Debugging** — set ``pipeline.debug = True``; after every forward,
+    ``pipeline.intermediates`` holds detached CPU copies of the stage outputs
+    (``bev_camera``, ``bev_lidar``, ``fused``, ``heatmap``, ``offset``).
+    Plot them with :func:`utils.visualize_pipeline_debug`; for *arbitrary*
+    submodule activations (backbone features, context head, …) use
+    :func:`utils.record_activations` instead — it hooks any dotted submodule
+    path without touching this class.
+
+    The SGBM stereo depth of the last-seen frame is cached: it is
+    CPU-expensive and depends only on the images (never the weights), so an
+    overfit loop or repeated debugging of one frame pays for it once. Replace
+    with the planned on-disk depth cache for multi-frame training (TODO P1).
+    """
+
+    fusion_cls: type[BEVFusion] = ConcatConvFusion
+
+    def __init__(self, num_classes: int = G.NUM_CLASSES):
+        super().__init__()
+        self.lidar_branch = PointPillarsBranch(PillarConfig())
+        self.camera_branch = StereoBEVBranch()
+        self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes),
+                                    fusion_cls=type(self).fusion_cls)
+        self.debug = False
+        self.intermediates: dict[str, torch.Tensor] = {}
+        self._sd_key, self._sd = None, None  # single-frame stereo-depth cache
+
+    def _stereo_depth_cached(self, sample):
+        from data import stereo_depth
+        key = (sample.log_name, sample.iteration)
+        if self._sd_key != key:
+            self._sd = stereo_depth(sample, self.camera_branch.sgbm_cfg)
+            self._sd_key = key
+        return self._sd
+
+    def forward(self, sample, device: torch.device = torch.device("cpu")
+                ) -> dict[str, torch.Tensor]:
+        self.to(device)  # keep weights with the requested device (no-op if there)
+        bev_lidar = self.lidar_branch(lidar_points(sample), device=device)
+        bev_camera = self.camera_branch(sample, device=device,
+                                        sd=self._stereo_depth_cached(sample))
+        fused = self.detector.fusion(bev_camera, bev_lidar)  # (1, C, nx, ny)
+        out = self.detector.head(fused)
+        if self.debug:
+            self.intermediates = {
+                "bev_camera": bev_camera.detach().cpu(),  # (C_cam, nx, ny)
+                "bev_lidar": bev_lidar.detach().cpu(),    # (C_lid, nx, ny)
+                "fused": fused[0].detach().cpu(),         # (C_fus, nx, ny)
+                "heatmap": out["heatmap"][0].detach().cpu(),  # logits
+                "offset": out["offset"][0].detach().cpu(),
+            }
+        return out
+
+
+class PipelineA(Pipeline):
+    """Pipeline A — mid fusion: stereo-splat + pillars → concat+conv → head."""
+
+
+class PipelineB(PipelineA):
+    """Pipeline B — A plus the painted LiDAR-range channel (ablation of A).
+
+    The BEV fusion is *identical* to A (doc §07); B differs only upstream, in
+    Stage A: ``sample.depth_left`` painted into the camera image stage before
+    the splat (sparsity-aware conv). That wiring is still TODO (P0), so
+    constructing with ``use_painted_range=True`` raises; ``False`` gives the
+    A-control arm of the ablation.
+    """
+
+    def __init__(self, num_classes: int = G.NUM_CLASSES,
+                 use_painted_range: bool = True):
+        if use_painted_range:
+            raise NotImplementedError(
+                "Pipeline B painted-range wiring is TODO (P0): inject "
+                "sample.depth_left as a 4th image channel (sparsity-aware "
+                "conv) in the camera branch. Pass use_painted_range=False "
+                "for the A-control arm.")
+        super().__init__(num_classes)
+        self.use_painted_range = use_painted_range
+
+
+class PipelineC(Pipeline):
+    """Pipeline C — cross-attention fusion (near→stereo, far→LiDAR), TODO P4.
+
+    Same branches and head as A; only the fusion block swaps
+    (:class:`CrossAttentionFusion`), whose ``_fuse`` is still a stub.
+    """
+
+    fusion_cls = CrossAttentionFusion
+
+
+# ===========================================================================
 # Branch demo helpers — run a single StereoSample through one branch.
 # Used by the notebooks and tests/test_network.py to produce real Stage A maps.
 # ===========================================================================
@@ -1221,11 +1362,8 @@ def _lidar_bev(
     """Run the PointPillars branch on one StereoSample → (C, nx, ny)."""
     cfg = PillarConfig(x_range=x_range, y_range=y_range, z_range=z_range)
     branch = PointPillarsBranch(cfg).to(device).eval()
-    pts = sample.lidar_xyz.astype(np.float32)
-    inten = sample.lidar_features["intensity"][:, None].astype(np.float32)
-    pts = np.concatenate([pts, inten], axis=1)
     with torch.no_grad():
-        return branch(pts, device=device)
+        return branch(lidar_points(sample), device=device)
 
 
 def _camera_bev(
