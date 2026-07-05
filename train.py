@@ -1,6 +1,8 @@
-"""Target generation and loss utilities for BEV object detection training."""
+"""Target generation, loss and training loop for BEV object detection."""
 
 import math
+import random
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -238,7 +240,8 @@ def overfit_one_frame(model: nn.Module, inputs,
     """
     model.to(device).train()
     loss_fn = CenterPointLoss()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(
+        (p for p in model.parameters() if p.requires_grad), lr=lr)
     tgt_hm, tgt_off = target_heatmap.to(device), target_offset.to(device)
 
     history = []
@@ -249,4 +252,167 @@ def overfit_one_frame(model: nn.Module, inputs,
         loss.backward()
         opt.step()
         history.append(float(loss))
+    return history
+
+
+# =========================================================================== #
+# Multi-frame training loop (P1)
+# =========================================================================== #
+def set_seed(seed: int = 0) -> None:
+    """Seed every RNG that touches training (python, numpy, torch, CUDA).
+
+    Makes runs *reproducible*, not bit-deterministic: the BEV splat and other
+    scatter-style CUDA kernels use atomics whose accumulation order varies, so
+    losses can still differ in the last decimals between identical runs. For
+    strict determinism add ``torch.use_deterministic_algorithms(True)`` (slower,
+    and some ops may raise).
+    """
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)          # seeds CUDA too (all devices)
+    torch.backends.cudnn.benchmark = False  # don't let autotune pick per-run kernels
+
+
+def split_frames(dataset, val_scenes: "int | list[int]" = 1) -> tuple[list, list]:
+    """Split a :class:`~data.Py123dDataset` into train/val **by scene (log)**.
+
+    Frames within one log are strongly correlated (consecutive timesteps of the
+    same drive), so a per-frame split would leak train scenes into val.
+
+    :param val_scenes: ``int`` — hold out the *last* n logs; or an explicit
+        list of scene indices to hold out (e.g. ``[1]`` to validate on a log
+        that actually contains the rare class you care about).
+    :returns: ``(train_frames, val_frames)`` — lists of :class:`~data.Frame`.
+    """
+    if isinstance(val_scenes, int):
+        assert 0 < val_scenes < dataset.scene_count, (
+            f"val_scenes={val_scenes} must leave at least one scene on each "
+            f"side of the split (dataset has {dataset.scene_count})")
+        val_ids = set(range(dataset.scene_count - val_scenes,
+                            dataset.scene_count))
+    else:
+        val_ids = set(int(i) for i in val_scenes)
+        assert val_ids and all(0 <= i < dataset.scene_count for i in val_ids), (
+            f"val scene indices {sorted(val_ids)} out of range "
+            f"(dataset has {dataset.scene_count} scenes)")
+        assert len(val_ids) < dataset.scene_count, "no scenes left for training"
+    train_frames, val_frames = [], []
+    for scene_index in range(dataset.scene_count):
+        bucket = val_frames if scene_index in val_ids else train_frames
+        bucket.extend(dataset.frames_in_scene(scene_index))
+    return train_frames, val_frames
+
+
+# Training needs neither the images (LiDAR path; the camera branch reads the
+# precomputed stereo cache) nor the LiDAR-in-box mask — skipping both cuts
+# sample assembly from ~0.9 s to ~30 ms (see to_stereo_sample docstring).
+FAST_SAMPLE_KWARGS = {"load_images": False, "point_mask": False}
+
+
+def validate(model: nn.Module, frames, *, input_fn=None,
+             encoder: "TargetEncoder | None" = None,
+             sample_kwargs: dict | None = None,
+             device: torch.device = torch.device("cpu")) -> float:
+    """Mean :class:`CenterPointLoss` over ``frames`` (no grad, eval mode)."""
+    input_fn = input_fn or (lambda s: s)
+    encoder = encoder or TargetEncoder()
+    sample_kwargs = FAST_SAMPLE_KWARGS if sample_kwargs is None else sample_kwargs
+    loss_fn = CenterPointLoss()
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for frame in frames:
+            sample = frame.to_stereo_sample(**sample_kwargs)
+            tgt_hm, tgt_off = encode_sample(sample, encoder)
+            pred = model(input_fn(sample), device=device)
+            loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
+            losses.append(float(loss))
+    return sum(losses) / max(1, len(losses))
+
+
+def train_model(model: nn.Module, train_frames, val_frames, *,
+                input_fn=None, epochs: int = 5, lr: float = 1e-3,
+                accum: int = 4, encoder: "TargetEncoder | None" = None,
+                ckpt_path: str | Path | None = None, log_every: int = 50,
+                seed: int = 0, sample_kwargs: dict | None = None,
+                device: torch.device = torch.device("cpu")) -> dict:
+    """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
+
+    The branches process one sample at a time (batch dim 1), so an effective
+    batch is built by accumulating ``accum`` frames' gradients per optimizer
+    step. Frames are re-shuffled every epoch; validation runs after each epoch
+    and the best-val checkpoint is written to ``ckpt_path`` (if given).
+
+    CPU/GPU overlap: the next frame's sample assembly + target encoding runs
+    in a background thread while the GPU steps on the current one, and samples
+    are loaded with :data:`FAST_SAMPLE_KWARGS` (no images, no point mask) —
+    the camera branch must therefore read the precomputed stereo cache
+    (:func:`data.precompute_stereo_inputs`); pass ``sample_kwargs={}`` to
+    force full samples instead.
+
+    :param input_fn: ``sample -> model input``; identity for the
+        :class:`network.Pipeline` classes (default), ``network.lidar_points``
+        for :class:`network.LidarOnlyDetector`.
+    :returns: history dict — per-epoch ``"train"`` / ``"val"`` mean losses and
+        the per-step ``"steps"`` list (for plotting).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    input_fn = input_fn or (lambda s: s)
+    encoder = encoder or TargetEncoder()
+    sample_kwargs = FAST_SAMPLE_KWARGS if sample_kwargs is None else sample_kwargs
+    loss_fn = CenterPointLoss()
+    model.to(device)
+    opt = torch.optim.Adam(
+        (p for p in model.parameters() if p.requires_grad), lr=lr)
+    rng = random.Random(seed)
+    order = list(range(len(train_frames)))
+
+    def _prep(frame):
+        sample = frame.to_stereo_sample(**sample_kwargs)
+        tgt_hm, tgt_off = encode_sample(sample, encoder)
+        return input_fn(sample), tgt_hm, tgt_off
+
+    history: dict = {"train": [], "val": [], "steps": []}
+    best_val = float("inf")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        rng.shuffle(order)
+        opt.zero_grad()
+        total = 0.0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_prep, train_frames[order[0]])
+            for k in range(len(order)):
+                inputs, tgt_hm, tgt_off = future.result()
+                if k + 1 < len(order):  # prefetch the next frame
+                    future = pool.submit(_prep, train_frames[order[k + 1]])
+                pred = model(inputs, device=device)
+                loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
+                (loss / accum).backward()
+                if (k + 1) % accum == 0 or k == len(order) - 1:
+                    opt.step()
+                    opt.zero_grad()
+                total += float(loss)
+                history["steps"].append(float(loss))
+                if log_every and (k + 1) % log_every == 0:
+                    print(f"  epoch {epoch} step {k + 1}/{len(order)} "
+                          f"loss {float(loss):.3f}")
+
+        train_mean = total / max(1, len(order))
+        val_mean = validate(model, val_frames, input_fn=input_fn,
+                            encoder=encoder, sample_kwargs=sample_kwargs,
+                            device=device)
+        history["train"].append(train_mean)
+        history["val"].append(val_mean)
+        print(f"epoch {epoch}/{epochs}  train {train_mean:.3f}  "
+              f"val {val_mean:.3f}")
+
+        if ckpt_path is not None and val_mean < best_val:
+            best_val = val_mean
+            ckpt = Path(ckpt_path)
+            ckpt.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(), "epoch": epoch,
+                        "val_loss": val_mean}, ckpt)
+            print(f"  new best val — checkpoint saved → {ckpt}")
     return history
