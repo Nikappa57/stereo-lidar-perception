@@ -260,6 +260,183 @@ def overfit_one_frame(model: nn.Module, inputs,
 
 
 # =========================================================================== #
+# Pipeline C convenience wrappers (CrossAttentionFusion, near/far gate)
+# =========================================================================== #
+# These thin wrappers call the generic overfit_one_frame / validate /
+# train_model with the right defaults for PipelineC (input_fn = identity,
+# sample_kwargs = FAST_SAMPLE_KWARGS).  They exist so notebook cells and
+# test scripts can read as single, intent-revealing lines:
+#
+#   history = overfit_pipeline_c(pipeline, sample, tgt_hm, tgt_off)
+#   val_loss = validate_pipeline_c(pipeline, val_frames)
+#   history  = train_pipeline_c(pipeline, train_frames, val_frames)
+#
+# The PipelineC.forward(sample, device=...) signature already matches the
+# ``(inputs, device=device)`` contract expected by overfit_one_frame /
+# train_model / validate — no extra adapter is needed.
+
+
+def overfit_pipeline_c(
+    model: nn.Module,
+    sample,
+    target_heatmap: torch.Tensor,
+    target_offset: torch.Tensor,
+    steps: int = 200,
+    lr: float = 5e-4,
+    device: torch.device = torch.device("cpu"),
+) -> list[float]:
+    """Overfit :class:`~network.PipelineC` on a single frame (sanity harness).
+
+    Wraps :func:`overfit_one_frame` with Pipeline C defaults (more steps and a
+    lower learning rate than the generic default — the cross-attention + gate add
+    parameters whose gradients are smaller in the early iterations).
+
+    Parameters
+    ----------
+    model:
+        A :class:`~network.PipelineC` (or any ``nn.Module`` with a
+        ``forward(sample, device=…) → {heatmap, offset}`` signature).
+    sample:
+        A :class:`~data.StereoSample` — the single frame to overfit on.
+    target_heatmap:
+        ``(1, num_classes, nx, ny)`` Gaussian heatmap from
+        :func:`encode_sample`.
+    target_offset:
+        ``(1, 2, nx, ny)`` sub-cell offset from :func:`encode_sample`.
+    steps:
+        Gradient steps (default 200 — extra headroom for the attention layers).
+    lr:
+        Adam learning rate (default 5e-4).
+    device:
+        Torch device.
+
+    Returns
+    -------
+    history : list[float]
+        Per-step total loss (heatmap focal + offset L1).  A steady decrease
+        confirms that gradients flow through both branches *and* the
+        cross-attention / gate layers.
+    """
+    return overfit_one_frame(model, sample, target_heatmap, target_offset,
+                             steps=steps, lr=lr, device=device)
+
+
+def validate_pipeline_c(
+    model: nn.Module,
+    frames,
+    *,
+    encoder: "TargetEncoder | None" = None,
+    sample_kwargs: dict | None = None,
+    device: torch.device = torch.device("cpu"),
+) -> float:
+    """Mean :class:`CenterPointLoss` over ``frames`` for Pipeline C (no grad, eval).
+
+    Wraps :func:`validate` with ``input_fn=None`` (identity — PipelineC takes
+    the full :class:`~data.StereoSample` directly) and the shared
+    :data:`FAST_SAMPLE_KWARGS` default (no images, no point mask — the camera
+    branch reads from the precomputed stereo cache).
+
+    Parameters
+    ----------
+    model:
+        :class:`~network.PipelineC` (or compatible pipeline).
+    frames:
+        List of :class:`~data.Frame` objects — typically the val split from
+        :func:`split_frames`.
+    encoder:
+        :class:`TargetEncoder` instance; a default one is created if ``None``.
+    sample_kwargs:
+        Keyword arguments forwarded to ``frame.to_stereo_sample``; defaults to
+        :data:`FAST_SAMPLE_KWARGS` (``load_images=False, point_mask=False``).
+        Pass ``{}`` to load full samples (e.g. when the stereo cache is absent).
+    device:
+        Torch device.
+
+    Returns
+    -------
+    float
+        Mean loss over all frames (returns 0.0 on an empty list).
+    """
+    return validate(model, frames, input_fn=None, encoder=encoder,
+                    sample_kwargs=sample_kwargs, device=device)
+
+
+def train_pipeline_c(
+    model: nn.Module,
+    train_frames,
+    val_frames,
+    *,
+    epochs: int = 10,
+    lr: float = 5e-4,
+    accum: int = 4,
+    encoder: "TargetEncoder | None" = None,
+    ckpt_path: "str | Path | None" = None,
+    log_every: int = 50,
+    seed: int = 0,
+    sample_kwargs: dict | None = None,
+    device: torch.device = torch.device("cpu"),
+) -> dict:
+    """Multi-frame training loop for :class:`~network.PipelineC`.
+
+    Wraps :func:`train_model` with Pipeline C defaults (more epochs, lower lr
+    to stabilise the cross-attention layers).  Gradient accumulation, CPU/GPU
+    overlap prefetch and best-val checkpointing are all inherited unchanged.
+
+    Parameters
+    ----------
+    model:
+        :class:`~network.PipelineC` (or any pipeline with the same forward
+        signature).
+    train_frames, val_frames:
+        Lists of :class:`~data.Frame` — use :func:`split_frames` to build them.
+    epochs:
+        Training epochs (default 10; Pipeline C typically needs more than A/B
+        because the attention layers start nearly random).
+    lr:
+        Adam learning rate (default 5e-4 — lower than the 1e-3 generic default
+        to prevent early instability in the QK projections).
+    accum:
+        Gradient accumulation steps (effective batch = accum × 1 frame).
+    encoder:
+        :class:`TargetEncoder`; a default one is created if ``None``.
+    ckpt_path:
+        If given, the best-val checkpoint is written here as a ``torch.save``
+        dict with keys ``model``, ``epoch``, ``val_loss``.
+    log_every:
+        Print a step-level loss line every this many frames (0 = silent).
+    seed:
+        RNG seed for reproducible frame shuffling.
+    sample_kwargs:
+        Forwarded to ``frame.to_stereo_sample``; defaults to
+        :data:`FAST_SAMPLE_KWARGS`.  Pass ``{}`` to load full samples.
+    device:
+        Torch device.
+
+    Returns
+    -------
+    dict
+        ``{"train": [float, …], "val": [float, …], "steps": [float, …]}`` —
+        per-epoch mean train/val losses and per-step losses for plotting.
+
+    Example
+    -------
+    >>> from network import PipelineC
+    >>> from train import split_frames, train_pipeline_c
+    >>> pipeline = PipelineC(stereo_cache_root="data/stereo_cache")
+    >>> train_frames, val_frames = split_frames(dataset, val_scenes=1)
+    >>> history = train_pipeline_c(
+    ...     pipeline, train_frames, val_frames,
+    ...     epochs=10, lr=5e-4, ckpt_path="checkpoints/pipeline_c_best.pt",
+    ...     device=torch.device("cuda"),
+    ... )
+    """
+    return train_model(model, train_frames, val_frames, input_fn=None,
+                       epochs=epochs, lr=lr, accum=accum, encoder=encoder,
+                       ckpt_path=ckpt_path, log_every=log_every, seed=seed,
+                       sample_kwargs=sample_kwargs, device=device)
+
+
+# =========================================================================== #
 # Multi-frame training loop (P1)
 # =========================================================================== #
 def set_seed(seed: int = 0) -> None:
