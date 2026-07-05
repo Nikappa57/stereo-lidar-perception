@@ -15,7 +15,7 @@ from train import TargetEncoder  # noqa: E402
 
 def test_encoder_decoder_consistency():
     # 1. Load a real sample
-    dataset = Py123dDataset(split_names=["av2-sensor_val"])
+    dataset = Py123dDataset(split_names=["kitti360_train"])
     sample = dataset[0].to_stereo_sample()
 
     boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)  # (N, 10)

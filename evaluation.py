@@ -103,7 +103,9 @@ class CenterPointDecoder:
 
 
 # =========================================================================== #
-# Distance-AP evaluation (AV2 style: TP if centre within d metres of a GT)
+# Distance-AP evaluation (center-distance, AV2/nuScenes style: TP if a
+# predicted centre is within d metres of a GT centre). Dataset-agnostic — needs
+# only GT centres, so it runs unchanged on KITTI-360, AV2, etc.
 # =========================================================================== #
 def frame_ground_truth(sample) -> tuple[np.ndarray, np.ndarray]:
     """Evaluable GT for one frame: in-grid, class-remapped centres.
@@ -197,14 +199,15 @@ def evaluate_model(model, frames, *, input_fn=None,
                    score_threshold: float = 0.1,
                    sample_kwargs: dict | None = None,
                    thresholds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)) -> dict:
-    """AV2-style distance-AP of a detector over a list of :class:`~data.Frame`.
+    """Center-distance AP of a detector over a list of :class:`~data.Frame`.
 
     Runs the model + :class:`CenterPointDecoder` on every frame, then per class
     computes AP at each distance threshold (0.5/1/2/4 m, the AV2 bands) and
     their mean; ``mAP`` averages the per-class means over classes that have GT.
     ``mean_error_m`` is the mean centre error of the matches at the 2 m band.
+    Dataset-agnostic (only needs GT centres) — same metric on KITTI-360 / AV2.
     (CDS — the size/orientation-aware composite — needs boxes we don't regress;
-    TODO with the full AV2 toolkit integration.)
+    TODO.)
 
     :param input_fn: ``sample -> model input``; identity (Pipeline) by default,
         ``network.lidar_points`` for the LiDAR-only baseline.

@@ -7,7 +7,7 @@ Two ways to use this file:
   misaligned BEV maps (design doc §02). These use random tensors, so they are
   fast and need no dataset.
 
-* ``python tests/test_network.py`` — loads one real Argoverse 2 frame, runs the
+* ``python tests/test_network.py`` — loads one real KITTI-360 frame, runs the
   two Stage A branches (LiDAR PointPillars + grounded StereoBEV), fuses them with
   ``BEVDetector`` and saves a figure of the **fused BEV** (plus the two input
   BEVs and the head's centre heatmap) to ``docs/img/bev_fusion_test_output.png``.
@@ -116,7 +116,7 @@ def save_fusion_figure(save_path: str = "docs/img/bev_fusion_test_output.png") -
     from data import Py123dDataset
     from network import _lidar_bev, _stereo_bev
 
-    dataset = Py123dDataset(split_names=["av2-sensor_val"], max_num_scenes=1)
+    dataset = Py123dDataset(split_names=["kitti360_train"], max_num_scenes=1)
     frame = dataset.get_frame(0, dataset.scenes[0].number_of_history_iterations + 13)
     sample = frame.to_stereo_sample()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -133,8 +133,8 @@ def save_fusion_figure(save_path: str = "docs/img/bev_fusion_test_output.png") -
     heatmap = out["heatmap"].sigmoid().amax(dim=1)[0].detach().cpu().numpy()  # (nx, ny)
 
     x_range, y_range = (0.0, 50.0), (-20.0, 20.0)
-    # Keep only GT centres that actually fall on the BEV grid (AV2 labels 360°,
-    # including boxes behind the ego and beyond 50 m — those aren't targets here).
+    # Keep only GT centres that actually fall on the BEV grid (KITTI-360 labels
+    # are 360°, including boxes behind the ego and beyond 50 m — not targets here).
     centres = sample.boxes_3d_ego[:, :2] if len(sample.boxes_3d_ego) else np.zeros((0, 2))
     in_grid = (
         (centres[:, 0] >= x_range[0]) & (centres[:, 0] < x_range[1])

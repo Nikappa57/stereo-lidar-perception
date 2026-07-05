@@ -850,7 +850,8 @@ class PillarConfig:
 
 def pillarize(points: np.ndarray, cfg: PillarConfig):
     """
-    points: (N, 4) array [x, y, z, intensity] -- Argoverse 2 sweep format.
+    points: (N, 4) array [x, y, z, intensity] -- one LiDAR sweep (KITTI-360 /
+        AV2 / any py123d dataset).
 
     Returns:
         pillar_points: (P, max_points_per_pillar, 9) augmented features per point

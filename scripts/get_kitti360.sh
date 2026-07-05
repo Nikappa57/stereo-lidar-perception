@@ -87,6 +87,8 @@ fetch_unzip() {
   log "extracting $name -> ${dest#$KITTI360_DATA_ROOT/}"
   # shellcheck disable=SC2086
   unzip -o -q "$zip" $filter -d "$dest"
+  # free the zip right after extraction to keep peak disk low ( KEEP_ZIPS=1 to retain )
+  [[ "${KEEP_ZIPS:-0}" == "1" ]] || rm -f "$zip"
 }
 
 # Timestamps zips cover ALL sequences; fetch once, extract only the ones we need.
@@ -130,8 +132,13 @@ fi
 
 command -v py123d-conversion >/dev/null || die "py123d-conversion not on PATH (pip install py123d)"
 
-# Build hydra list overrides:  [a, b, c]
-to_list() { local IFS=,; local arr=(); for x in $1; do arr+=("$(seq_name "$x")"); done; echo "[${arr[*]}]"; }
+# Build hydra list override "[a,b,c]".  Split $1 on spaces (default IFS), join with comma.
+to_list() {
+  local arr=() x
+  for x in $1; do arr+=("$(seq_name "$x")"); done
+  local IFS=,
+  printf '[%s]' "${arr[*]}"
+}
 TRAIN_LIST="$(to_list "$TRAIN_SEQ")"
 VAL_LIST="$(to_list "${VAL_SEQ:-}")"
 

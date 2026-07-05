@@ -213,10 +213,14 @@ def encode_sample(sample, encoder: "TargetEncoder"
     """
     boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)
     idx = [G.class_index(l) for l in sample.boxes_3d_labels]
+    if len(boxes) == 0:  # frames with no GT (common on KITTI-360, sparse labels)
+        return (torch.zeros((1, G.NUM_CLASSES, encoder.nx, encoder.ny)),
+                torch.zeros((1, 2, encoder.nx, encoder.ny)))
     x, y = boxes[:, 0], boxes[:, 1]
     inside = ((x >= G.X_RANGE[0]) & (x < G.X_RANGE[1]) &
               (y >= G.Y_RANGE[0]) & (y < G.Y_RANGE[1]))
-    keep = torch.tensor([c is not None for c in idx]) & inside
+    # dtype=bool: an empty list would otherwise make a Float tensor and break `&`.
+    keep = torch.tensor([c is not None for c in idx], dtype=torch.bool) & inside
     bx = boxes[keep]
     lab = torch.tensor([c for c, k in zip(idx, keep.tolist()) if k],
                        dtype=torch.long)

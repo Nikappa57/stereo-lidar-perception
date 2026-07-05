@@ -7,10 +7,12 @@ them into a per-frame :class:`StereoSample`, then provides the geometric
 that the network and baselines consume.
 
 Because everything goes through :class:`py123d.api.SceneAPI`, the same code
-works for any py123d dataset (Argoverse 2, nuPlan, nuScenes, Waymo, ...).
+works for any py123d dataset (KITTI-360, Argoverse 2, nuPlan, nuScenes, ...).
 Switching datasets only changes the :class:`~py123d.api.SceneFilter` and the
 root paths; the stereo-specific assembly assumes a left/right camera pair whose
-ids are configurable (AV2's ``pcam_stereo_l`` / ``pcam_stereo_r`` by default).
+ids are configurable (``pcam_stereo_l`` / ``pcam_stereo_r`` by default — see
+:mod:`globals`). The project default is KITTI-360 (the only py123d dataset with
+a real colour stereo pair; see ``docs/dataset.md``).
 
 ============================ INPUTS ============================
 Read from disk (paths resolved from environment variables, see
@@ -18,8 +20,10 @@ Read from disk (paths resolved from environment variables, see
 
 * Converted py123d logs (Arrow) under ``$PY123D_DATA_ROOT/logs`` — ego state,
   camera/lidar tables, 3D box labels, sync table.
-* Original sensor blobs under e.g. ``$AV2_DATA_ROOT/sensor`` — the JPEG images
-  and lidar feathers (AV2 conversion stores only relative paths to these).
+* Original sensor blobs under the per-dataset root (e.g. KITTI-360's
+  ``$KITTI360_DATA_ROOT/data_2d_raw`` + ``data_3d_raw``, AV2's
+  ``$AV2_DATA_ROOT/sensor``) — the PNG/JPEG images and lidar scans (conversion
+  stores only relative paths to these).
 * Precomputed sparse depth maps under
   ``$PY123D_DATA_ROOT/preprocessed/depth_maps/<log>/<iteration>.npz`` (key
   ``depth_map``): LiDAR projected into the left stereo image. Optional — frames
@@ -54,7 +58,7 @@ One :class:`StereoSample` per frame (consumed by the representations below):
 Quick start::
 
     from data import Py123dDataset
-    dataset = Py123dDataset(split_names=["av2-sensor_val"])
+    dataset = Py123dDataset(split_names=["kitti360_train"])
     sample = dataset[0].to_stereo_sample()   # -> StereoSample for preprocessing
 """
 
@@ -87,9 +91,9 @@ import globals as G
 # root at once (no env vars needed for the repo-local layout).
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "dataset"
 
-# Default stereo pair (Argoverse 2). Override for other datasets.
-DEFAULT_LEFT_CAMERA = "pcam_stereo_l"
-DEFAULT_RIGHT_CAMERA = "pcam_stereo_r"
+# Default stereo pair. From globals (KITTI-360 / AV2 share these enum ids).
+DEFAULT_LEFT_CAMERA = G.LEFT_CAMERA
+DEFAULT_RIGHT_CAMERA = G.RIGHT_CAMERA
 
 # Per-dataset "original data root" env vars. py123d derives each dataset's
 # sensor root from these (e.g. AV2_DATA_ROOT -> ``<root>/sensor``).
@@ -474,8 +478,10 @@ class Frame:
           expensive step): ``points_in_box_mask`` is all-False and
           ``points_outside_boxes_xyz`` empty, i.e. *not computed*.
 
-        :param left_camera_id: Left stereo camera id (default AV2 ``pcam_stereo_l``).
-        :param right_camera_id: Right stereo camera id (default AV2 ``pcam_stereo_r``).
+        :param left_camera_id: Left stereo camera id (default ``pcam_stereo_l``;
+            KITTI-360 ``image_00`` / AV2 stereo-left both map here).
+        :param right_camera_id: Right stereo camera id (default ``pcam_stereo_r``;
+            KITTI-360 ``image_01`` / AV2 stereo-right).
         :param lidar_id: Lidar to use; defaults to merged/first available.
         :raises ValueError: if the requested stereo cameras are not available.
         """
@@ -612,8 +618,8 @@ class Py123dDataset:
     :param data_root: Root holding converted ``logs/`` (and ``maps/``,
         ``preprocessed/``). Defaults to ``PY123D_DATA_ROOT`` or the repo
         ``dataset/`` dir.
-    :param split_names: Split filter, e.g. ``["av2-sensor_val"]``.
-    :param datasets: Dataset-name filter, e.g. ``["av2-sensor"]``.
+    :param split_names: Split filter, e.g. ``["kitti360_train"]``.
+    :param datasets: Dataset-name filter, e.g. ``["kitti360"]``.
     :param depth_root: Directory of precomputed depth maps. Defaults to
         ``<data_root>/preprocessed/depth_maps``.
     :param scene_filter: A fully-built :class:`SceneFilter`; if given, the
@@ -798,8 +804,10 @@ class StereoSGBMConfig:
     #: downscaled rectified pair, then the disparity is scaled back to full
     #: res, so metric depth is unaffected. ``num_disparities`` is the *full-res*
     #: search range; it is scaled internally for the downscaled matcher.
-    #: 0.5 ≈ 4× faster than full 2048×1550. Set 1.0 for best quality.
-    downscale: float = 0.5
+    #: 1.0 = full res. KITTI-360's rectified pair is already small
+    #: (~1408×376), so full-res matching is cheap and gives the best disparity.
+    #: Drop to 0.5 for large sensors (e.g. AV2's 2048×1550, ~4× faster).
+    downscale: float = 1.0
 
 
 @dataclass
@@ -1603,7 +1611,7 @@ def cluster_points(
 if __name__ == "__main__":
 
     sample = Py123dDataset(
-        split_names=["av2-sensor_val"])[0].to_stereo_sample()
+        split_names=[G.TRAIN_SPLIT])[0].to_stereo_sample()
     print(dir(sample))
     sd = stereo_depth(sample)
     bev = stereo_bev(sample)
