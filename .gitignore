@@ -231,3 +231,6 @@ KITTI-360/
 checkpoints/
 preprocessed/
 *.pt
+
+# Vendored IGEV-Stereo code + weights (large; fetch/rebuild, do not commit)
+third_party/

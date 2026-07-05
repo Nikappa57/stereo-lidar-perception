@@ -64,21 +64,30 @@ import data
 _MODEL = None
 _DEVICE = None
 _PADDER = None  # IGEV's InputPadder class, loaded by file to dodge name clashes
-_ROOT: str | None = None  # set by register(); falls back to $IGEV_ROOT
-_CKPT: str | None = None  # set by register(); falls back to $IGEV_CKPT
+_ROOT: str | None = None  # set by register(); falls back to $IGEV_ROOT / repo default
+_CKPT: str | None = None  # set by register(); falls back to $IGEV_CKPT / repo default
+
+# Repo-local defaults: the IGEV model code (its ``core/``) and KITTI-15 weights
+# vendored under ``third_party/`` (gitignored). Resolution order is:
+# explicit arg > env var > this repo-local default. So the notebooks / training
+# work out of the box once ``third_party/`` is populated, with no env vars.
+_REPO = Path(__file__).resolve().parent
+_DEFAULT_ROOT = _REPO / "third_party" / "IGEV-Stereo"
+_DEFAULT_CKPT = _REPO / "third_party" / "igev_kitti15.pth"
 
 
 def _resolve_paths(igev_root: str | None, ckpt: str | None) -> tuple[Path, Path]:
-    root = Path(igev_root or os.environ.get("IGEV_ROOT", "")).expanduser()
-    weights = Path(ckpt or os.environ.get("IGEV_CKPT", "")).expanduser()
+    root = Path(igev_root or os.environ.get("IGEV_ROOT") or _DEFAULT_ROOT).expanduser()
+    weights = Path(ckpt or os.environ.get("IGEV_CKPT") or _DEFAULT_CKPT).expanduser()
     if not root.exists():
         raise FileNotFoundError(
-            "IGEV model code not found. Set IGEV_ROOT to the cloned "
-            "IGEV/IGEV-Stereo directory (see module docstring).")
+            f"IGEV model code not found at {root}. Vendor the IGEV-Stereo "
+            "'core/' into third_party/IGEV-Stereo/, or set IGEV_ROOT "
+            "(see module docstring).")
     if not weights.exists():
         raise FileNotFoundError(
-            "IGEV weights not found. Set IGEV_CKPT to kitti15.pth "
-            "(see module docstring).")
+            f"IGEV weights not found at {weights}. Put kitti15.pth at "
+            "third_party/igev_kitti15.pth, or set IGEV_CKPT.")
     return root, weights
 
 

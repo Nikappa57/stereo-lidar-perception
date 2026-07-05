@@ -86,10 +86,22 @@ from scipy.spatial import cKDTree
 
 import globals as G
 
-# Repo-local fallback: ``dataset/`` holds the converted ``logs/``, the original
-# ``sensor/`` blobs, and ``preprocessed/`` outputs, so it can serve as every
-# root at once (no env vars needed for the repo-local layout).
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "dataset"
+# Repo-local fallback root for the converted ``logs/`` + ``preprocessed/``. Prefer
+# ``data/`` (the layout the KITTI-360 download script writes and the README uses),
+# then ``dataset/`` (the older self-contained layout) — whichever actually holds a
+# ``logs/`` dir. Picking the populated one means the notebooks / tests / scripts
+# work with a bare kernel (no ``PY123D_DATA_ROOT`` exported). Env vars still win.
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _default_data_root() -> Path:
+    for name in ("data", "dataset"):
+        if (_REPO_ROOT / name / "logs").is_dir():
+            return _REPO_ROOT / name
+    return _REPO_ROOT / "dataset"
+
+
+DEFAULT_DATA_ROOT = _default_data_root()
 
 # Default stereo pair. From globals (KITTI-360 / AV2 share these enum ids).
 DEFAULT_LEFT_CAMERA = G.LEFT_CAMERA
@@ -129,6 +141,12 @@ def configure_dataset_paths(data_root: str | Path | None = None) -> Path:
                     or DEFAULT_DATA_ROOT).resolve()
 
     os.environ["PY123D_DATA_ROOT"] = str(resolved)
+    # The raw KITTI-360 sensor blobs live in ``<repo>/KITTI-360`` (calibration/
+    # data_2d_raw/data_3d_raw), NOT under the logs root — point KITTI360_DATA_ROOT
+    # there when present, before the generic fill-in below defaults it to ``resolved``.
+    kitti360_root = _REPO_ROOT / "KITTI-360"
+    if kitti360_root.is_dir():
+        os.environ.setdefault("KITTI360_DATA_ROOT", str(kitti360_root))
     for env_var in _DATASET_ROOT_ENV_VARS:
         # ``setdefault`` keeps user-provided roots; only fills in the gaps.
         os.environ.setdefault(env_var, str(resolved))

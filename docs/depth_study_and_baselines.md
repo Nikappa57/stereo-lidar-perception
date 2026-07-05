@@ -294,8 +294,11 @@ version); without it `matcher="sgbm_wls"` falls back to a built-in equivalent
 
 - **Done:** pluggable matcher + IGEV integration + dense cache; camera-only,
   LiDAR-only and Pipeline A baselines with distance-AP; depth→BEV study.
-- **Next (P3 ablations):** IGEV vs SGBM depth *inside* the fused pipeline (both
-  caches exist); StereoBEV (grounded) vs MonoBEV (predicted depth); beam density.
+- **Next (P3 ablations):** IGEV vs SGBM depth *through the full network* — i.e.
+  train camera-only (and Pipeline A) on the SGBM cache and compare distance-AP to
+  the IGEV runs of §3, isolating the depth source's effect on detection. **Not
+  done yet:** every §3 number uses IGEV; the SGBM cache is currently only partial
+  (build it first). Then StereoBEV (grounded) vs MonoBEV (predicted); beam density.
 - **Data:** add more KITTI-360 urban drives (`scripts/get_kitti360.sh`) so
   PERSON / TWO_WHEELER become learnable; keep drive 0010 for final eval.
 - **Later:** Pipeline B (painted range), Pipeline C (cross-attention fusion),
