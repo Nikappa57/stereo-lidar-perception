@@ -225,3 +225,8 @@ py123d-docs/
 sensor
 None
 logs
+
+# Training
+checkpoints/
+preprocessed/
+*.pt
