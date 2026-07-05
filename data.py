@@ -310,9 +310,9 @@ class StereoSample:
     iteration: int
     timestamp_us: int
 
-    # raw stereo + lidar
-    image_left: np.ndarray
-    image_right: np.ndarray
+    # raw stereo + lidar (images are None when loaded with load_images=False)
+    image_left: np.ndarray | None
+    image_right: np.ndarray | None
     lidar_xyz: np.ndarray
     lidar_features: dict[
         str, np.ndarray] | None  # e.g. intensity, channel, timestamps
@@ -337,8 +337,8 @@ class StereoSample:
     points_outside_boxes_xyz: np.ndarray
     points_in_box_mask: np.ndarray
 
-    # calibration
-    calibration: Calibration
+    # calibration (None when loaded with load_images=False)
+    calibration: Calibration | None
 
     def __repr__(self) -> str:
         return (
@@ -457,22 +457,38 @@ class Frame:
         left_camera_id: CameraIdLike = DEFAULT_LEFT_CAMERA,
         right_camera_id: CameraIdLike = DEFAULT_RIGHT_CAMERA,
         lidar_id: LidarIdLike | None = None,
+        load_images: bool = True,
+        point_mask: bool = True,
     ) -> StereoSample:
         """Assemble the per-frame :class:`StereoSample` for preprocessing.
+
+        The two flags exist because full assembly costs ~0.9 s/frame while the
+        training loop needs almost none of it (profiled: the in-box point mask
+        dominates, then image decode + 2D projection):
+
+        * ``load_images=False`` — skip the stereo pair entirely: ``image_*``,
+          ``depth_left`` and ``calibration`` are ``None``, ``boxes_2d_*`` empty.
+          Enough for LiDAR training and for the camera branch fed from the
+          precomputed stereo cache (which stores its own K / extrinsics).
+        * ``point_mask=False`` — skip the LiDAR-in-box test (the single most
+          expensive step): ``points_in_box_mask`` is all-False and
+          ``points_outside_boxes_xyz`` empty, i.e. *not computed*.
 
         :param left_camera_id: Left stereo camera id (default AV2 ``pcam_stereo_l``).
         :param right_camera_id: Right stereo camera id (default AV2 ``pcam_stereo_r``).
         :param lidar_id: Lidar to use; defaults to merged/first available.
         :raises ValueError: if the requested stereo cameras are not available.
         """
-        left = self.camera(left_camera_id)
-        right = self.camera(right_camera_id)
-        if left is None or right is None:
-            available = [c.name for c in self.available_camera_ids]
-            raise ValueError(
-                f"Stereo cameras {left_camera_id!r}/{right_camera_id!r} not available; "
-                f"this scene exposes {available}. Pass left_camera_id/right_camera_id "
-                f"for your dataset's stereo pair.")
+        left = right = None
+        if load_images:
+            left = self.camera(left_camera_id)
+            right = self.camera(right_camera_id)
+            if left is None or right is None:
+                available = [c.name for c in self.available_camera_ids]
+                raise ValueError(
+                    f"Stereo cameras {left_camera_id!r}/{right_camera_id!r} not available; "
+                    f"this scene exposes {available}. Pass left_camera_id/right_camera_id "
+                    f"for your dataset's stereo pair.")
 
         lidar = self.lidar(lidar_id)
         lidar_xyz = lidar.xyz.astype(
@@ -496,7 +512,11 @@ class Frame:
 
         # 2D boxes: project the 3D (global) boxes into the left image. The 2D
         # projection consumes global boxes, so ``boxes_array`` stays global.
-        boxes_2d, boxes_2d_indices = _project_boxes_2d(left, boxes_array)
+        if left is not None:
+            boxes_2d, boxes_2d_indices = _project_boxes_2d(left, boxes_array)
+        else:
+            boxes_2d = np.zeros((0, 4), dtype=np.float64)
+            boxes_2d_indices = np.zeros((0, ), dtype=np.int64)
 
         # 3D positions of returns outside every box (background geometry).
         ego = self.ego_state()
@@ -509,34 +529,40 @@ class Frame:
             assert_boxes_in_sensor_range(boxes_ego)
         else:
             boxes_ego = np.zeros((0, 10), dtype=np.float64)
-        if lidar_xyz.shape[0] and boxes_array.shape[0] and ego is not None:
+        if point_mask and lidar_xyz.shape[0] and boxes_array.shape[0] and ego is not None:
             points_global = rel_to_abs_points_3d_array(ego.imu_se3, lidar_xyz)
             inside = points_3d_in_bbse3_array(points_global.astype(np.float64),
                                               boxes_array)  # (N_boxes, P)
             in_any_box = inside.any(axis=0)
+            points_outside = lidar_xyz[~in_any_box]
         else:
             in_any_box = np.zeros((lidar_xyz.shape[0], ), dtype=bool)
-        points_outside = lidar_xyz[~in_any_box]
+            # all points when the mask is trivially empty, none when skipped
+            points_outside = lidar_xyz if point_mask else np.zeros(
+                (0, 3), dtype=np.float64)
 
-        # Calibration.
-        ego_to_global = _pose_to_matrix(
-            ego.imu_se3) if ego is not None else np.eye(4)
-        left_to_ego = _pose_to_matrix(left.metadata.camera_to_imu_se3)
-        right_to_ego = _pose_to_matrix(right.metadata.camera_to_imu_se3)
-        baseline = float(
-            np.linalg.norm(left_to_ego[:3, 3] - right_to_ego[:3, 3]))
-        calibration = Calibration(
-            left_intrinsics=_intrinsics_matrix(left.metadata.intrinsics),
-            right_intrinsics=_intrinsics_matrix(right.metadata.intrinsics),
-            left_to_ego=left_to_ego,
-            right_to_ego=right_to_ego,
-            ego_to_global=ego_to_global,
-            left_to_global=_pose_to_matrix(left.camera_to_global_se3),
-            right_to_global=_pose_to_matrix(right.camera_to_global_se3),
-            stereo_baseline_m=baseline,
-            left_is_distorted=bool(left.metadata.is_distorted),
-            right_is_distorted=bool(right.metadata.is_distorted),
-        )
+        # Calibration (needs the camera metadata, so only with images loaded).
+        if left is not None:
+            ego_to_global = _pose_to_matrix(
+                ego.imu_se3) if ego is not None else np.eye(4)
+            left_to_ego = _pose_to_matrix(left.metadata.camera_to_imu_se3)
+            right_to_ego = _pose_to_matrix(right.metadata.camera_to_imu_se3)
+            baseline = float(
+                np.linalg.norm(left_to_ego[:3, 3] - right_to_ego[:3, 3]))
+            calibration = Calibration(
+                left_intrinsics=_intrinsics_matrix(left.metadata.intrinsics),
+                right_intrinsics=_intrinsics_matrix(right.metadata.intrinsics),
+                left_to_ego=left_to_ego,
+                right_to_ego=right_to_ego,
+                ego_to_global=ego_to_global,
+                left_to_global=_pose_to_matrix(left.camera_to_global_se3),
+                right_to_global=_pose_to_matrix(right.camera_to_global_se3),
+                stereo_baseline_m=baseline,
+                left_is_distorted=bool(left.metadata.is_distorted),
+                right_is_distorted=bool(right.metadata.is_distorted),
+            )
+        else:
+            calibration = None
 
         return StereoSample(
             dataset=self.dataset,
@@ -544,11 +570,11 @@ class Frame:
             scene_index=self.scene_index,
             iteration=self.iteration,
             timestamp_us=self.timestamp.time_us,
-            image_left=left.image,
-            image_right=right.image,
+            image_left=left.image if left is not None else None,
+            image_right=right.image if right is not None else None,
             lidar_xyz=lidar_xyz,
             lidar_features=lidar_features,
-            depth_left=self.depth(),
+            depth_left=self.depth() if load_images else None,
             boxes_3d=boxes_array,
             boxes_3d_ego=boxes_ego,
             boxes_3d_labels=boxes_labels,
@@ -1143,6 +1169,103 @@ def stereo_bev(
             bev[4 + k][occ] /= count[occ]
 
     return bev
+
+
+# --------------------------------------------------------------------------- #
+# Stereo input cache — precomputed camera-branch inputs
+#
+# SGBM depth is CPU-expensive (~1-2 s/frame) and depends only on the images,
+# never on network weights, so training pays for it *once*: precompute the
+# camera-branch inputs (rectified-left image + depth, already resized to the
+# backbone resolution, plus the matching K and camera→ego transform) and load
+# them per step. <1 MB/frame vs ~50 MB for the full rectification bundle.
+# --------------------------------------------------------------------------- #
+def stereo_cache_root(data_root: str | Path | None = None) -> Path:
+    """Default cache dir: ``<data_root>/preprocessed/stereo_inputs``."""
+    root = Path(data_root or os.environ.get("PY123D_DATA_ROOT") or DEFAULT_DATA_ROOT)
+    return root / "preprocessed" / "stereo_inputs"
+
+
+def stereo_cache_path(cache_root: str | Path, log_name: str, iteration: int) -> Path:
+    return Path(cache_root) / log_name / f"{iteration:05d}.npz"
+
+
+def stereo_branch_inputs(
+    sample: StereoSample,
+    target_hw: tuple[int, int] = (192, 640),
+    sgbm_cfg: StereoSGBMConfig | None = None,
+    sd: StereoDepth | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Everything the camera branch consumes, at backbone input resolution.
+
+    This is the single recipe shared by the live path
+    (:meth:`network.StereoBEVBranch.forward`) and the precomputed cache, so
+    cached and uncached training see byte-identical inputs.
+
+    :param sd: Precomputed :class:`StereoDepth`; computed here when ``None``.
+    :returns: ``(image, depth, K, T_cam2ego)`` — rectified-left RGB ``(h, w, 3)``
+        uint8, metric depth ``(h, w)`` float32 (0 = invalid), intrinsics ``(3, 3)``
+        scaled to ``target_hw``, and rectified-left → ego ``(4, 4)``, all float32.
+    """
+    if sd is None:
+        sd = stereo_depth(sample, sgbm_cfg)
+    th, tw = target_hw
+    ih, iw = sd.rect_left.shape[:2]
+
+    image = cv2.resize(sd.rect_left, (tw, th), interpolation=cv2.INTER_AREA)
+    depth = cv2.resize(sd.depth, (tw, th), interpolation=cv2.INTER_NEAREST)
+
+    K = sd.rect.P1[:3, :3].astype(np.float32).copy()
+    K[0] *= tw / iw  # fx, cx
+    K[1] *= th / ih  # fy, cy
+
+    R1T = np.eye(4)
+    R1T[:3, :3] = sd.rect.R1.T
+    T_cam2ego = (sample.calibration.left_to_ego @ R1T).astype(np.float32)
+    return image, depth.astype(np.float32), K, T_cam2ego
+
+
+def load_stereo_inputs(cache_root: str | Path, log_name: str, iteration: int):
+    """Load one cached ``(image, depth, K, T_cam2ego)`` bundle, or ``None``."""
+    path = stereo_cache_path(cache_root, log_name, iteration)
+    if not path.exists():
+        return None
+    with np.load(path) as z:
+        return z["image"], z["depth"], z["K"], z["T_cam2ego"]
+
+
+def precompute_stereo_inputs(
+    frames,
+    cache_root: str | Path | None = None,
+    target_hw: tuple[int, int] = (192, 640),
+    sgbm_cfg: StereoSGBMConfig | None = None,
+    overwrite: bool = False,
+    log_every: int = 25,
+) -> Path:
+    """Precompute the camera-branch input bundle for every frame.
+
+    :param frames: Iterable of :class:`Frame` (e.g. a :class:`Py123dDataset`).
+    :param cache_root: Output dir; defaults to :func:`stereo_cache_root`.
+    :returns: The cache root written to. Existing files are skipped unless
+        ``overwrite`` — safe to re-run / resume.
+    """
+    cache_root = Path(cache_root) if cache_root is not None else stereo_cache_root()
+    n_done = n_skipped = 0
+    for i, frame in enumerate(frames):
+        path = stereo_cache_path(cache_root, frame.log_name, frame.iteration)
+        if path.exists() and not overwrite:
+            n_skipped += 1
+            continue
+        sample = frame.to_stereo_sample()
+        image, depth, K, T = stereo_branch_inputs(sample, target_hw, sgbm_cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(path, image=image, depth=depth, K=K, T_cam2ego=T)
+        n_done += 1
+        if log_every and (n_done % log_every == 0):
+            print(f"  precomputed {n_done} frames (+{n_skipped} cached) ...")
+    print(f"stereo input cache: {n_done} written, {n_skipped} already cached "
+          f"→ {cache_root}")
+    return cache_root
 
 
 # ===========================================================================
