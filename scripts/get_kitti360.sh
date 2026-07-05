@@ -10,7 +10,7 @@
 #   3. Runs `py123d-conversion` into  $PY123D_DATA_ROOT/logs/kitti360_{train,val}/,
 #      ready for the DataLoader / training.
 #
-# The small LOGIN-GATED files (calibration/, data_poses/, data_3d_bboxes/) are NOT
+# The small LOGIN-GATED files (calibration/, data_poses/ (Vechicle Poses), data_3d_bboxes/) are NOT
 # public — download them once from https://www.cvlibs.net/datasets/kitti-360/ and
 # drop them under $KITTI360_DATA_ROOT/. This script checks for them and stops with a
 # clear message if they are missing.
