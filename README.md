@@ -23,7 +23,7 @@ stage below maps to one block in [`network.py`](network.py):
 1. **Camera backbone** — turns the left image into a grid of semantic features.
 2. **Splat to BEV** — places those features on the ground plane using stereo depth (no learnable parameters; pure geometry).
 3. **LiDAR stem** — encodes the LiDAR BEV map into features (already top-down).
-4. **Fusion** — both branches now share the grid, so they are stacked and convolved. This block is swappable (cross-attention drops in here).
+4. **Fusion** — both branches now share the grid, so they are fused before the head. This block is swappable: **Pipeline A/B** uses channel concatenation + 2D convolutions (`ConcatConvFusion`), while **Pipeline C** drops in a **Windowed Cross-Attention Transformer** (`CrossAttentionFusion`). See [`docs/newnetwork.md`](docs/newnetwork.md) for the complete mathematical and architectural breakdown.
 5. **BEV backbone** — 2D context reasoning over the fused grid.
 6. **Center head** — per-class heatmap + sub-cell offset, decoded into an object list.
 
@@ -36,6 +36,12 @@ We compare four fusion strategies along a single axis — *where the two sensors
 | <img src="docs/img/pipeline_a.svg" width="380"> | <img src="docs/img/pipeline_b.svg" width="380"> |
 | **C — Cross-attention fusion** | **D — Late fusion (baseline)** |
 | <img src="docs/img/pipeline_c.svg" width="380"> | <img src="docs/img/pipeline_d.svg" width="380"> |
+
+### The CNN vs. Transformer Fusion Dichotomy
+While **Pipeline A/B** relies on $3 \times 3$ convolutions (which assume strict cell-by-cell spatial alignment between camera and LiDAR BEV maps), **Pipeline C** introduces a Transformer-based cross-attention module (`CrossAttentionFusion`) designed to relax alignment constraints and adapt to range-dependent sensor uncertainty:
+- **Windowed Cross-Attention ($O(N \cdot \text{win}^2)$):** The BEV grid is partitioned into local $8 \times 8$ windows ($2\text{ m} \times 2\text{ m}$ patches). Camera tokens act as **queries ($Q$)** searching over LiDAR **keys/values ($K, V$)**, reducing attention complexity by **500×** compared to global attention to ensure real-time execution on the Jetson AGX Orin.
+- **Swin-Style Relative Position Bias:** A learnable bias table indexed by relative token offsets $(\Delta\text{row}, \Delta\text{col})$ is added to attention dot-products, preserving BEV translation equivariance while guiding attention across stereo depth uncertainty.
+- **Learnable Near/Far Spatial Gating ($g \in (0, 1)$):** A per-cell sigmoid gate modulates between camera projection and attended LiDAR features ($F_{\text{fused}} = (1 - g) \cdot F_{\text{cam}} + g \cdot F_{\text{attn}}$). In the near field ($\le 20\text{ m}$), dense stereo depth is trusted ($g \to 0$); in the far field ($> 50\text{ m}$ where stereo disparity error degrades quadratically), the network automatically shifts trust to the attended LiDAR signal ($g \to 1$).
 
 ## Dataset
 

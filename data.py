@@ -125,8 +125,14 @@ def configure_dataset_paths(data_root: str | Path | None = None) -> Path:
     look up sensor locations through the process-global dataset paths. It is
     invoked automatically by :class:`Py123dDataset`.
     """
-    resolved = Path(data_root or os.environ.get("PY123D_DATA_ROOT")
-                    or DEFAULT_DATA_ROOT).resolve()
+    env_root = os.environ.get("PY123D_DATA_ROOT")
+    if env_root == "None":
+        env_root = None
+    resolved = Path(data_root or env_root or DEFAULT_DATA_ROOT).resolve()
+    if not (resolved / "logs").exists():
+        print(f"DEBUG: logs not found in {resolved}, falling back to {DEFAULT_DATA_ROOT}", flush=True)
+        resolved = Path(DEFAULT_DATA_ROOT).resolve()
+    print(f"DEBUG: PY123D_DATA_ROOT resolved to {resolved}", flush=True)
 
     os.environ["PY123D_DATA_ROOT"] = str(resolved)
     for env_var in _DATASET_ROOT_ENV_VARS:
@@ -652,8 +658,8 @@ class Py123dDataset:
             )
         self.scene_filter = scene_filter
 
-        self.scenes: list[SceneAPI] = get_filtered_scenes(
-            scene_filter, data_root=self.data_root)
+        self.scenes: List[SceneAPI] = get_filtered_scenes(scene_filter, data_root=self.data_root)
+        print(f"DEBUG: found {len(self.scenes)} scenes using filter {scene_filter}", flush=True)
         # Flat index: one entry per (scene, iteration) so frames are addressable
         # by a single integer. ``number_of_iterations`` counts current + future.
         self._index: list[tuple[int, int]] = [

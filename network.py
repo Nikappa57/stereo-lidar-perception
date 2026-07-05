@@ -1140,17 +1140,251 @@ class ConcatConvFusion(BEVFusion):
                                     dim=1))  # (B, out_channels, nx, ny)
 
 
-class CrossAttentionFusion(BEVFusion):
-    """Pipeline C fusion — same interface, learns near->stereo / far->lidar.
+class _WindowCrossAttention(nn.Module):
+    """Windowed cross-attention: camera queries attend to LiDAR keys/values.
 
-    Drop-in replacement for :class:`ConcatConvFusion` (doc §07 C). Use
-    deformable / windowed attention or attend only at candidate cells; full
-    all-to-all over the grid is quadratic and too slow.
+    The BEV grid is partitioned into non-overlapping windows of shape
+    ``(win_h, win_w)``.  Within each window the ``n = win_h * win_w`` tokens
+    interact as standard multi-head attention, giving O(n^2) cost *per window*
+    instead of O(N^2) for the full grid.  For win=8 on a 200x160 grid
+    (-> 25x20 = 500 windows) n = 64, well within the Orin latency budget.
+
+    Positional encoding uses **learnable relative position bias** (Swin-style):
+    a parameter table of shape ``((2·wh-1)·(2·ww-1), num_heads)`` is indexed
+    by the ``(Δrow, Δcol)`` offset between every pair of tokens in a window and
+    added to the raw QK dot-products before softmax.  This lets the model
+    distinguish cells by position within a window without breaking the
+    translation-equivariance of the windowing itself.
+
+    Parameters
+    ----------
+    q_dim   : channel depth of the query (camera BEV projected).
+    kv_dim  : channel depth of the key/value (lidar BEV projected).
+    out_dim : output channel depth.
+    num_heads : attention heads (must divide ``out_dim``).
+    win_h, win_w : window size in BEV cells.
     """
 
+    def __init__(
+        self,
+        q_dim: int,
+        kv_dim: int,
+        out_dim: int,
+        num_heads: int = 4,
+        win_h: int = 8,
+        win_w: int = 8,
+    ):
+        super().__init__()
+        self.win_h = win_h
+        self.win_w = win_w
+        self.num_heads = num_heads
+        assert out_dim % num_heads == 0, (
+            f"out_dim ({out_dim}) must be divisible by num_heads ({num_heads})"
+        )
+        self.q_proj   = nn.Linear(q_dim,  out_dim, bias=False)
+        self.k_proj   = nn.Linear(kv_dim, out_dim, bias=False)
+        self.v_proj   = nn.Linear(kv_dim, out_dim, bias=False)
+        self.out_proj = nn.Linear(out_dim, out_dim, bias=False)
+        self.norm_q   = nn.LayerNorm(out_dim)
+        self.norm_kv  = nn.LayerNorm(out_dim)
+        self.scale    = (out_dim // num_heads) ** -0.5
+
+        # ---- Learnable relative position bias (Swin-style) ----
+        # One scalar per (Δrow, Δcol, head). Table has (2·wh-1)·(2·ww-1) rows.
+        # Initialised near zero with small std so it starts as a mild prior.
+        self.rel_pos_bias_table = nn.Parameter(
+            torch.zeros((2 * win_h - 1) * (2 * win_w - 1), num_heads)
+        )
+        nn.init.trunc_normal_(self.rel_pos_bias_table, std=0.02)
+
+        # Relative position index for every (query, key) token pair in one
+        # window — shape (n, n) where n = win_h * win_w.  Precomputed once and
+        # stored as a non-learnable buffer so it travels with `.to(device)`.
+        coords_h = torch.arange(win_h)
+        coords_w = torch.arange(win_w)
+        grid = torch.stack(
+            torch.meshgrid(coords_h, coords_w, indexing="ij"))   # (2, wh, ww)
+        flat = grid.reshape(2, -1)                                # (2, n)
+        rel  = flat[:, :, None] - flat[:, None, :]               # (2, n, n)
+        rel[0] += win_h - 1                                       # shift to ≥ 0
+        rel[1] += win_w - 1
+        rel_idx = rel[0] * (2 * win_w - 1) + rel[1]              # (n, n)
+        self.register_buffer("relative_position_index", rel_idx)
+
+    # ------------------------------------------------------------------
+    # Window helpers
+    # ------------------------------------------------------------------
+    def _partition(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        """(B, C, H, W) -> (B*nW, n, C); also returns padded Hp, Wp."""
+        B, C, H, W = x.shape
+        wh, ww = self.win_h, self.win_w
+        pad_h = (wh - H % wh) % wh
+        pad_w = (ww - W % ww) % ww
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        _, _, Hp, Wp = x.shape
+        nwh, nww = Hp // wh, Wp // ww
+        x = x.reshape(B, C, nwh, wh, nww, ww)
+        x = x.permute(0, 2, 4, 3, 5, 1)           # (B, nwh, nww, wh, ww, C)
+        x = x.reshape(B * nwh * nww, wh * ww, C)   # (B*nW, n, C)
+        return x, Hp, Wp
+
+    def _unpartition(
+        self, x: torch.Tensor, B: int, Hp: int, Wp: int
+    ) -> torch.Tensor:
+        """(B*nW, n, C) -> (B, C, Hp, Wp)."""
+        wh, ww = self.win_h, self.win_w
+        C = x.shape[-1]
+        nwh, nww = Hp // wh, Wp // ww
+        x = x.reshape(B, nwh, nww, wh, ww, C)
+        x = x.permute(0, 5, 1, 3, 2, 4)            # (B, C, nwh, wh, nww, ww)
+        return x.reshape(B, C, Hp, Wp)
+
+    # ------------------------------------------------------------------
+    def forward(self, cam: torch.Tensor, lid: torch.Tensor) -> torch.Tensor:
+        """cam: (B, q_dim, H, W), lid: (B, kv_dim, H, W) -> (B, out_dim, H, W)."""
+        B, _, H, W = cam.shape
+
+        cam_w, Hp, Wp = self._partition(cam)   # (B*nW, n, q_dim)
+        lid_w, _,  _  = self._partition(lid)   # (B*nW, n, kv_dim)
+
+        Q = self.norm_q( self.q_proj(cam_w))   # (B*nW, n, E)
+        K = self.norm_kv(self.k_proj(lid_w))
+        V = self.v_proj(lid_w)
+
+        nW_B, n, E = Q.shape
+        hd = E // self.num_heads
+
+        # Multi-head attention
+        Q = Q.reshape(nW_B, n, self.num_heads, hd).transpose(1, 2)  # (nW_B, h, n, d)
+        K = K.reshape(nW_B, n, self.num_heads, hd).transpose(1, 2)
+        V = V.reshape(nW_B, n, self.num_heads, hd).transpose(1, 2)
+
+        attn = (Q @ K.transpose(-2, -1)) * self.scale   # (nW_B, h, n, n)
+
+        # relative position bias: look up table -> (n*n, h) -> (h, n, n)
+        # NOTE: use the `n` captured before the multi-head reshape (= win_h * win_w),
+        # not Q.shape[1] which is num_heads after the .transpose(1, 2) above.
+        bias = self.rel_pos_bias_table[
+            self.relative_position_index.view(-1)]               # (n*n, h)
+        bias = bias.view(n, n, self.num_heads).permute(2, 0, 1).contiguous()  # (h, n, n)
+        attn = (attn + bias.unsqueeze(0)).softmax(dim=-1)        # (nW_B, h, n, n)
+
+        out = (attn @ V).transpose(1, 2).reshape(nW_B, n, E)
+        out = self.out_proj(out)
+
+        # Unpartition and trim padding
+        out = self._unpartition(out, B, Hp, Wp)   # (B, E, Hp, Wp)
+        return out[..., :H, :W]
+
+
+class CrossAttentionFusion(BEVFusion):
+    """Pipeline C fusion -- learns near->stereo / far->LiDAR.  doc SS07 C.
+
+    Drop-in replacement for :class:`ConcatConvFusion`: same ``BEVFusion``
+    interface, identical ``(B, out_channels, nx, ny)`` output contract.
+
+    Architecture
+    ------------
+    1. **Project** both branches to a common embedding width (``out_channels``)
+       via 1x1 conv + BN + ReLU.
+    2. **Windowed cross-attention** (:class:`_WindowCrossAttention`):
+       camera BEV tokens query the LiDAR BEV within local ``win x win``
+       windows -- O(win^2) per window, not O(N^2) for the full grid.
+       Default ``win=8`` -> n=64 tokens/window on the 200x160 grid.
+    3. **Spatial near/far gate**: a lightweight conv produces a per-cell
+       scalar ``g in (0,1)`` from the concatenation of the two projected
+       maps.  The gate modulates the attended LiDAR signal:
+       ``fused = (1-g)*cam_proj + g*attn_out``.
+       Near cells (dense, accurate stereo) learn ``g~=0``; far cells
+       (sparse stereo, reliable LiDAR) learn ``g~=1``.
+    4. **Post-fusion conv** adds local spatial context between BEV cells
+       (mirrors the role of the conv stack in :class:`ConcatConvFusion`).
+
+    Parameters
+    ----------
+    cfg       : ``BEVFusionConfig`` -- channel contract + grid size.
+    num_heads : attention heads (default 4; must divide ``out_channels``).
+    win_h, win_w : window size in BEV cells (default 8x8).
+    """
+
+    def __init__(
+        self,
+        cfg: BEVFusionConfig,
+        num_heads: int = 4,
+        win_h: int = 8,
+        win_w: int = 8,
+    ):
+        super().__init__(cfg)
+        E = cfg.out_channels   # shared embedding / output width
+
+        # 1. Project both branches into a common embedding space
+        self.cam_proj = nn.Sequential(
+            nn.Conv2d(cfg.camera_channels, E, 1, bias=False),
+            nn.BatchNorm2d(E),
+            nn.ReLU(inplace=True),
+        )
+        self.lid_proj = nn.Sequential(
+            nn.Conv2d(cfg.lidar_channels, E, 1, bias=False),
+            nn.BatchNorm2d(E),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Windowed cross-attention (camera queries lidar)
+        self.cross_attn = _WindowCrossAttention(
+            q_dim=E,
+            kv_dim=E,
+            out_dim=E,
+            num_heads=num_heads,
+            win_h=win_h,
+            win_w=win_w,
+        )
+
+        # 3. Near/far gate: 1x1 conv on cat([cam_proj, lid_proj]) -> scalar
+        self.gate = nn.Sequential(
+            nn.Conv2d(E * 2, E, 1, bias=False),
+            nn.BatchNorm2d(E),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(E, 1, 1),
+            nn.Sigmoid(),
+        )
+
+        # 4. Post-fusion spatial context conv (mirrors ConcatConvFusion)
+        self.post_conv = nn.Sequential(
+            nn.Conv2d(E, E, 3, padding=1, bias=False),
+            nn.BatchNorm2d(E),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(E, E, 3, padding=1, bias=False),
+            nn.BatchNorm2d(E),
+            nn.ReLU(inplace=True),
+        )
+
     def _fuse(self, cam: torch.Tensor, lid: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "Pipeline C cross-attention fusion: TODO (P4).")
+        """
+        Parameters
+        ----------
+        cam : (B, camera_channels, nx, ny)
+        lid : (B, lidar_channels,  nx, ny)
+
+        Returns
+        -------
+        fused : (B, out_channels, nx, ny)
+        """
+        # 1. Project to shared width
+        cam_e = self.cam_proj(cam)   # (B, E, nx, ny)
+        lid_e = self.lid_proj(lid)   # (B, E, nx, ny)
+
+        # 2. Windowed cross-attention: camera queries lidar
+        attn_out = self.cross_attn(cam_e, lid_e)   # (B, E, nx, ny)
+
+        # 3. Near/far gate: g~=0 -> trust camera, g~=1 -> trust lidar attention
+        gate = self.gate(torch.cat([cam_e, lid_e], dim=1))   # (B, 1, nx, ny)
+        fused = (1.0 - gate) * cam_e + gate * attn_out       # (B, E, nx, ny)
+
+        # 4. Post-fusion spatial context
+        return self.post_conv(fused)   # (B, E, nx, ny)
 
 
 # ===========================================================================

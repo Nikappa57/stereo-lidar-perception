@@ -84,7 +84,7 @@ The fusion block has a **fixed interface** — *two BEV maps in, one out* — so
 | **C** | `CrossAttentionFusion` (near→stereo, far→LiDAR) | swaps the fusion block; same interface, drop-in |
 | **D** | **none** | late fusion merges object lists, not feature maps — does not use this module |
 
-Both `ConcatConvFusion` and `CrossAttentionFusion` subclass the abstract `BEVFusion`, so moving from the CNN baseline (A) to the cross-attention novelty (C) is a one-class change.
+Both `ConcatConvFusion` and `CrossAttentionFusion` subclass the abstract `BEVFusion`, so moving from the CNN baseline (A) to the cross-attention novelty (C) is a one-class change. For an exhaustive architectural comparison, mathematical formulation, and efficiency analysis of CNN vs. Transformer fusion, see [`newnetwork.md`](newnetwork.md).
 
 ---
 
