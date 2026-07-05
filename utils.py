@@ -378,3 +378,205 @@ def visualize_pointcloud(sample: StereoSample) -> None:
     ax.set_title(f"LiDAR Point Cloud (Ego Frame)")
     
     plt.show()
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline C — attention gate visualisation
+# --------------------------------------------------------------------------- #
+def visualize_attention_gate(
+        pipeline_c,
+        sample: StereoSample,
+        device=None,
+        save_path: str | None = None,
+):
+    """Visualise the learned near/far attention gate of :class:`network.PipelineC`.
+
+    Runs one forward pass through Pipeline C, captures the sigmoid gate
+    ``g ∈ (0,1)`` produced by ``fusion.gate``, and renders it on the ego BEV
+    grid with::
+
+        g ≈ 0  (dark green)  → the model trusts the stereo camera (near cells)
+        g ≈ 1  (dark red)    → the model trusts the LiDAR attention (far cells)
+
+    Overlaid:
+    * cyan rings — GT box centres (ego frame, in-grid).
+    * dashed white arcs — iso-range circles at 10 / 20 / 30 / 40 m so the
+      near/far structure is immediately legible.
+    * per-cell gate value on a shared 0–1 colour scale so comparisons across
+      runs / training stages are meaningful.
+
+    Parameters
+    ----------
+    pipeline_c : :class:`network.PipelineC`
+        The trained (or untrained) Pipeline C instance.
+    sample     : StereoSample
+        One frame to run the forward pass on.
+    device     : torch.device, optional
+        Defaults to CUDA if available.
+    save_path  : str, optional
+        Write a PNG instead of calling ``plt.show()``.
+    """
+    import torch
+    import globals as G
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    pipeline_c.to(device).eval()
+
+    # ---- capture gate output via forward hook ----
+    gate_map = {}
+    def _grab_gate(m, inp, out):
+        gate_map["gate"] = out[0, 0].detach().cpu().numpy()  # (nx, ny)
+    handle = pipeline_c.detector.fusion.gate.register_forward_hook(_grab_gate)
+    with torch.no_grad():
+        pipeline_c(sample, device=device)
+    handle.remove()
+
+    if "gate" not in gate_map:
+        print("Gate not captured — is this really a PipelineC instance?")
+        return
+    gate = gate_map["gate"]
+
+    # ---- BEV grid geometry ----
+    (x_min, x_max), (y_min, y_max) = G.X_RANGE, G.Y_RANGE
+    extent = [y_min, y_max, x_min, x_max]
+    nx, ny = G.GRID_SIZE
+    res = G.BEV_RES_M
+
+    # ---- GT centres (ego frame, in-grid) ----
+    centres = (sample.boxes_3d_ego[:, :2]
+               if len(sample.boxes_3d_ego) else np.zeros((0, 2)))
+    m = ((centres[:, 0] >= x_min) & (centres[:, 0] < x_max) &
+         (centres[:, 1] >= y_min) & (centres[:, 1] < y_max))
+    centres = centres[m]
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+    fig.suptitle(
+        f"Pipeline C — learned near/far gate | "
+        f"{sample.dataset} iter={sample.iteration}",
+        fontsize=13, fontweight="bold")
+
+    for ax, cmap, title in zip(
+        axes,
+        ["RdYlGn_r", "coolwarm"],
+        [
+            "Gate g  (green=trust stereo, red=trust LiDAR)",
+            "Gate g  (blue=stereo, red=LiDAR)",
+        ],
+    ):
+        im = ax.imshow(gate, origin="lower", cmap=cmap, vmin=0.0, vmax=1.0,
+                       extent=extent, aspect="auto")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="gate g")
+
+        # iso-range arcs from ego origin (x=0, y=0)
+        for r in [10, 20, 30, 40]:
+            theta = np.linspace(np.radians(-90), np.radians(90), 200)
+            arc_x = r * np.cos(theta)
+            arc_y = r * np.sin(theta)
+            # keep only arcs inside the BEV extent
+            inside = ((arc_x >= x_min) & (arc_x < x_max) &
+                      (arc_y >= y_min) & (arc_y < y_max))
+            if inside.any():
+                ax.plot(arc_y[inside], arc_x[inside], "w--", lw=0.8, alpha=0.6)
+                # label the arc at the rightmost visible point
+                label_idx = np.where(inside)[0][-1]
+                ax.text(arc_y[label_idx], arc_x[label_idx],
+                        f"{r} m", color="white", fontsize=7, alpha=0.8,
+                        ha="center", va="bottom")
+
+        if len(centres):
+            ax.scatter(centres[:, 1], centres[:, 0], s=50,
+                       facecolors="none", edgecolors="cyan", lw=1.5,
+                       label="GT centres")
+            ax.legend(loc="upper right", fontsize=8)
+
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Y lateral (m)")
+        ax.set_ylabel("X forward (m)")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_path:
+        fig.savefig(save_path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        return save_path
+    plt.show()
+
+
+def compare_pipeline_a_c(
+        pipeline_a,
+        pipeline_c,
+        sample: StereoSample,
+        device=None,
+        save_path: str | None = None,
+):
+    """Side-by-side debug forward of Pipeline A and Pipeline C on one frame.
+
+    Four panels: camera BEV | LiDAR BEV | Pipeline A fused BEV (concat+conv) |
+    Pipeline C fused BEV (cross-attention). All collapsed to channel-|mean| for
+    visualisation. GT centres overlaid in cyan so alignment is clear.
+
+    Both pipelines must already be in eval mode or will be set to eval here.
+    """
+    import torch
+    import globals as G
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline_a.to(device).eval()
+    pipeline_c.to(device).eval()
+
+    # Reuse Pipeline A's stereo-depth cache to avoid computing it twice
+    pipeline_a.debug = True
+    pipeline_c.debug = True
+
+    with torch.no_grad():
+        pipeline_a(sample, device=device)
+        pipeline_c(sample, device=device)
+
+    inter_a = pipeline_a.intermediates
+    inter_c = pipeline_c.intermediates
+
+    (x_min, x_max), (y_min, y_max) = G.X_RANGE, G.Y_RANGE
+    extent = [y_min, y_max, x_min, x_max]
+
+    centres = (sample.boxes_3d_ego[:, :2]
+               if len(sample.boxes_3d_ego) else np.zeros((0, 2)))
+    m = ((centres[:, 0] >= x_min) & (centres[:, 0] < x_max) &
+         (centres[:, 1] >= y_min) & (centres[:, 1] < y_max))
+    centres = centres[m]
+
+    def _panel(ax, feat, title, cmap):
+        lo = float(np.percentile(feat, 1))
+        hi = float(np.percentile(feat, 99))
+        if hi <= lo:
+            lo, hi = float(feat.min()), float(feat.max()) + 1e-9
+        im = ax.imshow(feat, origin="lower", cmap=cmap, vmin=lo, vmax=hi,
+                       extent=extent, aspect="auto")
+        if len(centres):
+            ax.scatter(centres[:, 1], centres[:, 0], s=30,
+                       facecolors="none", edgecolors="cyan", lw=1.0)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Y lateral (m)")
+        ax.set_ylabel("X forward (m)")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig, ax = plt.subplots(1, 4, figsize=(24, 7))
+    fig.suptitle(
+        f"Pipeline A vs C — fused BEV comparison | "
+        f"{sample.dataset} iter={sample.iteration}",
+        fontsize=13, fontweight="bold")
+
+    _panel(ax[0], inter_a["bev_camera"].abs().mean(0).numpy(),
+           f"Camera BEV ({inter_a['bev_camera'].shape[0]} ch, |mean|)", "plasma")
+    _panel(ax[1], inter_a["bev_lidar"].abs().mean(0).numpy(),
+           f"LiDAR BEV ({inter_a['bev_lidar'].shape[0]} ch, |mean|)", "viridis")
+    _panel(ax[2], inter_a["fused"].abs().mean(0).numpy(),
+           f"Pipeline A fused ({inter_a['fused'].shape[0]} ch, concat+conv)", "magma")
+    _panel(ax[3], inter_c["fused"].abs().mean(0).numpy(),
+           f"Pipeline C fused ({inter_c['fused'].shape[0]} ch, cross-attn)", "magma")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_path:
+        fig.savefig(save_path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        return save_path
+    plt.show()
