@@ -66,6 +66,9 @@ Legend: `critical` / `high` / `medium` / `low` = §11 priority.
 
 **Gate:** the ablation table, with the splat and beam-density rows quantified. Change one variable at a time; report mean ± std over ≥3 seeds.
 
+> Full run plan (camera-branch × fusion matrix, run order, tags, baseline
+> numbers): [`docs/experiments.md`](docs/experiments.md).
+
 - [ ] **Stereo-splat vs predicted-depth** (StereoBEV vs MonoBEV) — *the headline experiment*; proves grounded stereo depth earns its place.
 - [ ] Painted-range on/off (Pipeline B).
 - [ ] Beam density 64 / 32 / 16 — bridges the AV2 ↔ VLP-16 gap; procurement argument.
