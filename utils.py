@@ -5,12 +5,18 @@ from contextlib import contextmanager
 import numpy as np
 import matplotlib.pyplot as plt
 
+import globals as G
 from data import StereoSample, frustum_points, voxel_grid, cluster_points
 from network import PillarConfig
 
-#: Fixed per-class colours, shared by every figure (identity follows the
-#: entity — same order as globals.CLASSES everywhere).
-CLASS_COLORS = np.array([[0.15, 0.6, 1.0], [1.0, 0.55, 0.1], [0.2, 1.0, 0.3]])
+#: Per-class colours, shared by every figure (identity follows the entity — same
+#: order as globals.CLASSES everywhere). The first three are the original
+#: vehicle/person/two_wheeler hues; any further classes get distinct tab10
+#: colours, and the array is sized to ``G.NUM_CLASSES`` so it never under-indexes.
+CLASS_COLORS = np.concatenate([
+    np.array([[0.15, 0.6, 1.0], [1.0, 0.55, 0.1], [0.2, 1.0, 0.3]]),
+    plt.cm.tab10(np.arange(10))[:, :3],
+])[:max(3, G.NUM_CLASSES)]
 
 
 # --------------------------------------------------------------------------- #

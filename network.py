@@ -1746,6 +1746,30 @@ def _stereo_bev(
         return branch(sample, device)
 
 
+def build_detector(name: str, *, stereo_cache_root=None, stereo_cfg=None):
+    """Factory: model name -> ``(model, input_fn)``, the single source of truth
+    for the name→class mapping shared by the training + presentation notebooks.
+
+    ``name`` ∈ ``lidar`` | ``camera`` | ``pipeline_a`` | ``pipeline_b`` |
+    ``pipeline_c``. ``input_fn`` is ``lidar_points`` for the LiDAR baseline and
+    ``None`` (identity — the model consumes the sample) for everything else.
+    Pipeline D is late fusion (no model) — see ``evaluation.evaluate_late_fusion``.
+    """
+    name = name.lower()
+    if name in ("lidar", "lidar_only"):
+        return LidarOnlyDetector(), lidar_points
+    if name in ("camera", "camera_only"):
+        return CameraOnlyDetector(stereo_cache_root=stereo_cache_root,
+                                  stereo_cfg=stereo_cfg), None
+    pipelines = {"pipeline_a": PipelineA, "pipeline_b": PipelineB,
+                 "pipeline_c": PipelineC}
+    if name not in pipelines:
+        raise ValueError(f"unknown model {name!r}; expected one of "
+                         f"lidar, camera, {', '.join(pipelines)}")
+    return pipelines[name](stereo_cache_root=stereo_cache_root,
+                           stereo_cfg=stereo_cfg), None
+
+
 if __name__ == "__main__":
     # Smoke test with random Stage A maps (no dataset needed).
     nx, ny = G.GRID_SIZE

@@ -110,7 +110,20 @@ Six modules (the prescribed layout):
 | `data.py` | Dataset loading (`StereoSample`) **and** the geometric preprocessing representations: stereo depth/BEV, voxel grid, frustum points, clustering. |
 | `network.py` | Full architecture — one block per diagram node: camera branch (Mono/Stereo BEV), LiDAR stem (PointPillars), fusion, BEV backbone, CenterPoint head. See [`docs/newnetwork.md`](docs/newnetwork.md). |
 | `train.py` | BEV target encoder (`TargetEncoder`), CenterPoint loss (Gaussian-focal heatmap + masked L1 offset), single-frame overfit harness + multi-frame training loop (`train_model`). |
-| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score) and center-distance AP (`evaluate_model` @0.5/1/2/4 m, per class). CDS *(TODO)*. |
+| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score), center-distance AP (`evaluate_model` @0.5/1/2/4 m, per class), `evaluate_late_fusion` (Pipeline D), and `save_report`/`save_history` (the on-disk record). CDS *(TODO)*. |
+
+### Notebooks
+
+All notebooks live in [`notebooks/`](notebooks/) and are thin wiring over the `.py` modules (which stay at the repo root — the prescribed 6-module layout). Each starts with a one-line *repo-root bootstrap* cell, so it runs whether the kernel's working directory is `notebooks/` or the repo root. Split by role:
+
+| Notebook | Role |
+| --- | --- |
+| `notebooks/training.ipynb` | **Train** every model (set `MODEL` = `lidar` / `camera` / `pipeline_a` / `pipeline_b` / `pipeline_c`, re-run). Each run writes `checkpoints/<model>.pt`, `results/<model>.json` (AP report) and `results/<model>_history.json` (loss curves). §8b runs **Pipeline D** (late fusion of the lidar + camera checkpoints). |
+| `notebooks/{lidar,camera,pipeline_a,pipeline_b,pipeline_c,pipeline_d}.ipynb` | **Presentation, one per model** — they *don't train*: they load that model's `results/*.json` + checkpoint and render loss curves, the AP table, PR/F1/confusion diagnostics and qualitative BEV detections. Figures are written to `docs/img/`. Keep each one's outputs to have a persistent, shareable page per model. |
+| `notebooks/confronto.ipynb` | **Comparison hub** — loads every `results/*.json` into one AP table, per-class AP bars, overall-mAP + fusion-gain chart, and overlaid validation curves. Reads only from disk. |
+| `notebooks/debug_network.ipynb` | **Dev tool** — inspect any intermediate network output (stage-level debug panel, `record_activations` taps, single-frame overfit sanity). |
+
+`results/*.json` is the single source of truth for the numbers; graphs are regenerated from it (not stored as the primary artifact), so they never go stale.
 
 ## Evaluation
 
