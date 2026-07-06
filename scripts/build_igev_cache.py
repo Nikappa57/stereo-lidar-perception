@@ -23,7 +23,7 @@ from data import (Py123dDataset, StereoSGBMConfig,  # noqa: E402
 MATCHER = os.environ.get("MATCHER", "igev")
 
 if MATCHER != "sgbm":
-    import igev_matcher  # noqa: E402
+    import igev_matcher  # noqa: E402  (repo-root module; registers the IGEV matcher)
     igev_matcher.register()
 
 train_ds = Py123dDataset(split_names=["kitti360_train"])

@@ -121,7 +121,7 @@ def get_model(igev_root: str | None = None, ckpt: str | None = None,
         if p not in sys.path:
             sys.path.insert(0, p)
 
-    from igev_stereo import IGEVStereo  # noqa: E402  (external, optional)
+    from igev_stereo import IGEVStereo  # type: ignore  # noqa: E402  (vendored in third_party/IGEV-Stereo, added to sys.path just above)
 
     _DEVICE = device or ("cuda" if torch.cuda.is_available() else "cpu")
     args = argparse.Namespace(

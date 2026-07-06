@@ -108,6 +108,7 @@ def visualize_pipeline_debug(pipeline, sample, device=None,
                        edgecolors="cyan", lw=1.0)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Y lateral (m)")
+        ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
         ax.set_ylabel("X forward (m)")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -184,6 +185,7 @@ def visualize_bev(sample: StereoSample, cmap: str = "inferno") -> None:
             ys = cy + dx * sin_h + dy * cos_h
             plt.plot(ys, xs, "r-", lw=1)  # (lateral, forward) to match extent
     plt.xlabel("Y lateral (m)")
+    plt.gca().invert_xaxis()  # +y (ego-left) on the left, matching the camera
     plt.ylabel("X forward (m)")
     plt.title("LiDAR density BEV + GT boxes (ego frame)")
     plt.show()
@@ -269,6 +271,7 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
         ax[0, 1].plot(ys, xs, "-", color=colors[c], lw=1.3)
     ax[0, 1].set_title("LiDAR density BEV + GT boxes")
     ax[0, 1].set_xlabel("Y lateral (m)")
+    ax[0, 1].invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax[0, 1].set_ylabel("X forward (m)")
 
     # 3. encoded heatmap + oriented GT 3D boxes (to compare blob vs footprint)
@@ -287,6 +290,7 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
         ax[1, 0].plot(ys, xs, "-", color="cyan", lw=1.0)
     ax[1, 0].set_title("Encoded heatmap (max over classes) + GT 3D boxes")
     ax[1, 0].set_xlabel("Y lateral (m)")
+    ax[1, 0].invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax[1, 0].set_ylabel("X forward (m)")
 
     # 4. decoded vs GT over LiDAR
@@ -301,6 +305,7 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
     ax[1, 1].legend(loc="upper right")
     ax[1, 1].set_title(f"Decoded {len(dec)} vs {len(centres)} GT centres")
     ax[1, 1].set_xlabel("Y lateral (m)")
+    ax[1, 1].invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax[1, 1].set_ylabel("X forward (m)")
 
     handles = [plt.Line2D([0], [0], marker="s", color="w", markersize=11,
@@ -360,6 +365,7 @@ def visualize_detections(sample: StereoSample, detections: dict,
                    label=f"decoded ({len(det_xy)})")
     ax.legend(loc="upper right")
     ax.set_xlabel("Y lateral (m)")
+    ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax.set_ylabel("X forward (m)")
     ax.set_title(f"Detections vs GT | {sample.log_name[:8]}… "
                  f"iter={sample.iteration}")
@@ -504,6 +510,7 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     ax.set_xlim(y_min, y_max)
     ax.set_ylim(x_min, x_max)
     ax.set_xlabel("Y lateral (m)")
+    ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax.set_ylabel("X forward (m)")
     ax.legend(loc="upper right", fontsize=8, markerscale=2)
     ax.set_title("3 · BEV geometry — stereo/LiDAR/GT + decoded")
@@ -525,6 +532,7 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     if len(gt_xy) or len(det_xy):
         ax.legend(loc="upper right", fontsize=8, markerscale=1.5)
     ax.set_xlabel("Y lateral (m)")
+    ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax.set_ylabel("X forward (m)")
     ax.set_title(f"4 · BEV output — heatmap + decoded (score≥{score_threshold:g})")
 
@@ -812,6 +820,7 @@ def visualize_attention_gate(
 
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Y lateral (m)")
+        ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
         ax.set_ylabel("X forward (m)")
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -876,6 +885,7 @@ def compare_pipeline_a_c(
                        facecolors="none", edgecolors="cyan", lw=1.0)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Y lateral (m)")
+        ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
         ax.set_ylabel("X forward (m)")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
