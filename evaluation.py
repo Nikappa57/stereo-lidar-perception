@@ -221,39 +221,56 @@ def evaluate_model(model, frames, *, input_fn=None,
         sample_kwargs = {"load_images": False, "point_mask": False}
     decoder = CenterPointDecoder(score_threshold=score_threshold)
 
-    # scores/xy/frame ids per class + GT centres per (class, frame)
+    frame_dets: list[dict] = []          # raw per-frame preds
+    frame_gts: list[tuple] = []          # raw per-frame GT (centres, classes)
+    model.eval()
+    with torch.no_grad():
+        for frame in frames:
+            sample = frame.to_stereo_sample(**sample_kwargs)
+            out = model(input_fn(sample), device=device)
+            det = decoder(out["heatmap"].cpu(), out["offset"].cpu())[0]
+            frame_dets.append(_det_to_numpy(det))
+            frame_gts.append(frame_ground_truth(sample))
+    return _build_report(frame_dets, frame_gts, thresholds)
+
+
+def _det_to_numpy(det: dict) -> dict:
+    """CenterPointDecoder output (torch) → numpy ``{xy, scores, classes}``."""
+    return {"xy": det["boxes_2d"].numpy(),
+            "scores": det["scores"].numpy(),
+            "classes": det["classes"].numpy()}
+
+
+def _build_report(frame_dets: list[dict], frame_gts: list[tuple],
+                  thresholds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)) -> dict:
+    """Assemble the AP report from per-frame detections + GT.
+
+    Shared by :func:`evaluate_model` (single detector) and
+    :func:`evaluate_late_fusion` (merged lidar+camera detections), so both score
+    with identical accounting. ``frame_dets`` are numpy ``{xy, scores, classes}``
+    dicts; ``frame_gts`` are ``(centres, classes)`` from :func:`frame_ground_truth`.
+    """
     preds: dict[int, dict[str, list]] = {
         c: {"scores": [], "xy": [], "frame": []} for c in range(G.NUM_CLASSES)}
     gt_by_class: dict[int, dict[int, np.ndarray]] = {
         c: {} for c in range(G.NUM_CLASSES)}
     n_gt = np.zeros(G.NUM_CLASSES, dtype=np.int64)
-
-    frame_dets: list[dict] = []          # raw per-frame preds (for confusion)
-    frame_gts: list[tuple] = []          # raw per-frame GT (for confusion)
-    model.eval()
-    with torch.no_grad():
-        for f_id, frame in enumerate(frames):
-            sample = frame.to_stereo_sample(**sample_kwargs)
-            out = model(input_fn(sample), device=device)
-            det = decoder(out["heatmap"].cpu(), out["offset"].cpu())[0]
-            for c in range(G.NUM_CLASSES):
-                m = det["classes"] == c
-                preds[c]["scores"].extend(det["scores"][m].tolist())
-                preds[c]["xy"].extend(det["boxes_2d"][m].tolist())
-                preds[c]["frame"].extend([f_id] * int(m.sum()))
-            centres, classes = frame_ground_truth(sample)
-            for c in range(G.NUM_CLASSES):
-                gt_by_class[c][f_id] = centres[classes == c]
-                n_gt[c] += int((classes == c).sum())
-            frame_dets.append({"xy": det["boxes_2d"].numpy(),
-                               "scores": det["scores"].numpy(),
-                               "classes": det["classes"].numpy()})
-            frame_gts.append((centres, classes))
+    for f_id, (det, (centres, classes)) in enumerate(zip(frame_dets, frame_gts)):
+        cls = np.asarray(det["classes"])
+        sc = np.asarray(det["scores"])
+        xy = np.asarray(det["xy"]).reshape(-1, 2)
+        for c in range(G.NUM_CLASSES):
+            m = cls == c
+            preds[c]["scores"].extend(sc[m].tolist())
+            preds[c]["xy"].extend(xy[m].tolist())
+            preds[c]["frame"].extend([f_id] * int(m.sum()))
+            gt_by_class[c][f_id] = centres[classes == c]
+            n_gt[c] += int((classes == c).sum())
 
     # the distance band used for the P/R/F1 operating point + mean error
     op_thr = 2.0 if 2.0 in thresholds else thresholds[len(thresholds) // 2]
 
-    report: dict = {"per_class": {}, "n_frames": len(frames),
+    report: dict = {"per_class": {}, "n_frames": len(frame_dets),
                     "op_threshold_m": op_thr}
     class_means, errors = [], []
     for c, name in enumerate(G.CLASSES):
@@ -425,3 +442,93 @@ def compare_reports(reports: dict[str, dict]) -> None:
             for c in G.CLASSES)
         print(f"{name:<{name_w}s}{cells}{rep['mAP']:<7.3f}{rep['precision']:<7.3f}"
               f"{rep['recall']:<7.3f}{rep['f1']:<7.3f}{rep['mean_error_m']:.3f}")
+
+
+# =========================================================================== #
+# Pipeline D — late fusion (baseline): merge the object lists of the LiDAR-only
+# and camera-only detectors at the output, then score with the same AP. No
+# training and no shared feature map — it reuses the two single-sensor
+# checkpoints, so it is the natural "does fusing at the very end already help?"
+# baseline against the mid-fusion pipelines A/B/C.
+# =========================================================================== #
+def merge_detections(dets: list[dict], radius_m: float = 1.0) -> dict:
+    """Late-fuse detection lists: concatenate, then per-class distance-NMS.
+
+    Each element of ``dets`` is a numpy ``{xy (N,2), scores (N,), classes (N,)}``
+    dict (e.g. the LiDAR and the camera detector on one frame). The union is
+    greedily de-duplicated by descending score: a kept detection suppresses any
+    **same-class** detection within ``radius_m`` metres — so the same object seen
+    by both sensors is counted once, keeping the more confident hit.
+    """
+    if not dets:
+        return {"xy": np.zeros((0, 2)), "scores": np.zeros(0),
+                "classes": np.zeros(0, dtype=np.int64)}
+    xy = np.concatenate([np.asarray(d["xy"]).reshape(-1, 2) for d in dets])
+    sc = np.concatenate([np.asarray(d["scores"]).reshape(-1) for d in dets])
+    cls = np.concatenate([np.asarray(d["classes"]).reshape(-1) for d in dets]
+                         ).astype(np.int64)
+
+    suppressed = np.zeros(len(sc), dtype=bool)
+    keep_xy, keep_sc, keep_cls = [], [], []
+    for i in np.argsort(-sc):
+        if suppressed[i]:
+            continue
+        keep_xy.append(xy[i]); keep_sc.append(sc[i]); keep_cls.append(cls[i])
+        d = np.linalg.norm(xy - xy[i], axis=1)
+        suppressed |= (cls == cls[i]) & (d < radius_m)  # incl. self
+    return {"xy": np.asarray(keep_xy).reshape(-1, 2),
+            "scores": np.asarray(keep_sc),
+            "classes": np.asarray(keep_cls, dtype=np.int64)}
+
+
+def evaluate_late_fusion(lidar_model, camera_model, frames, *,
+                         lidar_input_fn=None, camera_input_fn=None,
+                         device: torch.device = torch.device("cpu"),
+                         score_threshold: float = 0.1,
+                         sample_kwargs: dict | None = None,
+                         thresholds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0),
+                         merge_radius_m: float = 1.0) -> dict:
+    """Center-distance AP of the **late-fusion** (Pipeline D) baseline.
+
+    Decodes the LiDAR-only and camera-only detectors on each frame, merges their
+    object lists with :func:`merge_detections`, and scores the union with the same
+    metric as :func:`evaluate_model` — so the report is directly comparable in
+    :func:`compare_reports`. ``lidar_input_fn`` defaults to ``network.lidar_points``;
+    ``camera_input_fn`` defaults to identity (the camera model takes the sample).
+    """
+    from network import lidar_points
+    lidar_input_fn = lidar_input_fn or lidar_points
+    camera_input_fn = camera_input_fn or (lambda s: s)
+    if sample_kwargs is None:
+        sample_kwargs = {"load_images": False, "point_mask": False}
+    decoder = CenterPointDecoder(score_threshold=score_threshold)
+
+    frame_dets, frame_gts = [], []
+    lidar_model.eval(); camera_model.eval()
+    with torch.no_grad():
+        for frame in frames:
+            sample = frame.to_stereo_sample(**sample_kwargs)
+            lo = lidar_model(lidar_input_fn(sample), device=device)
+            co = camera_model(camera_input_fn(sample), device=device)
+            dl = _det_to_numpy(decoder(lo["heatmap"].cpu(), lo["offset"].cpu())[0])
+            dc = _det_to_numpy(decoder(co["heatmap"].cpu(), co["offset"].cpu())[0])
+            frame_dets.append(merge_detections([dl, dc], radius_m=merge_radius_m))
+            frame_gts.append(frame_ground_truth(sample))
+    return _build_report(frame_dets, frame_gts, thresholds)
+
+
+# =========================================================================== #
+# Loss-curve history (train.train_model returns it; persist for the per-model
+# presentation notebooks so curves regenerate from disk, no re-training).
+# =========================================================================== #
+def save_history(history: dict, path: str | Path) -> Path:
+    """Save a ``train_model`` history dict (``train``/``val``/``steps``) to JSON."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(history))
+    return path
+
+
+def load_history(path: str | Path) -> dict:
+    """Load a :func:`save_history` JSON (``{"train": [...], "val": [...], "steps": [...]}``)."""
+    return json.loads(Path(path).read_text())

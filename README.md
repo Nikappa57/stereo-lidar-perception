@@ -51,7 +51,7 @@ We use **KITTI-360** through the [`py123d`](https://pypi.org/project/py123d/) lo
 - a dense **LiDAR** (Velodyne HDL-64, ~114k points/sweep),
 - human-annotated **3D bounding boxes** + ego poses and calibration.
 
-**Classes used:** `VEHICLE` (development and stability), `PERSON`, and `TWO_WHEELER` (KITTI-360 has no traffic cones; the cone transfer target will come from AV2/CARLA later). The loader is dataset-agnostic, so switching back to Argoverse 2 only means flipping the dataset block in `globals.py`.
+**Classes used:** the **unified** taxonomy KITTI-360 produces — `VEHICLE`, `PERSON`, `TWO_WHEELER`, `TRAFFIC_SIGN`, plus the rare `TRAIN` (kept for completeness, effectively eval-only). `GENERIC_OBJECT` (poles/box/trashbin/…) is deliberately excluded — a heterogeneous, noisy bucket — and `trafficLight` (present in the raw XML) is not emitted by py123d, so it too is omitted. KITTI-360 has no traffic cones — the cone transfer target will come from AV2/CARLA later. The loader is dataset-agnostic, so switching back to Argoverse 2 only means flipping the dataset block in `globals.py`.
 
 ## Installation
 
@@ -73,8 +73,10 @@ The raw stereo images and LiDAR scans are on a **public** S3 bucket — one scri
 # smoke test — smallest sequence (~3 GB), all into kitti360_train
 scripts/get_kitti360.sh
 
-# real train/val split (~25 GB): train = drives 0003+0007, val = drive 0010
-TRAIN_SEQ="0003 0007" VAL_SEQ="0010" scripts/get_kitti360.sh
+# real train/val split (~70 GB): train = drives 0003+0007+0009, val = drive 0010
+# (0009 added because 0003/0007 are the two poorest drives for PERSON/TWO_WHEELER;
+#  0010 is rich in every class and is held out for validation)
+TRAIN_SEQ="0003 0007 0009" VAL_SEQ="0010" scripts/get_kitti360.sh
 ```
 
 The script is idempotent (re-runs skip already-extracted sequences), checks the gated files from step 2, and verifies the converted splits (frame counts, colour, LiDAR, boxes, baseline) at the end.
@@ -106,9 +108,22 @@ Six modules (the prescribed layout):
 | `globals.py` | Single source of truth: shared BEV grid, channel contract, classes. |
 | `utils.py` | Visualization helpers (LiDAR density BEV + GT boxes, frustum, clusters). |
 | `data.py` | Dataset loading (`StereoSample`) **and** the geometric preprocessing representations: stereo depth/BEV, voxel grid, frustum points, clustering. |
-| `network.py` | Full architecture — one block per diagram node: camera branch (Mono/Stereo BEV), LiDAR stem (PointPillars), fusion, BEV backbone, CenterPoint head. |
+| `network.py` | Full architecture — one block per diagram node: camera branch (Mono/Stereo BEV), LiDAR stem (PointPillars), fusion, BEV backbone, CenterPoint head. See [`docs/newnetwork.md`](docs/newnetwork.md). |
 | `train.py` | BEV target encoder (`TargetEncoder`), CenterPoint loss (Gaussian-focal heatmap + masked L1 offset), single-frame overfit harness + multi-frame training loop (`train_model`). |
-| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score) and center-distance AP (`evaluate_model` @0.5/1/2/4 m, per class). CDS *(TODO)*. |
+| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score), center-distance AP (`evaluate_model` @0.5/1/2/4 m, per class), `evaluate_late_fusion` (Pipeline D), and `save_report`/`save_history` (the on-disk record). CDS *(TODO)*. |
+
+### Notebooks
+
+All notebooks live in [`notebooks/`](notebooks/) and are thin wiring over the `.py` modules (which stay at the repo root — the prescribed 6-module layout). Each starts with a one-line *repo-root bootstrap* cell, so it runs whether the kernel's working directory is `notebooks/` or the repo root. Split by role:
+
+| Notebook | Role |
+| --- | --- |
+| `notebooks/training.ipynb` | **Train** every model (set `MODEL` = `lidar` / `camera` / `pipeline_a` / `pipeline_b` / `pipeline_c`, re-run). Each run writes `checkpoints/<model>.pt`, `results/<model>.json` (AP report) and `results/<model>_history.json` (loss curves). §8b runs **Pipeline D** (late fusion of the lidar + camera checkpoints). |
+| `notebooks/{lidar,camera,pipeline_a,pipeline_b,pipeline_c,pipeline_d}.ipynb` | **Presentation, one per model** — they *don't train*: they load that model's `results/*.json` + checkpoint and render loss curves, the AP table, PR/F1/confusion diagnostics and qualitative BEV detections. Figures are written to `docs/img/`. Keep each one's outputs to have a persistent, shareable page per model. |
+| `notebooks/confronto.ipynb` | **Comparison hub** — loads every `results/*.json` into one AP table, per-class AP bars, overall-mAP + fusion-gain chart, and overlaid validation curves. Reads only from disk. |
+| `notebooks/debug_network.ipynb` | **Dev tool** — inspect any intermediate network output (stage-level debug panel, `record_activations` taps, single-frame overfit sanity). |
+
+`results/*.json` is the single source of truth for the numbers; graphs are regenerated from it (not stored as the primary artifact), so they never go stale.
 
 ## Evaluation
 

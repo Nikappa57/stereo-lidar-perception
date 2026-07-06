@@ -5,12 +5,18 @@ from contextlib import contextmanager
 import numpy as np
 import matplotlib.pyplot as plt
 
+import globals as G
 from data import StereoSample, frustum_points, voxel_grid, cluster_points
 from network import PillarConfig
 
-#: Fixed per-class colours, shared by every figure (identity follows the
-#: entity — same order as globals.CLASSES everywhere).
-CLASS_COLORS = np.array([[0.15, 0.6, 1.0], [1.0, 0.55, 0.1], [0.2, 1.0, 0.3]])
+#: Per-class colours, shared by every figure (identity follows the entity — same
+#: order as globals.CLASSES everywhere). The first three are the original
+#: vehicle/person/two_wheeler hues; any further classes get distinct tab10
+#: colours, and the array is sized to ``G.NUM_CLASSES`` so it never under-indexes.
+CLASS_COLORS = np.concatenate([
+    np.array([[0.15, 0.6, 1.0], [1.0, 0.55, 0.1], [0.2, 1.0, 0.3]]),
+    plt.cm.tab10(np.arange(10))[:, :3],
+])[:max(3, G.NUM_CLASSES)]
 
 
 # --------------------------------------------------------------------------- #
@@ -102,6 +108,7 @@ def visualize_pipeline_debug(pipeline, sample, device=None,
                        edgecolors="cyan", lw=1.0)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Y lateral (m)")
+        ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
         ax.set_ylabel("X forward (m)")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -178,6 +185,7 @@ def visualize_bev(sample: StereoSample, cmap: str = "inferno") -> None:
             ys = cy + dx * sin_h + dy * cos_h
             plt.plot(ys, xs, "r-", lw=1)  # (lateral, forward) to match extent
     plt.xlabel("Y lateral (m)")
+    plt.gca().invert_xaxis()  # +y (ego-left) on the left, matching the camera
     plt.ylabel("X forward (m)")
     plt.title("LiDAR density BEV + GT boxes (ego frame)")
     plt.show()
@@ -263,6 +271,7 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
         ax[0, 1].plot(ys, xs, "-", color=colors[c], lw=1.3)
     ax[0, 1].set_title("LiDAR density BEV + GT boxes")
     ax[0, 1].set_xlabel("Y lateral (m)")
+    ax[0, 1].invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax[0, 1].set_ylabel("X forward (m)")
 
     # 3. encoded heatmap + oriented GT 3D boxes (to compare blob vs footprint)
@@ -281,6 +290,7 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
         ax[1, 0].plot(ys, xs, "-", color="cyan", lw=1.0)
     ax[1, 0].set_title("Encoded heatmap (max over classes) + GT 3D boxes")
     ax[1, 0].set_xlabel("Y lateral (m)")
+    ax[1, 0].invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax[1, 0].set_ylabel("X forward (m)")
 
     # 4. decoded vs GT over LiDAR
@@ -295,6 +305,7 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
     ax[1, 1].legend(loc="upper right")
     ax[1, 1].set_title(f"Decoded {len(dec)} vs {len(centres)} GT centres")
     ax[1, 1].set_xlabel("Y lateral (m)")
+    ax[1, 1].invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax[1, 1].set_ylabel("X forward (m)")
 
     handles = [plt.Line2D([0], [0], marker="s", color="w", markersize=11,
@@ -311,13 +322,17 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
     plt.show()
 
 def visualize_detections(sample: StereoSample, detections: dict,
-                         save_path: str | None = None):
-    """Decoded detections vs GT centres over the LiDAR density BEV.
+                         save_path: str | None = None, model=None):
+    """Decoded detections vs GT centres over a density BEV.
 
     ``detections`` is one element of :class:`evaluation.CenterPointDecoder`
     output (``boxes_2d`` / ``scores`` / ``classes``). GT rings are the in-grid,
     class-remapped centres (same filter as training targets). Marker colour =
     class, following the :data:`globals.CLASSES` order.
+
+    The background density heatmap defaults to the LiDAR sweep. Pass ``model``
+    (a camera-only detector) to instead back-project the branch's stereo depth,
+    so a camera-only figure never shows LiDAR the model cannot see.
     """
     import torch
 
@@ -329,8 +344,15 @@ def visualize_detections(sample: StereoSample, detections: dict,
     nx, ny = G.GRID_SIZE
     colors = CLASS_COLORS
 
+    if model is not None:
+        image, depth, K, T_cam2ego = _stereo_inputs_for(model, sample)
+        pts = _backproject_depth(depth, K, T_cam2ego)
+        bg_label = "stereo depth"
+    else:
+        pts = sample.lidar_xyz
+        bg_label = "LiDAR"
+
     grid = np.zeros((nx, ny), np.float32)
-    pts = sample.lidar_xyz
     m = ((pts[:, 0] >= x_min) & (pts[:, 0] < x_max) &
          (pts[:, 1] >= y_min) & (pts[:, 1] < y_max))
     p = pts[m]
@@ -354,8 +376,9 @@ def visualize_detections(sample: StereoSample, detections: dict,
                    label=f"decoded ({len(det_xy)})")
     ax.legend(loc="upper right")
     ax.set_xlabel("Y lateral (m)")
+    ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax.set_ylabel("X forward (m)")
-    ax.set_title(f"Detections vs GT | {sample.log_name[:8]}… "
+    ax.set_title(f"Detections vs GT | bg={bg_label} | {sample.log_name[:8]}… "
                  f"iter={sample.iteration}")
     if save_path:
         fig.savefig(save_path, dpi=110, bbox_inches="tight")
@@ -401,7 +424,9 @@ def _backproject_depth(depth, K, T_cam2ego):
 
 def visualize_stereo_bev_diagnostic(model, sample, device=None,
                                     score_threshold: float = 0.1,
-                                    save_path: str | None = None):
+                                    save_path: str | None = None,
+                                    show_lidar: bool = True,
+                                    heat_gamma: float = 1.0):
     """Split the camera failure into *seeing* vs *placing* — four stages.
 
     Answers "does the net see the object in the image but scatter it to the
@@ -409,13 +434,14 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
 
     1. **Camera view** — the left image with 2D GT boxes (coloured by class).
        If a class is boxed here, it is in frame; the backbone gets to see it.
-    2. **SGBM depth** — the exact depth map the splat consumes (0 = invalid,
+    2. **Stereo depth** — the exact depth map the splat consumes (0 = invalid,
        shown black). Thin/low-texture objects (pedestrians) drop out here.
-    3. **BEV geometry** — the stereo depth back-projected to ego (grey) over the
-       LiDAR cloud (blue) with GT centres (stars). This is the money panel: a
-       star with LiDAR under it but no grey nearby = depth never reconstructed
-       it; grey offset in range from the star = depth is biased. Placement, not
-       perception, is the failure when the image panel *did* box the object.
+    3. **BEV geometry** — the stereo depth back-projected to ego (grey) with GT
+       centres (stars). This is the money panel: a star with no grey nearby =
+       depth never reconstructed it; grey offset in range from the star = depth
+       is biased. With ``show_lidar=True`` the LiDAR cloud (blue) is overlaid
+       *only as a geometry reference* — it is never a model input; the detector
+       stays camera-only. Set ``show_lidar=False`` for a pure camera-only figure.
     4. **Network BEV output** — the predicted heatmap (max over classes) with GT
        centres (stars) *and* the decoded detections (``x`` markers, coloured by
        class) that survive NMS + the ``score_threshold``. A bright heatmap blob
@@ -470,17 +496,18 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     im = ax.imshow(dm, cmap="turbo")
     ax.set_facecolor("black")
     valid_pct = 100.0 * (depth > 0).mean()
-    ax.set_title(f"2 · SGBM depth (splat input) — {valid_pct:.0f}% valid")
+    ax.set_title(f"2 · stereo depth (splat input) — {valid_pct:.0f}% valid")
     ax.axis("off")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="metric depth (m)")
 
     # 3) BEV geometry: stereo cloud vs LiDAR vs GT -------------------------
     ax = axes[1, 0]
-    lp = sample.lidar_xyz
-    lm = ((lp[:, 0] >= x_min) & (lp[:, 0] < x_max) &
-          (lp[:, 1] >= y_min) & (lp[:, 1] < y_max))
-    ax.scatter(lp[lm, 1], lp[lm, 0], s=1, c="#3a7bd5", alpha=0.25,
-               label="LiDAR")
+    if show_lidar:
+        lp = sample.lidar_xyz
+        lm = ((lp[:, 0] >= x_min) & (lp[:, 0] < x_max) &
+              (lp[:, 1] >= y_min) & (lp[:, 1] < y_max))
+        ax.scatter(lp[lm, 1], lp[lm, 0], s=1, c="#3a7bd5", alpha=0.25,
+                   label="LiDAR (reference only)")
     sm = ((stereo_ego[:, 0] >= x_min) & (stereo_ego[:, 0] < x_max) &
           (stereo_ego[:, 1] >= y_min) & (stereo_ego[:, 1] < y_max))
     ax.scatter(stereo_ego[sm, 1], stereo_ego[sm, 0], s=1, c="0.55", alpha=0.35,
@@ -498,14 +525,19 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     ax.set_xlim(y_min, y_max)
     ax.set_ylim(x_min, x_max)
     ax.set_xlabel("Y lateral (m)")
+    ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax.set_ylabel("X forward (m)")
     ax.legend(loc="upper right", fontsize=8, markerscale=2)
-    ax.set_title("3 · BEV geometry — stereo/LiDAR/GT + decoded")
+    ax.set_title("3 · BEV geometry — stereo/LiDAR/GT + decoded" if show_lidar
+                 else "3 · BEV geometry — stereo depth/GT + decoded")
 
     # 4) network BEV output: heatmap + GT stars + decoded detections -------
     ax = axes[1, 1]
+    # heat_gamma < 1 brightens the low-confidence structure via a gamma stretch
+    # while keeping the 0..1 scale honest (gamma == 1 -> plain linear scale).
+    from matplotlib.colors import PowerNorm
     ax.imshow(heat, origin="lower", cmap="inferno", extent=extent,
-              aspect="auto", vmin=0, vmax=1)
+              aspect="auto", norm=PowerNorm(gamma=heat_gamma, vmin=0, vmax=1))
     for ci in range(len(G.CLASSES)):
         m = gt_cls == ci
         if m.any():
@@ -519,8 +551,10 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     if len(gt_xy) or len(det_xy):
         ax.legend(loc="upper right", fontsize=8, markerscale=1.5)
     ax.set_xlabel("Y lateral (m)")
+    ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
     ax.set_ylabel("X forward (m)")
-    ax.set_title(f"4 · BEV output — heatmap + decoded (score≥{score_threshold:g})")
+    gtag = "" if heat_gamma == 1.0 else f", γ={heat_gamma:g}"
+    ax.set_title(f"4 · BEV output — heatmap + decoded (score≥{score_threshold:g}{gtag})")
 
     fig.suptitle(f"stereo→BEV diagnostic | {sample.log_name[:8]}… "
                  f"iter={sample.iteration}", fontsize=13)
@@ -806,6 +840,7 @@ def visualize_attention_gate(
 
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Y lateral (m)")
+        ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
         ax.set_ylabel("X forward (m)")
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -870,6 +905,7 @@ def compare_pipeline_a_c(
                        facecolors="none", edgecolors="cyan", lw=1.0)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Y lateral (m)")
+        ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
         ax.set_ylabel("X forward (m)")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
