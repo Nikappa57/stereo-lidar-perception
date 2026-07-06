@@ -51,7 +51,7 @@ We use **KITTI-360** through the [`py123d`](https://pypi.org/project/py123d/) lo
 - a dense **LiDAR** (Velodyne HDL-64, ~114k points/sweep),
 - human-annotated **3D bounding boxes** + ego poses and calibration.
 
-**Classes used:** `VEHICLE` (development and stability), `PERSON`, and `TWO_WHEELER` (KITTI-360 has no traffic cones; the cone transfer target will come from AV2/CARLA later). The loader is dataset-agnostic, so switching back to Argoverse 2 only means flipping the dataset block in `globals.py`.
+**Classes used:** the **unified** taxonomy KITTI-360 produces — `VEHICLE`, `PERSON`, `TWO_WHEELER`, `TRAFFIC_SIGN`, plus the rare `TRAIN` (kept for completeness, effectively eval-only). `GENERIC_OBJECT` (poles/box/trashbin/…) is deliberately excluded — a heterogeneous, noisy bucket — and `trafficLight` (present in the raw XML) is not emitted by py123d, so it too is omitted. KITTI-360 has no traffic cones — the cone transfer target will come from AV2/CARLA later. The loader is dataset-agnostic, so switching back to Argoverse 2 only means flipping the dataset block in `globals.py`.
 
 ## Installation
 
@@ -73,8 +73,10 @@ The raw stereo images and LiDAR scans are on a **public** S3 bucket — one scri
 # smoke test — smallest sequence (~3 GB), all into kitti360_train
 scripts/get_kitti360.sh
 
-# real train/val split (~25 GB): train = drives 0003+0007, val = drive 0010
-TRAIN_SEQ="0003 0007" VAL_SEQ="0010" scripts/get_kitti360.sh
+# real train/val split (~70 GB): train = drives 0003+0007+0009, val = drive 0010
+# (0009 added because 0003/0007 are the two poorest drives for PERSON/TWO_WHEELER;
+#  0010 is rich in every class and is held out for validation)
+TRAIN_SEQ="0003 0007 0009" VAL_SEQ="0010" scripts/get_kitti360.sh
 ```
 
 The script is idempotent (re-runs skip already-extracted sequences), checks the gated files from step 2, and verifies the converted splits (frame counts, colour, LiDAR, boxes, baseline) at the end.

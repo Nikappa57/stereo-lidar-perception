@@ -1751,7 +1751,8 @@ if __name__ == "__main__":
     nx, ny = G.GRID_SIZE
     bev_cam = torch.randn(CAMERA_BEV_CHANNELS, nx, ny)
     bev_lid = torch.randn(LIDAR_BEV_CHANNELS, nx, ny)
-    det = BEVDetector.from_bev_maps(bev_cam, bev_lid, num_classes=3).eval()
+    det = BEVDetector.from_bev_maps(bev_cam, bev_lid,
+                                    num_classes=G.NUM_CLASSES).eval()
     describe(det)
     with torch.no_grad():
         out = det(bev_cam, bev_lid)

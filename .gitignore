@@ -221,16 +221,23 @@ __marimo__/
 
 
 # Converted py123d logs / maps (path-refs + arrow); regenerate via scripts/get_kitti360.sh
-data/
+# No trailing slash: on some setups these are SYMLINKS (dataset lives on an
+# external volume, symlinked into the repo). A "data/" pattern matches only real
+# dirs and would leave the symlink tracked, committing a machine-local abs path.
+data
 py123d-docs/
 
 # Raw datasets — public repo, do NOT commit (GBs). Fetch via scripts/get_kitti360.sh
-KITTI-360/
+KITTI-360
 
 # Training
 checkpoints/
 preprocessed/
 *.pt
+
+# Shared stereo-cache archives (see scripts/build_igev_cache.py) — GBs, never commit
+*.tar
+igev_cache.tar
 
 # Vendored IGEV-Stereo code + weights (large; fetch/rebuild, do not commit)
 third_party/

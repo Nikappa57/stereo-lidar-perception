@@ -66,15 +66,34 @@ RIGHT_CAMERA: str = "pcam_stereo_r"
 # --------------------------------------------------------------------------- #
 # Classes (design doc §05)
 # --------------------------------------------------------------------------- #
-# The py123d loader emits a *unified* taxonomy (VEHICLE / PERSON / BARRIER /
-# TWO_WHEELER / TRAFFIC_CONE / TRAFFIC_SIGN / OTHER / ANIMAL), coarser than each
-# dataset's raw names. We train on a 3-class subset. KITTI-360 has **no cones**
-# (urban German streets), so the small-object slot is TWO_WHEELER (bicycle /
-# motorcycle / rider) — which py123d does *not* fold into VEHICLE. Note this
-# means VEHICLE = car/truck/bus only. Everything else maps to the ignore bucket
-# (index None). TRAFFIC_CONE remains the Formula-Student deployment target, but
-# it must come from AV2 (CONSTRUCTION_CONE) or CARLA — swap it back in there.
-CLASSES: tuple[str, ...] = ("VEHICLE", "PERSON", "TWO_WHEELER")
+# The py123d loader emits a *unified* taxonomy (via ``default_label``), coarser
+# than each dataset's raw names. We train on **every unified class KITTI-360
+# actually produces**. The raw KITTI-360 → unified folding is (parser registry):
+#   VEHICLE        ← car, truck, bus, caravan, trailer
+#   PERSON         ← pedestrian, rider
+#   TWO_WHEELER    ← bicycle, motorcycle
+#   TRAFFIC_SIGN   ← trafficSign, stop
+#   TRAIN          ← train
+#   GENERIC_OBJECT ← bigPole, smallPole, lamp, box, trashbin, vendingmachine
+# NOTE: KITTI-360's ``trafficLight`` exists in the XML (~147 boxes) but py123d's
+# parser does **not** emit it — verified 0 TRAFFIC_LIGHT detections on the val
+# drive (which has 74 in the raw XML). So TRAFFIC_LIGHT is intentionally omitted:
+# a class with zero GT only wastes a head channel and a permanently-0 AP row.
+# Class-frequency notes (measured on drives 0003/0007/0009/0010, see docs):
+#   * GENERIC_OBJECT (bigPole/smallPole/lamp/box/trashbin/vendingmachine) is a
+#     heterogeneous, noisy bucket (mostly thin poles) — **excluded**: those raw
+#     labels now fall into the ignore bucket (class_index -> None).
+#   * TRAIN is emitted but rare and only on drive 0010 (the val split) → it
+#     never appears in training; expect ~0 AP. Kept for taxonomy completeness.
+# TRAFFIC_CONE (the Formula-Student deployment target) does not exist in
+# KITTI-360; it must come from AV2 (CONSTRUCTION_CONE) or CARLA later.
+CLASSES: tuple[str, ...] = (
+    "VEHICLE",
+    "PERSON",
+    "TWO_WHEELER",
+    "TRAFFIC_SIGN",
+    "TRAIN",
+)
 NUM_CLASSES: int = len(CLASSES)
 
 # Loader label -> training class index. Labels absent here are ignored (not a
