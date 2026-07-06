@@ -220,8 +220,17 @@ __marimo__/
 
 
 
+# Converted py123d logs / maps (path-refs + arrow); regenerate via scripts/get_kitti360.sh
 data/
 py123d-docs/
-sensor
-None
-logs
+
+# Raw datasets — public repo, do NOT commit (GBs). Fetch via scripts/get_kitti360.sh
+KITTI-360/
+
+# Training
+checkpoints/
+preprocessed/
+*.pt
+
+# Vendored IGEV-Stereo code + weights (large; fetch/rebuild, do not commit)
+third_party/
