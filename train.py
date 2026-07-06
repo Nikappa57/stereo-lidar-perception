@@ -1,6 +1,8 @@
-"""Target generation and loss utilities for BEV object detection training."""
+"""Target generation, loss and training loop for BEV object detection."""
 
 import math
+import random
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -211,10 +213,14 @@ def encode_sample(sample, encoder: "TargetEncoder"
     """
     boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)
     idx = [G.class_index(l) for l in sample.boxes_3d_labels]
+    if len(boxes) == 0:  # frames with no GT (common on KITTI-360, sparse labels)
+        return (torch.zeros((1, G.NUM_CLASSES, encoder.nx, encoder.ny)),
+                torch.zeros((1, 2, encoder.nx, encoder.ny)))
     x, y = boxes[:, 0], boxes[:, 1]
     inside = ((x >= G.X_RANGE[0]) & (x < G.X_RANGE[1]) &
               (y >= G.Y_RANGE[0]) & (y < G.Y_RANGE[1]))
-    keep = torch.tensor([c is not None for c in idx]) & inside
+    # dtype=bool: an empty list would otherwise make a Float tensor and break `&`.
+    keep = torch.tensor([c is not None for c in idx], dtype=torch.bool) & inside
     bx = boxes[keep]
     lab = torch.tensor([c for c, k in zip(idx, keep.tolist()) if k],
                        dtype=torch.long)
@@ -238,7 +244,8 @@ def overfit_one_frame(model: nn.Module, inputs,
     """
     model.to(device).train()
     loss_fn = CenterPointLoss()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(
+        (p for p in model.parameters() if p.requires_grad), lr=lr)
     tgt_hm, tgt_off = target_heatmap.to(device), target_offset.to(device)
 
     history = []
@@ -249,4 +256,344 @@ def overfit_one_frame(model: nn.Module, inputs,
         loss.backward()
         opt.step()
         history.append(float(loss))
+    return history
+
+
+# =========================================================================== #
+# Pipeline C convenience wrappers (CrossAttentionFusion, near/far gate)
+# =========================================================================== #
+# These thin wrappers call the generic overfit_one_frame / validate /
+# train_model with the right defaults for PipelineC (input_fn = identity,
+# sample_kwargs = FAST_SAMPLE_KWARGS).  They exist so notebook cells and
+# test scripts can read as single, intent-revealing lines:
+#
+#   history = overfit_pipeline_c(pipeline, sample, tgt_hm, tgt_off)
+#   val_loss = validate_pipeline_c(pipeline, val_frames)
+#   history  = train_pipeline_c(pipeline, train_frames, val_frames)
+#
+# The PipelineC.forward(sample, device=...) signature already matches the
+# ``(inputs, device=device)`` contract expected by overfit_one_frame /
+# train_model / validate — no extra adapter is needed.
+
+
+def overfit_pipeline_c(
+    model: nn.Module,
+    sample,
+    target_heatmap: torch.Tensor,
+    target_offset: torch.Tensor,
+    steps: int = 200,
+    lr: float = 5e-4,
+    device: torch.device = torch.device("cpu"),
+) -> list[float]:
+    """Overfit :class:`~network.PipelineC` on a single frame (sanity harness).
+
+    Wraps :func:`overfit_one_frame` with Pipeline C defaults (more steps and a
+    lower learning rate than the generic default — the cross-attention + gate add
+    parameters whose gradients are smaller in the early iterations).
+
+    Parameters
+    ----------
+    model:
+        A :class:`~network.PipelineC` (or any ``nn.Module`` with a
+        ``forward(sample, device=…) → {heatmap, offset}`` signature).
+    sample:
+        A :class:`~data.StereoSample` — the single frame to overfit on.
+    target_heatmap:
+        ``(1, num_classes, nx, ny)`` Gaussian heatmap from
+        :func:`encode_sample`.
+    target_offset:
+        ``(1, 2, nx, ny)`` sub-cell offset from :func:`encode_sample`.
+    steps:
+        Gradient steps (default 200 — extra headroom for the attention layers).
+    lr:
+        Adam learning rate (default 5e-4).
+    device:
+        Torch device.
+
+    Returns
+    -------
+    history : list[float]
+        Per-step total loss (heatmap focal + offset L1).  A steady decrease
+        confirms that gradients flow through both branches *and* the
+        cross-attention / gate layers.
+    """
+    return overfit_one_frame(model, sample, target_heatmap, target_offset,
+                             steps=steps, lr=lr, device=device)
+
+
+def validate_pipeline_c(
+    model: nn.Module,
+    frames,
+    *,
+    encoder: "TargetEncoder | None" = None,
+    sample_kwargs: dict | None = None,
+    device: torch.device = torch.device("cpu"),
+) -> float:
+    """Mean :class:`CenterPointLoss` over ``frames`` for Pipeline C (no grad, eval).
+
+    Wraps :func:`validate` with ``input_fn=None`` (identity — PipelineC takes
+    the full :class:`~data.StereoSample` directly) and the shared
+    :data:`FAST_SAMPLE_KWARGS` default (no images, no point mask — the camera
+    branch reads from the precomputed stereo cache).
+
+    Parameters
+    ----------
+    model:
+        :class:`~network.PipelineC` (or compatible pipeline).
+    frames:
+        List of :class:`~data.Frame` objects — typically the val split from
+        :func:`split_frames`.
+    encoder:
+        :class:`TargetEncoder` instance; a default one is created if ``None``.
+    sample_kwargs:
+        Keyword arguments forwarded to ``frame.to_stereo_sample``; defaults to
+        :data:`FAST_SAMPLE_KWARGS` (``load_images=False, point_mask=False``).
+        Pass ``{}`` to load full samples (e.g. when the stereo cache is absent).
+    device:
+        Torch device.
+
+    Returns
+    -------
+    float
+        Mean loss over all frames (returns 0.0 on an empty list).
+    """
+    return validate(model, frames, input_fn=None, encoder=encoder,
+                    sample_kwargs=sample_kwargs, device=device)
+
+
+def train_pipeline_c(
+    model: nn.Module,
+    train_frames,
+    val_frames,
+    *,
+    epochs: int = 10,
+    lr: float = 5e-4,
+    accum: int = 4,
+    encoder: "TargetEncoder | None" = None,
+    ckpt_path: "str | Path | None" = None,
+    log_every: int = 50,
+    seed: int = 0,
+    sample_kwargs: dict | None = None,
+    device: torch.device = torch.device("cpu"),
+) -> dict:
+    """Multi-frame training loop for :class:`~network.PipelineC`.
+
+    Wraps :func:`train_model` with Pipeline C defaults (more epochs, lower lr
+    to stabilise the cross-attention layers).  Gradient accumulation, CPU/GPU
+    overlap prefetch and best-val checkpointing are all inherited unchanged.
+
+    Parameters
+    ----------
+    model:
+        :class:`~network.PipelineC` (or any pipeline with the same forward
+        signature).
+    train_frames, val_frames:
+        Lists of :class:`~data.Frame` — use :func:`split_frames` to build them.
+    epochs:
+        Training epochs (default 10; Pipeline C typically needs more than A/B
+        because the attention layers start nearly random).
+    lr:
+        Adam learning rate (default 5e-4 — lower than the 1e-3 generic default
+        to prevent early instability in the QK projections).
+    accum:
+        Gradient accumulation steps (effective batch = accum × 1 frame).
+    encoder:
+        :class:`TargetEncoder`; a default one is created if ``None``.
+    ckpt_path:
+        If given, the best-val checkpoint is written here as a ``torch.save``
+        dict with keys ``model``, ``epoch``, ``val_loss``.
+    log_every:
+        Print a step-level loss line every this many frames (0 = silent).
+    seed:
+        RNG seed for reproducible frame shuffling.
+    sample_kwargs:
+        Forwarded to ``frame.to_stereo_sample``; defaults to
+        :data:`FAST_SAMPLE_KWARGS`.  Pass ``{}`` to load full samples.
+    device:
+        Torch device.
+
+    Returns
+    -------
+    dict
+        ``{"train": [float, …], "val": [float, …], "steps": [float, …]}`` —
+        per-epoch mean train/val losses and per-step losses for plotting.
+
+    Example
+    -------
+    >>> from network import PipelineC
+    >>> from train import split_frames, train_pipeline_c
+    >>> pipeline = PipelineC(stereo_cache_root="data/stereo_cache")
+    >>> train_frames, val_frames = split_frames(dataset, val_scenes=1)
+    >>> history = train_pipeline_c(
+    ...     pipeline, train_frames, val_frames,
+    ...     epochs=10, lr=5e-4, ckpt_path="checkpoints/pipeline_c_best.pt",
+    ...     device=torch.device("cuda"),
+    ... )
+    """
+    return train_model(model, train_frames, val_frames, input_fn=None,
+                       epochs=epochs, lr=lr, accum=accum, encoder=encoder,
+                       ckpt_path=ckpt_path, log_every=log_every, seed=seed,
+                       sample_kwargs=sample_kwargs, device=device)
+
+
+# =========================================================================== #
+# Multi-frame training loop (P1)
+# =========================================================================== #
+def set_seed(seed: int = 0) -> None:
+    """Seed every RNG that touches training (python, numpy, torch, CUDA).
+
+    Makes runs *reproducible*, not bit-deterministic: the BEV splat and other
+    scatter-style CUDA kernels use atomics whose accumulation order varies, so
+    losses can still differ in the last decimals between identical runs. For
+    strict determinism add ``torch.use_deterministic_algorithms(True)`` (slower,
+    and some ops may raise).
+    """
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)          # seeds CUDA too (all devices)
+    torch.backends.cudnn.benchmark = False  # don't let autotune pick per-run kernels
+
+
+def split_frames(dataset, val_scenes: "int | list[int]" = 1) -> tuple[list, list]:
+    """Split a :class:`~data.Py123dDataset` into train/val **by scene (log)**.
+
+    Frames within one log are strongly correlated (consecutive timesteps of the
+    same drive), so a per-frame split would leak train scenes into val.
+
+    :param val_scenes: ``int`` — hold out the *last* n logs; or an explicit
+        list of scene indices to hold out (e.g. ``[1]`` to validate on a log
+        that actually contains the rare class you care about).
+    :returns: ``(train_frames, val_frames)`` — lists of :class:`~data.Frame`.
+    """
+    if isinstance(val_scenes, int):
+        assert 0 < val_scenes < dataset.scene_count, (
+            f"val_scenes={val_scenes} must leave at least one scene on each "
+            f"side of the split (dataset has {dataset.scene_count})")
+        val_ids = set(range(dataset.scene_count - val_scenes,
+                            dataset.scene_count))
+    else:
+        val_ids = set(int(i) for i in val_scenes)
+        assert val_ids and all(0 <= i < dataset.scene_count for i in val_ids), (
+            f"val scene indices {sorted(val_ids)} out of range "
+            f"(dataset has {dataset.scene_count} scenes)")
+        assert len(val_ids) < dataset.scene_count, "no scenes left for training"
+    train_frames, val_frames = [], []
+    for scene_index in range(dataset.scene_count):
+        bucket = val_frames if scene_index in val_ids else train_frames
+        bucket.extend(dataset.frames_in_scene(scene_index))
+    return train_frames, val_frames
+
+
+# Training needs neither the images (LiDAR path; the camera branch reads the
+# precomputed stereo cache) nor the LiDAR-in-box mask — skipping both cuts
+# sample assembly from ~0.9 s to ~30 ms (see to_stereo_sample docstring).
+FAST_SAMPLE_KWARGS = {"load_images": False, "point_mask": False}
+
+
+def validate(model: nn.Module, frames, *, input_fn=None,
+             encoder: "TargetEncoder | None" = None,
+             sample_kwargs: dict | None = None,
+             device: torch.device = torch.device("cpu")) -> float:
+    """Mean :class:`CenterPointLoss` over ``frames`` (no grad, eval mode)."""
+    input_fn = input_fn or (lambda s: s)
+    encoder = encoder or TargetEncoder()
+    sample_kwargs = FAST_SAMPLE_KWARGS if sample_kwargs is None else sample_kwargs
+    loss_fn = CenterPointLoss()
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for frame in frames:
+            sample = frame.to_stereo_sample(**sample_kwargs)
+            tgt_hm, tgt_off = encode_sample(sample, encoder)
+            pred = model(input_fn(sample), device=device)
+            loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
+            losses.append(float(loss))
+    return sum(losses) / max(1, len(losses))
+
+
+def train_model(model: nn.Module, train_frames, val_frames, *,
+                input_fn=None, epochs: int = 5, lr: float = 1e-3,
+                accum: int = 4, encoder: "TargetEncoder | None" = None,
+                ckpt_path: str | Path | None = None, log_every: int = 50,
+                seed: int = 0, sample_kwargs: dict | None = None,
+                device: torch.device = torch.device("cpu")) -> dict:
+    """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
+
+    The branches process one sample at a time (batch dim 1), so an effective
+    batch is built by accumulating ``accum`` frames' gradients per optimizer
+    step. Frames are re-shuffled every epoch; validation runs after each epoch
+    and the best-val checkpoint is written to ``ckpt_path`` (if given).
+
+    CPU/GPU overlap: the next frame's sample assembly + target encoding runs
+    in a background thread while the GPU steps on the current one, and samples
+    are loaded with :data:`FAST_SAMPLE_KWARGS` (no images, no point mask) —
+    the camera branch must therefore read the precomputed stereo cache
+    (:func:`data.precompute_stereo_inputs`); pass ``sample_kwargs={}`` to
+    force full samples instead.
+
+    :param input_fn: ``sample -> model input``; identity for the
+        :class:`network.Pipeline` classes (default), ``network.lidar_points``
+        for :class:`network.LidarOnlyDetector`.
+    :returns: history dict — per-epoch ``"train"`` / ``"val"`` mean losses and
+        the per-step ``"steps"`` list (for plotting).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    input_fn = input_fn or (lambda s: s)
+    encoder = encoder or TargetEncoder()
+    sample_kwargs = FAST_SAMPLE_KWARGS if sample_kwargs is None else sample_kwargs
+    loss_fn = CenterPointLoss()
+    model.to(device)
+    opt = torch.optim.Adam(
+        (p for p in model.parameters() if p.requires_grad), lr=lr)
+    rng = random.Random(seed)
+    order = list(range(len(train_frames)))
+
+    def _prep(frame):
+        sample = frame.to_stereo_sample(**sample_kwargs)
+        tgt_hm, tgt_off = encode_sample(sample, encoder)
+        return input_fn(sample), tgt_hm, tgt_off
+
+    history: dict = {"train": [], "val": [], "steps": []}
+    best_val = float("inf")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        rng.shuffle(order)
+        opt.zero_grad()
+        total = 0.0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_prep, train_frames[order[0]])
+            for k in range(len(order)):
+                inputs, tgt_hm, tgt_off = future.result()
+                if k + 1 < len(order):  # prefetch the next frame
+                    future = pool.submit(_prep, train_frames[order[k + 1]])
+                pred = model(inputs, device=device)
+                loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
+                (loss / accum).backward()
+                if (k + 1) % accum == 0 or k == len(order) - 1:
+                    opt.step()
+                    opt.zero_grad()
+                total += float(loss)
+                history["steps"].append(float(loss))
+                if log_every and (k + 1) % log_every == 0:
+                    print(f"  epoch {epoch} step {k + 1}/{len(order)} "
+                          f"loss {float(loss):.3f}")
+
+        train_mean = total / max(1, len(order))
+        val_mean = validate(model, val_frames, input_fn=input_fn,
+                            encoder=encoder, sample_kwargs=sample_kwargs,
+                            device=device)
+        history["train"].append(train_mean)
+        history["val"].append(val_mean)
+        print(f"epoch {epoch}/{epochs}  train {train_mean:.3f}  "
+              f"val {val_mean:.3f}")
+
+        if ckpt_path is not None and val_mean < best_val:
+            best_val = val_mean
+            ckpt = Path(ckpt_path)
+            ckpt.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(), "epoch": epoch,
+                        "val_loss": val_mean}, ckpt)
+            print(f"  new best val — checkpoint saved → {ckpt}")
     return history

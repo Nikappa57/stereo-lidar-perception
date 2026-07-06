@@ -12,7 +12,7 @@ Two ways to use this file:
   switches camera. The overlay uses py123d's own projection, so it is
   guaranteed consistent with the data.
 
-Although the data shipped here is Argoverse 2, nothing below is AV2-specific:
+Although the data shipped here is KITTI-360, nothing below is dataset-specific:
 pass a different ``--split`` (or ``Py123dDataset(datasets=[...])``) and the same
 code visualises any py123d dataset.
 """
@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data import Frame, Py123dDataset  # noqa: E402
 
-DEFAULT_SPLIT = "av2-sensor_val"
+DEFAULT_SPLIT = "kitti360_train"
 
 
 def build_dataset(max_num_scenes: int = 1, split: str = DEFAULT_SPLIT) -> Py123dDataset:
@@ -183,7 +183,7 @@ def test_stereo_sample_contract(dataset: Py123dDataset):
     c = sample.calibration
     assert c.left_intrinsics.shape == (3, 3) and c.right_intrinsics.shape == (3, 3)
     assert c.ego_to_global.shape == (4, 4) and c.left_to_ego.shape == (4, 4)
-    assert 0.0 < c.stereo_baseline_m < 2.0  # AV2 stereo baseline is ~0.5 m
+    assert 0.0 < c.stereo_baseline_m < 2.0  # KITTI-360 ~0.6 m (AV2 was ~0.5 m)
 
 
 def test_boxes_global_to_ego_roundtrip():
@@ -248,7 +248,8 @@ def test_boxes_ego_frame_matches_lidar(dataset):
     np.testing.assert_array_equal(in_ego, in_global)
 
     # The guard must reject the *global* boxes when the city origin is far away
-    # (the realistic AV2 case); skip the assertion if this log sits near origin.
+    # (KITTI-360/AV2 both use city-scale global coords); skip the assertion if
+    # this log happens to sit near the origin.
     global_r = np.linalg.norm(boxes_g[:, BoundingBoxSE3Index.XYZ][:, :2], axis=1).max()
     assert_boxes_in_sensor_range(boxes_e)
     if global_r > SENSOR_RANGE_M:

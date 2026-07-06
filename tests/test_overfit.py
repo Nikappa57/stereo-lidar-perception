@@ -4,7 +4,7 @@ Two ways to use this file:
 
 * ``pytest tests/test_overfit.py`` — headless assertions, three levels of the
   same recipe (TargetEncoder -> model -> CenterPointLoss -> backward ->
-  CenterPointDecoder on a single real Argoverse 2 frame):
+  CenterPointDecoder on a single real KITTI-360 frame):
 
   - ``test_overfit_lidar_only`` — the cheapest differentiable path
     (:class:`network.LidarOnlyDetector`: pillars -> head).
@@ -43,23 +43,22 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _load_sample():
-    """Load a single frame from the AV2 validation split.
+    """First frame that actually has >=1 in-grid GT of a kept class.
 
-    If the dataset directory is missing or contains no scenes, raise a clear
-    ``RuntimeError`` with instructions. This prevents obscure ``IndexError``
-    crashes when users run the visualisation script on a fresh checkout.
+    KITTI-360 boxes are sparse (~5/frame, many static/ignored), so a fixed
+    index can land on an empty frame — the overfit would have nothing to
+    recover. Scan cheaply (no images) for a frame with a positive target, then
+    reload it in full (the camera branch needs the stereo images).
     """
-    dataset = Py123dDataset(split_names=["av2-sensor_val"], max_num_scenes=1)
-    if not getattr(dataset, "scenes", None):
-        raise RuntimeError(
-            "No scenes found in the AV2 dataset. Please download the Argoverse 2 "
-            "validation split and set the appropriate environment variable or "
-            "configure ``data.py`` to point at the dataset location."
-        )
-    # Grab a frame a few iterations after the start to ensure we have enough history.
-    frame = dataset.get_frame(
-        0, dataset.scenes[0].number_of_history_iterations + 13)
-    return frame.to_stereo_sample()
+    dataset = Py123dDataset(split_names=["kitti360_train"], max_num_scenes=1)
+    enc = TargetEncoder()
+    frames = dataset.frames_in_scene(0)
+    for frame in frames:
+        light = frame.to_stereo_sample(load_images=False, point_mask=False)
+        hm, _ = encode_sample(light, enc)
+        if hm.eq(1).any():
+            return frame.to_stereo_sample()
+    return frames[0].to_stereo_sample()  # fallback (should not happen)
 
 
 def _assert_recovers_gt(model, inputs, tgt_hm, tgt_off, history):
@@ -78,7 +77,7 @@ def _assert_recovers_gt(model, inputs, tgt_hm, tgt_off, history):
 
     dist = torch.cdist(gt["boxes_2d"], det["boxes_2d"])  # (n_gt, n_det)
     min_dist, nearest = dist.min(dim=1)
-    recovered = min_dist < 0.5  # metres — the tightest AV2 distance-AP band
+    recovered = min_dist < 0.5  # metres — the tightest distance-AP band
     assert recovered.float().mean() > 0.9, (
         f"only {int(recovered.sum())}/{len(recovered)} GT centres within 0.5 m")
     cls_ok = det["classes"][nearest] == gt["classes"]

@@ -40,7 +40,7 @@ from data import (  # noqa: E402
 )
 from network import PillarConfig  # noqa: E402
 
-DEFAULT_SPLIT = "av2-sensor_val"
+DEFAULT_SPLIT = "kitti360_train"
 
 
 def build_dataset(max_num_scenes: int = 1, split: str = DEFAULT_SPLIT) -> Py123dDataset:
@@ -109,7 +109,7 @@ def test_rectification_is_wellformed(sample: StereoSample):
     assert rect.R1.shape == (3, 3)
     assert rect.map_lx.shape == (h, w) and rect.map_ly.shape == (h, w)
     assert rect.fx_rect > 0
-    assert 0.0 < rect.baseline_m < 2.0  # AV2 stereo baseline ~0.5 m
+    assert 0.0 < rect.baseline_m < 2.0  # KITTI-360 ~0.6 m (AV2 was ~0.5 m)
 
 
 def test_disparity_to_depth_formula():
@@ -186,7 +186,9 @@ def test_bev_aligns_with_raw_lidar(sample: StereoSample):
 def test_depth_matches_lidar_depth(sample: StereoSample):
     """The headline correctness check: stereo depth ≈ LiDAR depth.
 
-    Validated baseline on this data: median |err| ≈ 0.4 m, ~82 % within 2 m.
+    Needs ``sample.depth_left`` (precomputed sparse LiDAR depth); KITTI-360 has
+    no precomputed depth maps, so this **skips** unless they were generated.
+    Reference figures measured on AV2: median |err| ≈ 0.4 m, ~82 % within 2 m.
     Thresholds are loosened for margin across frames / OpenCV versions.
     """
     metrics = compare_depth_to_lidar(sample)
@@ -206,7 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--split", default=DEFAULT_SPLIT, help="py123d split to load")
     parser.add_argument("--frames", type=int, nargs="+", default=[0, 50, 100],
                         help="frame indices to evaluate")
-    parser.add_argument("--downscale", type=float, default=0.5, help="SGBM matching scale")
+    parser.add_argument("--downscale", type=float, default=1.0, help="SGBM matching scale")
     parser.add_argument("--save", default=None, help="save a disparity/depth/BEV figure for the first frame")
     args = parser.parse_args(argv)
 

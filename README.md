@@ -2,7 +2,7 @@
 
 **Stereo + LiDAR fusion for 3D object detection in bird's-eye view.**
 
-A Computer Vision course project (AIRO master's program, Sapienza University of Rome) by three members of the [Fast Charge](https://fastcharge.diag.uniroma1.it/) Formula Student Driverless team. The method is developed and benchmarked on **Argoverse 2** and designed to port to the team's driverless car for cone detection.
+A Computer Vision course project (AIRO master's program, Sapienza University of Rome) by three members of the [Fast Charge](https://sapienzafastcharge.it/) Formula Student Driverless team. The method is developed and benchmarked on **KITTI-360** and designed to port to the team's driverless car for cone detection.
 
 ---
 
@@ -45,66 +45,47 @@ While **Pipeline A/B** relies on $3 \times 3$ convolutions (which assume strict 
 
 ## Dataset
 
-We use **Argoverse 2** through the [`py123d`](https://pypi.org/project/py123d/) loader. Among large autonomous-driving datasets it is the only one that combines everything this project needs:
+We use **KITTI-360** through the [`py123d`](https://pypi.org/project/py123d/) loader. It is the only py123d dataset that combines everything this project needs (see [docs/dataset.md](docs/dataset.md) for the full comparison):
 
-- a real **stereo** camera pair (most AV datasets are mono-camera),
-- a dense **LiDAR** (two aggregated 32-beam sweeps),
-- a genuine small-object class — **`CONSTRUCTION_CONE`** — the closest available proxy to Formula Student track cones,
-- a **distance-based** detection metric that matches a centre-mapping task and transfers cleanly to cones.
+- a real **colour stereo** camera pair (most AV datasets are mono/surround; Argoverse 2 has a stereo pair but it is grayscale),
+- a dense **LiDAR** (Velodyne HDL-64, ~114k points/sweep),
+- human-annotated **3D bounding boxes** + ego poses and calibration.
 
-**Classes used:** `REGULAR_VEHICLE` (development and stability), `PEDESTRIAN`, and `CONSTRUCTION_CONE` (transfer-relevant small object).
+**Classes used:** `VEHICLE` (development and stability), `PERSON`, and `TWO_WHEELER` (KITTI-360 has no traffic cones; the cone transfer target will come from AV2/CARLA later). The loader is dataset-agnostic, so switching back to Argoverse 2 only means flipping the dataset block in `globals.py`.
 
 ## Installation
 
 ### 1. Install the dataset library
 
-Install `py123d` with the dataset backend (Argoverse 2):
-
 ```bash
-pip install "py123d[av2]"
+pip install py123d
 ```
 
-### 2. Download the dataset
+### 2. Get the login-gated annotation files (once)
 
-Set the destination directory:
+Register (free) at [cvlibs.net/datasets/kitti-360](https://www.cvlibs.net/datasets/kitti-360/) and download the three small archives — **Calibrations** (~3K), **Vehicle Poses** (~9M), **3D Bounding Boxes** (~30M) — then unzip them under `KITTI-360/` in the repo root (`calibration/`, `data_poses/`, `data_3d_bboxes/`). If a teammate already has them, copying those three folders works too.
 
-```bash
-export AV2_DATA_ROOT=/path/to/argoverse
-```
+### 3. Download + convert the sensor data (scripted)
 
-Download a subset of logs (e.g. 5 from the validation split) to test the code:
+The raw stereo images and LiDAR scans are on a **public** S3 bucket — one script downloads, extracts and converts them into `data/logs/kitti360_{train,val}/`:
 
 ```bash
-py123d-download dataset=av2-sensor \
-    'dataset.downloader.splits=[av2-sensor_val]' \
-    dataset.downloader.num_logs=5
+# smoke test — smallest sequence (~3 GB), all into kitti360_train
+scripts/get_kitti360.sh
+
+# real train/val split (~25 GB): train = drives 0003+0007, val = drive 0010
+TRAIN_SEQ="0003 0007" VAL_SEQ="0010" scripts/get_kitti360.sh
 ```
 
-### 3. Convert the data
-
-`py123d` uses Apache Arrow for fast loading. Convert the downloaded data:
-
-```bash
-py123d-conversion dataset=av2-sensor \
-    'dataset.parser.splits=[av2-sensor_val]'
-```
-
-> **`AV2_DATA_ROOT` must still be exported** (step 2) — the conversion CLI reads it
-> to locate the raw `sensor/` directory and fails with `av2_sensor_root … None/sensor`
-> otherwise.
->
-> **Restrict `dataset.parser.splits` to what you actually downloaded.** The parser
-> scans `train`/`val`/`test` by default; with only `av2-sensor_val` on disk, the
-> override above avoids a `No such file or directory: …/sensor/train` error.
-
-> The `dataset=av2-sensor-stream` option downloads and parses logs on the fly if disk space is limited.
+The script is idempotent (re-runs skip already-extracted sequences), checks the gated files from step 2, and verifies the converted splits (frame counts, colour, LiDAR, boxes, baseline) at the end.
 
 ## Usage
 
-Set the workspace path before running:
+Set the dataset roots before running (the loader also auto-fills them from the repo layout):
 
 ```bash
-export PY123D_DATA_ROOT="/your/data/path"
+export PY123D_DATA_ROOT="$PWD/data"          # converted Arrow logs
+export KITTI360_DATA_ROOT="$PWD/KITTI-360"   # raw images / LiDAR blobs
 ```
 
 The `py123d` Scene API gives frame-by-frame access:
@@ -126,18 +107,19 @@ Six modules (the prescribed layout):
 | `utils.py` | Visualization helpers (LiDAR density BEV + GT boxes, frustum, clusters). |
 | `data.py` | Dataset loading (`StereoSample`) **and** the geometric preprocessing representations: stereo depth/BEV, voxel grid, frustum points, clustering. |
 | `network.py` | Full architecture — one block per diagram node: camera branch (Mono/Stereo BEV), LiDAR stem (PointPillars), fusion, BEV backbone, CenterPoint head. See [`docs/newnetwork.md`](docs/newnetwork.md). |
-| `train.py` | BEV target encoder (`TargetEncoder`), CenterPoint loss (Gaussian-focal heatmap + masked L1 offset), LiDAR-only detector + single-frame overfit harness. Multi-frame training loop *(TODO)*. |
-| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score). Distance-AP / CDS metrics *(TODO)*. |
+| `train.py` | BEV target encoder (`TargetEncoder`), CenterPoint loss (Gaussian-focal heatmap + masked L1 offset), single-frame overfit harness + multi-frame training loop (`train_model`). |
+| `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score) and center-distance AP (`evaluate_model` @0.5/1/2/4 m, per class). CDS *(TODO)*. |
 
 ## Evaluation
 
-Two single-sensor baselines (camera-only and LiDAR-only) set the floor — fusion must beat both. Detection is scored with the Argoverse 2 **distance-AP** metric (true positives at 0.5 / 1 / 2 / 4 m) plus the composite detection score, reported per class and stratified by range.
+Two single-sensor baselines (camera-only and LiDAR-only) set the floor — fusion must beat both. Detection is scored with a **center-distance AP** metric (Argoverse-style bands: true positives at 0.5 / 1 / 2 / 4 m) plus the composite detection score, reported per class and stratified by range. The metric only needs GT centres, so it is dataset-agnostic.
 
 ## References
 
 - **BEVFusion** — Multi-Task Multi-Sensor Fusion with Unified BEV Representation. [arXiv:2205.13542](https://arxiv.org/abs/2205.13542)
 - **SLBEVFusion** — 3D detection using stereo camera and LiDAR fusion with BEV (Neurocomputing, 2024).
 - **FutrTrack** — Camera-LiDAR Fusion Transformer for 3D MOT. [arXiv:2510.19981](https://arxiv.org/abs/2510.19981)
+- **KITTI-360** — A Novel Dataset and Benchmarks for Urban Scene Understanding in 2D and 3D. [arXiv:2109.13410](https://arxiv.org/abs/2109.13410)
 - **Argoverse 2** — Next Generation Datasets for Self-Driving Perception and Forecasting. [arXiv:2301.00493](https://arxiv.org/abs/2301.00493)
 
 ## Authors

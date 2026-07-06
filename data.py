@@ -7,10 +7,12 @@ them into a per-frame :class:`StereoSample`, then provides the geometric
 that the network and baselines consume.
 
 Because everything goes through :class:`py123d.api.SceneAPI`, the same code
-works for any py123d dataset (Argoverse 2, nuPlan, nuScenes, Waymo, ...).
+works for any py123d dataset (KITTI-360, Argoverse 2, nuPlan, nuScenes, ...).
 Switching datasets only changes the :class:`~py123d.api.SceneFilter` and the
 root paths; the stereo-specific assembly assumes a left/right camera pair whose
-ids are configurable (AV2's ``pcam_stereo_l`` / ``pcam_stereo_r`` by default).
+ids are configurable (``pcam_stereo_l`` / ``pcam_stereo_r`` by default — see
+:mod:`globals`). The project default is KITTI-360 (the only py123d dataset with
+a real colour stereo pair; see ``docs/dataset.md``).
 
 ============================ INPUTS ============================
 Read from disk (paths resolved from environment variables, see
@@ -18,8 +20,10 @@ Read from disk (paths resolved from environment variables, see
 
 * Converted py123d logs (Arrow) under ``$PY123D_DATA_ROOT/logs`` — ego state,
   camera/lidar tables, 3D box labels, sync table.
-* Original sensor blobs under e.g. ``$AV2_DATA_ROOT/sensor`` — the JPEG images
-  and lidar feathers (AV2 conversion stores only relative paths to these).
+* Original sensor blobs under the per-dataset root (e.g. KITTI-360's
+  ``$KITTI360_DATA_ROOT/data_2d_raw`` + ``data_3d_raw``, AV2's
+  ``$AV2_DATA_ROOT/sensor``) — the PNG/JPEG images and lidar scans (conversion
+  stores only relative paths to these).
 * Precomputed sparse depth maps under
   ``$PY123D_DATA_ROOT/preprocessed/depth_maps/<log>/<iteration>.npz`` (key
   ``depth_map``): LiDAR projected into the left stereo image. Optional — frames
@@ -54,14 +58,14 @@ One :class:`StereoSample` per frame (consumed by the representations below):
 Quick start::
 
     from data import Py123dDataset
-    dataset = Py123dDataset(split_names=["av2-sensor_val"])
+    dataset = Py123dDataset(split_names=["kitti360_train"])
     sample = dataset[0].to_stereo_sample()   # -> StereoSample for preprocessing
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -82,14 +86,26 @@ from scipy.spatial import cKDTree
 
 import globals as G
 
-# Repo-local fallback: ``dataset/`` holds the converted ``logs/``, the original
-# ``sensor/`` blobs, and ``preprocessed/`` outputs, so it can serve as every
-# root at once (no env vars needed for the repo-local layout).
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "dataset"
+# Repo-local fallback root for the converted ``logs/`` + ``preprocessed/``. Prefer
+# ``data/`` (the layout the KITTI-360 download script writes and the README uses),
+# then ``dataset/`` (the older self-contained layout) — whichever actually holds a
+# ``logs/`` dir. Picking the populated one means the notebooks / tests / scripts
+# work with a bare kernel (no ``PY123D_DATA_ROOT`` exported). Env vars still win.
+_REPO_ROOT = Path(__file__).resolve().parent
 
-# Default stereo pair (Argoverse 2). Override for other datasets.
-DEFAULT_LEFT_CAMERA = "pcam_stereo_l"
-DEFAULT_RIGHT_CAMERA = "pcam_stereo_r"
+
+def _default_data_root() -> Path:
+    for name in ("data", "dataset"):
+        if (_REPO_ROOT / name / "logs").is_dir():
+            return _REPO_ROOT / name
+    return _REPO_ROOT / "dataset"
+
+
+DEFAULT_DATA_ROOT = _default_data_root()
+
+# Default stereo pair. From globals (KITTI-360 / AV2 share these enum ids).
+DEFAULT_LEFT_CAMERA = G.LEFT_CAMERA
+DEFAULT_RIGHT_CAMERA = G.RIGHT_CAMERA
 
 # Per-dataset "original data root" env vars. py123d derives each dataset's
 # sensor root from these (e.g. AV2_DATA_ROOT -> ``<root>/sensor``).
@@ -131,6 +147,12 @@ def configure_dataset_paths(data_root: str | Path | None = None) -> Path:
     print(f"DEBUG: PY123D_DATA_ROOT resolved to {resolved}", flush=True)
 
     os.environ["PY123D_DATA_ROOT"] = str(resolved)
+    # The raw KITTI-360 sensor blobs live in ``<repo>/KITTI-360`` (calibration/
+    # data_2d_raw/data_3d_raw), NOT under the logs root — point KITTI360_DATA_ROOT
+    # there when present, before the generic fill-in below defaults it to ``resolved``.
+    kitti360_root = _REPO_ROOT / "KITTI-360"
+    if kitti360_root.is_dir():
+        os.environ.setdefault("KITTI360_DATA_ROOT", str(kitti360_root))
     for env_var in _DATASET_ROOT_ENV_VARS:
         # ``setdefault`` keeps user-provided roots; only fills in the gaps.
         os.environ.setdefault(env_var, str(resolved))
@@ -316,9 +338,9 @@ class StereoSample:
     iteration: int
     timestamp_us: int
 
-    # raw stereo + lidar
-    image_left: np.ndarray
-    image_right: np.ndarray
+    # raw stereo + lidar (images are None when loaded with load_images=False)
+    image_left: np.ndarray | None
+    image_right: np.ndarray | None
     lidar_xyz: np.ndarray
     lidar_features: dict[
         str, np.ndarray] | None  # e.g. intensity, channel, timestamps
@@ -343,8 +365,8 @@ class StereoSample:
     points_outside_boxes_xyz: np.ndarray
     points_in_box_mask: np.ndarray
 
-    # calibration
-    calibration: Calibration
+    # calibration (None when loaded with load_images=False)
+    calibration: Calibration | None
 
     def __repr__(self) -> str:
         return (
@@ -463,22 +485,40 @@ class Frame:
         left_camera_id: CameraIdLike = DEFAULT_LEFT_CAMERA,
         right_camera_id: CameraIdLike = DEFAULT_RIGHT_CAMERA,
         lidar_id: LidarIdLike | None = None,
+        load_images: bool = True,
+        point_mask: bool = True,
     ) -> StereoSample:
         """Assemble the per-frame :class:`StereoSample` for preprocessing.
 
-        :param left_camera_id: Left stereo camera id (default AV2 ``pcam_stereo_l``).
-        :param right_camera_id: Right stereo camera id (default AV2 ``pcam_stereo_r``).
+        The two flags exist because full assembly costs ~0.9 s/frame while the
+        training loop needs almost none of it (profiled: the in-box point mask
+        dominates, then image decode + 2D projection):
+
+        * ``load_images=False`` — skip the stereo pair entirely: ``image_*``,
+          ``depth_left`` and ``calibration`` are ``None``, ``boxes_2d_*`` empty.
+          Enough for LiDAR training and for the camera branch fed from the
+          precomputed stereo cache (which stores its own K / extrinsics).
+        * ``point_mask=False`` — skip the LiDAR-in-box test (the single most
+          expensive step): ``points_in_box_mask`` is all-False and
+          ``points_outside_boxes_xyz`` empty, i.e. *not computed*.
+
+        :param left_camera_id: Left stereo camera id (default ``pcam_stereo_l``;
+            KITTI-360 ``image_00`` / AV2 stereo-left both map here).
+        :param right_camera_id: Right stereo camera id (default ``pcam_stereo_r``;
+            KITTI-360 ``image_01`` / AV2 stereo-right).
         :param lidar_id: Lidar to use; defaults to merged/first available.
         :raises ValueError: if the requested stereo cameras are not available.
         """
-        left = self.camera(left_camera_id)
-        right = self.camera(right_camera_id)
-        if left is None or right is None:
-            available = [c.name for c in self.available_camera_ids]
-            raise ValueError(
-                f"Stereo cameras {left_camera_id!r}/{right_camera_id!r} not available; "
-                f"this scene exposes {available}. Pass left_camera_id/right_camera_id "
-                f"for your dataset's stereo pair.")
+        left = right = None
+        if load_images:
+            left = self.camera(left_camera_id)
+            right = self.camera(right_camera_id)
+            if left is None or right is None:
+                available = [c.name for c in self.available_camera_ids]
+                raise ValueError(
+                    f"Stereo cameras {left_camera_id!r}/{right_camera_id!r} not available; "
+                    f"this scene exposes {available}. Pass left_camera_id/right_camera_id "
+                    f"for your dataset's stereo pair.")
 
         lidar = self.lidar(lidar_id)
         lidar_xyz = lidar.xyz.astype(
@@ -502,7 +542,11 @@ class Frame:
 
         # 2D boxes: project the 3D (global) boxes into the left image. The 2D
         # projection consumes global boxes, so ``boxes_array`` stays global.
-        boxes_2d, boxes_2d_indices = _project_boxes_2d(left, boxes_array)
+        if left is not None:
+            boxes_2d, boxes_2d_indices = _project_boxes_2d(left, boxes_array)
+        else:
+            boxes_2d = np.zeros((0, 4), dtype=np.float64)
+            boxes_2d_indices = np.zeros((0, ), dtype=np.int64)
 
         # 3D positions of returns outside every box (background geometry).
         ego = self.ego_state()
@@ -515,34 +559,40 @@ class Frame:
             assert_boxes_in_sensor_range(boxes_ego)
         else:
             boxes_ego = np.zeros((0, 10), dtype=np.float64)
-        if lidar_xyz.shape[0] and boxes_array.shape[0] and ego is not None:
+        if point_mask and lidar_xyz.shape[0] and boxes_array.shape[0] and ego is not None:
             points_global = rel_to_abs_points_3d_array(ego.imu_se3, lidar_xyz)
             inside = points_3d_in_bbse3_array(points_global.astype(np.float64),
                                               boxes_array)  # (N_boxes, P)
             in_any_box = inside.any(axis=0)
+            points_outside = lidar_xyz[~in_any_box]
         else:
             in_any_box = np.zeros((lidar_xyz.shape[0], ), dtype=bool)
-        points_outside = lidar_xyz[~in_any_box]
+            # all points when the mask is trivially empty, none when skipped
+            points_outside = lidar_xyz if point_mask else np.zeros(
+                (0, 3), dtype=np.float64)
 
-        # Calibration.
-        ego_to_global = _pose_to_matrix(
-            ego.imu_se3) if ego is not None else np.eye(4)
-        left_to_ego = _pose_to_matrix(left.metadata.camera_to_imu_se3)
-        right_to_ego = _pose_to_matrix(right.metadata.camera_to_imu_se3)
-        baseline = float(
-            np.linalg.norm(left_to_ego[:3, 3] - right_to_ego[:3, 3]))
-        calibration = Calibration(
-            left_intrinsics=_intrinsics_matrix(left.metadata.intrinsics),
-            right_intrinsics=_intrinsics_matrix(right.metadata.intrinsics),
-            left_to_ego=left_to_ego,
-            right_to_ego=right_to_ego,
-            ego_to_global=ego_to_global,
-            left_to_global=_pose_to_matrix(left.camera_to_global_se3),
-            right_to_global=_pose_to_matrix(right.camera_to_global_se3),
-            stereo_baseline_m=baseline,
-            left_is_distorted=bool(left.metadata.is_distorted),
-            right_is_distorted=bool(right.metadata.is_distorted),
-        )
+        # Calibration (needs the camera metadata, so only with images loaded).
+        if left is not None:
+            ego_to_global = _pose_to_matrix(
+                ego.imu_se3) if ego is not None else np.eye(4)
+            left_to_ego = _pose_to_matrix(left.metadata.camera_to_imu_se3)
+            right_to_ego = _pose_to_matrix(right.metadata.camera_to_imu_se3)
+            baseline = float(
+                np.linalg.norm(left_to_ego[:3, 3] - right_to_ego[:3, 3]))
+            calibration = Calibration(
+                left_intrinsics=_intrinsics_matrix(left.metadata.intrinsics),
+                right_intrinsics=_intrinsics_matrix(right.metadata.intrinsics),
+                left_to_ego=left_to_ego,
+                right_to_ego=right_to_ego,
+                ego_to_global=ego_to_global,
+                left_to_global=_pose_to_matrix(left.camera_to_global_se3),
+                right_to_global=_pose_to_matrix(right.camera_to_global_se3),
+                stereo_baseline_m=baseline,
+                left_is_distorted=bool(left.metadata.is_distorted),
+                right_is_distorted=bool(right.metadata.is_distorted),
+            )
+        else:
+            calibration = None
 
         return StereoSample(
             dataset=self.dataset,
@@ -550,11 +600,11 @@ class Frame:
             scene_index=self.scene_index,
             iteration=self.iteration,
             timestamp_us=self.timestamp.time_us,
-            image_left=left.image,
-            image_right=right.image,
+            image_left=left.image if left is not None else None,
+            image_right=right.image if right is not None else None,
             lidar_xyz=lidar_xyz,
             lidar_features=lidar_features,
-            depth_left=self.depth(),
+            depth_left=self.depth() if load_images else None,
             boxes_3d=boxes_array,
             boxes_3d_ego=boxes_ego,
             boxes_3d_labels=boxes_labels,
@@ -592,8 +642,8 @@ class Py123dDataset:
     :param data_root: Root holding converted ``logs/`` (and ``maps/``,
         ``preprocessed/``). Defaults to ``PY123D_DATA_ROOT`` or the repo
         ``dataset/`` dir.
-    :param split_names: Split filter, e.g. ``["av2-sensor_val"]``.
-    :param datasets: Dataset-name filter, e.g. ``["av2-sensor"]``.
+    :param split_names: Split filter, e.g. ``["kitti360_train"]``.
+    :param datasets: Dataset-name filter, e.g. ``["kitti360"]``.
     :param depth_root: Directory of precomputed depth maps. Defaults to
         ``<data_root>/preprocessed/depth_maps``.
     :param scene_filter: A fully-built :class:`SceneFilter`; if given, the
@@ -769,6 +819,23 @@ class StereoSGBMConfig:
     pre_filter_cap: int = 63
     mode: int = cv2.STEREO_SGBM_MODE_SGBM_3WAY
 
+    # ---- matcher selection ----
+    #: ``"sgbm"`` = raw SGBM (default, back-compat). ``"sgbm_wls"`` = SGBM plus a
+    #: WLS post-filter — left/right consistency confidence + edge-aware
+    #: smoothing/hole-filling. Uses ``cv2.ximgproc.DisparityWLSFilter`` (the
+    #: canonical filter) when the ``opencv-contrib`` module is present; otherwise
+    #: a dependency-free built-in equivalent runs (LR check + guided filter), so
+    #: the option always works. Everything downstream keys off the disparity, so
+    #: this is the only knob that changes.
+    matcher: str = "sgbm"
+    # ---- WLS post-filter (only used when matcher == "sgbm_wls") ----
+    wls_lambda: float = 8000.0  # smoothness weight (ximgproc ``lambda``)
+    wls_sigma: float = 1.5  # edge sensitivity (ximgproc ``sigmaColor``)
+    wls_lr_max_diff: float = 1.0  # left-right consistency threshold (px)
+    wls_radius: int = 8  # guided-filter radius (built-in fallback only)
+    wls_eps: float = 1e-3  # guided-filter regularisation (built-in fallback only)
+    wls_min_valid_frac: float = 0.05  # drop cells with too few valid neighbours (fallback)
+
     # ---- depth conversion / filtering ----
     min_depth_m: float = 0.5
     max_depth_m: float = 80.0
@@ -778,8 +845,10 @@ class StereoSGBMConfig:
     #: downscaled rectified pair, then the disparity is scaled back to full
     #: res, so metric depth is unaffected. ``num_disparities`` is the *full-res*
     #: search range; it is scaled internally for the downscaled matcher.
-    #: 0.5 ≈ 4× faster than full 2048×1550. Set 1.0 for best quality.
-    downscale: float = 0.5
+    #: 1.0 = full res. KITTI-360's rectified pair is already small
+    #: (~1408×376), so full-res matching is cheap and gives the best disparity.
+    #: Drop to 0.5 for large sensors (e.g. AV2's 2048×1550, ~4× faster).
+    downscale: float = 1.0
 
 
 @dataclass
@@ -912,6 +981,158 @@ def compute_disparity(
     return disp
 
 
+def _guided_filter_hole_aware(
+    guide: np.ndarray,
+    src: np.ndarray,
+    mask: np.ndarray,
+    radius: int,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Edge-aware guided filter (He et al., 2010) that ignores invalid pixels.
+
+    The guided filter smooths ``src`` while snapping its transitions to edges in
+    ``guide``. Here the box statistics are normalised by the local count of
+    *valid* pixels, so invalid (hole) pixels neither pollute the statistics nor
+    stay empty: they are filled from valid neighbours, edge-awarely.
+
+    :param guide: grayscale left image in ``[0, 1]`` (the edge reference).
+    :param src:   disparity map, ``0`` at invalid pixels.
+    :param mask:  ``0/1`` validity map, same shape as ``src``.
+    :param radius: box-filter radius (window = ``2·radius+1``).
+    :param eps:   regularisation (larger → smoother, softer edges).
+    :returns: ``(filtered, density)`` — the filtered disparity and the local
+        valid fraction (``box(mask)``) used to reject barely-supported cells.
+    """
+    k = (2 * radius + 1, 2 * radius + 1)
+
+    def box(im: np.ndarray) -> np.ndarray:
+        return cv2.boxFilter(im.astype(np.float32), -1, k, normalize=True)
+
+    density = box(mask)
+    n = density + 1e-6  # local valid fraction (avoid div-by-zero)
+    mean_I = box(guide * mask) / n
+    mean_p = box(src * mask) / n
+    mean_Ip = box(guide * src * mask) / n
+    mean_II = box(guide * guide * mask) / n
+    cov_Ip = mean_Ip - mean_I * mean_p
+    var_I = mean_II - mean_I * mean_I
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    filtered = box(a * mask) / n * guide + box(b * mask) / n
+    return filtered.astype(np.float32), density
+
+
+def compute_disparity_wls(
+    rect_left: np.ndarray,
+    rect_right: np.ndarray,
+    cfg: StereoSGBMConfig | None = None,
+) -> np.ndarray:
+    """SGBM disparity with a **WLS post-filter** (``matcher='sgbm_wls'``).
+
+    A weighted-least-squares style clean-up of the raw SGBM disparity, targeting
+    exactly the failure mode of block matching: the occluded-edge / textureless
+    outliers that dominate the far-range RMSE (see ``docs/perception_pipeline.md``
+    §4.5). Two effects:
+
+    * **left/right consistency** — a match is trusted only if the left disparity
+      and the (independently matched) right disparity agree at the corresponding
+      pixel; inconsistent pixels (occlusions, mismatches) are dropped.
+    * **edge-aware smoothing + hole-filling** — the trusted disparity is smoothed
+      and its gaps filled while snapping transitions to image edges.
+
+    Prefers ``cv2.ximgproc.DisparityWLSFilter`` (the canonical filter, from
+    ``opencv-contrib``). When ``ximgproc`` is not installed a dependency-free
+    equivalent runs instead — left/right consistency via the horizontal-flip
+    trick + :func:`_guided_filter_hole_aware` — so the option works out of the
+    box and upgrades automatically to the canonical filter if contrib is added.
+
+    :returns: float32 disparity ``(H, W)`` in pixels; ``<= 0`` marks invalid.
+    """
+    cfg = cfg or StereoSGBMConfig()
+    if rect_left.ndim == 3:
+        gl = cv2.cvtColor(rect_left, cv2.COLOR_RGB2GRAY)
+        gr = cv2.cvtColor(rect_right, cv2.COLOR_RGB2GRAY)
+    else:
+        gl, gr = rect_left, rect_right
+
+    left = _build_matcher(cfg)
+
+    # ---- canonical path: opencv-contrib DisparityWLSFilter ----
+    ximgproc = getattr(cv2, "ximgproc", None)
+    if ximgproc is not None:
+        right = ximgproc.createRightMatcher(left)
+        disp_l = left.compute(gl, gr)  # int16 fixed-point (×16)
+        disp_r = right.compute(gr, gl)
+        wls = ximgproc.createDisparityWLSFilter(left)
+        wls.setLambda(cfg.wls_lambda)
+        wls.setSigmaColor(cfg.wls_sigma)
+        filtered = wls.filter(disp_l, gl, disparity_map_right=disp_r)
+        disp = filtered.astype(np.float32) / 16.0
+        disp[disp < cfg.min_disparity + 1e-3] = 0.0
+        return disp
+
+    # ---- fallback: LR consistency + hole-aware guided filter (no contrib) ----
+    disp_l = left.compute(gl, gr).astype(np.float32) / 16.0
+    # right-image disparity via the horizontal-flip trick (no createRightMatcher):
+    # SGBM on the mirrored, swapped pair, flipped back, is the right-view disparity.
+    disp_r = left.compute(np.ascontiguousarray(gr[:, ::-1]),
+                          np.ascontiguousarray(gl[:, ::-1])).astype(np.float32) / 16.0
+    disp_r = disp_r[:, ::-1]
+
+    h, w = disp_l.shape
+    xs = np.broadcast_to(np.arange(w), (h, w))
+    rows = np.broadcast_to(np.arange(h)[:, None], (h, w))
+    xr = np.round(xs - disp_l).astype(np.int64)  # right pixel each left pixel maps to
+    disp_r_at = disp_r[rows, np.clip(xr, 0, w - 1)]
+    consistent = ((disp_l > cfg.min_disparity) & (xr >= 0) &
+                  (np.abs(disp_l - disp_r_at) <= cfg.wls_lr_max_diff))
+    disp_lr = np.where(consistent, disp_l, 0.0).astype(np.float32)
+
+    guide = gl.astype(np.float32) / 255.0
+    mask = (disp_lr > 0).astype(np.float32)
+    filtered, density = _guided_filter_hole_aware(guide, disp_lr, mask,
+                                                  cfg.wls_radius, cfg.wls_eps)
+    disp = np.where(density > cfg.wls_min_valid_frac, filtered, 0.0).astype(np.float32)
+    disp[disp < cfg.min_disparity + 1e-3] = 0.0
+    return disp
+
+
+#: Registry for **learned** stereo matchers (RAFT-Stereo, IGEV-Stereo, ...).
+#: Register a callable ``(rect_left, rect_right, cfg) -> disparity (H, W) float32``
+#: (full-res pixels, ``<= 0`` = invalid) under a name, then set
+#: ``StereoSGBMConfig.matcher`` to that name. The heavy model code + weights stay
+#: an *optional external* dependency (imported by the registrant, like
+#: ``ultralytics`` for the YOLO backbone) so the core preprocessing never depends
+#: on them. Example::
+#:
+#:     import data
+#:     data.LEARNED_MATCHERS["igev"] = my_igev_disparity   # your adapter
+#:     sd = data.stereo_depth(sample, StereoSGBMConfig(matcher="igev"))
+LEARNED_MATCHERS: dict[str, "Callable[..., np.ndarray]"] = {}
+
+
+def _match_disparity(
+    rect_left: np.ndarray,
+    rect_right: np.ndarray,
+    cfg: StereoSGBMConfig,
+) -> np.ndarray:
+    """Run the stereo matcher selected by ``cfg.matcher`` on a rectified pair.
+
+    Built-in matchers are ``"sgbm"`` and ``"sgbm_wls"``; any name present in
+    :data:`LEARNED_MATCHERS` dispatches to the registered learned matcher.
+    """
+    if cfg.matcher == "sgbm":
+        return compute_disparity(rect_left, rect_right, cfg)
+    if cfg.matcher == "sgbm_wls":
+        return compute_disparity_wls(rect_left, rect_right, cfg)
+    learned = LEARNED_MATCHERS.get(cfg.matcher)
+    if learned is not None:
+        return learned(rect_left, rect_right, cfg)
+    raise ValueError(
+        f"unknown matcher {cfg.matcher!r}; expected 'sgbm', 'sgbm_wls', or a "
+        f"name registered in data.LEARNED_MATCHERS ({list(LEARNED_MATCHERS)})")
+
+
 def disparity_to_depth(disp: np.ndarray, fx: float,
                        baseline_m: float) -> np.ndarray:
     """Convert disparity (pixels) to metric depth ``z = fx · baseline / disp``.
@@ -972,10 +1193,10 @@ def stereo_depth(
                         interpolation=cv2.INTER_AREA)
         nd = max(16, int(round(cfg.num_disparities * s / 16)) * 16)
         mcfg = replace(cfg, num_disparities=nd)
-        disp_s = compute_disparity(lo, ro, mcfg)
+        disp_s = _match_disparity(lo, ro, mcfg)
         disp = cv2.resize(disp_s, (w, h), interpolation=cv2.INTER_NEAREST) / s
     else:
-        disp = compute_disparity(rect_left, rect_right, cfg)
+        disp = _match_disparity(rect_left, rect_right, cfg)
 
     # ---- disparity → depth (rectified-left frame) ----
     depth = disparity_to_depth(disp, rect.fx_rect, rect.baseline_m)
@@ -1149,6 +1370,128 @@ def stereo_bev(
             bev[4 + k][occ] /= count[occ]
 
     return bev
+
+
+# --------------------------------------------------------------------------- #
+# Stereo input cache — precomputed camera-branch inputs
+#
+# SGBM depth is CPU-expensive (~1-2 s/frame) and depends only on the images,
+# never on network weights, so training pays for it *once*: precompute the
+# camera-branch inputs (rectified-left image + depth, already resized to the
+# backbone resolution, plus the matching K and camera→ego transform) and load
+# them per step. <1 MB/frame vs ~50 MB for the full rectification bundle.
+# --------------------------------------------------------------------------- #
+def stereo_cache_root(data_root: str | Path | None = None,
+                      matcher: str = "sgbm") -> Path:
+    """Default cache dir for a matcher's precomputed camera-branch inputs.
+
+    ``sgbm`` keeps the historical ``<data_root>/preprocessed/stereo_inputs`` path;
+    any other matcher gets its own ``stereo_inputs_<matcher>`` sibling so caches
+    from different depth sources (e.g. ``sgbm`` vs ``igev``) never collide — both
+    can coexist on disk for the StereoBEV depth-source ablation.
+    """
+    root = Path(data_root or os.environ.get("PY123D_DATA_ROOT") or DEFAULT_DATA_ROOT)
+    sub = "stereo_inputs" if matcher == "sgbm" else f"stereo_inputs_{matcher}"
+    return root / "preprocessed" / sub
+
+
+def stereo_cache_path(cache_root: str | Path, log_name: str, iteration: int) -> Path:
+    return Path(cache_root) / log_name / f"{iteration:05d}.npz"
+
+
+def stereo_branch_inputs(
+    sample: StereoSample,
+    target_hw: tuple[int, int] = (192, 640),
+    sgbm_cfg: StereoSGBMConfig | None = None,
+    sd: StereoDepth | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Everything the camera branch consumes, at backbone input resolution.
+
+    This is the single recipe shared by the live path
+    (:meth:`network.StereoBEVBranch.forward`) and the precomputed cache, so
+    cached and uncached training see byte-identical inputs.
+
+    :param sd: Precomputed :class:`StereoDepth`; computed here when ``None``.
+    :returns: ``(image, depth, K, T_cam2ego)`` — rectified-left RGB ``(h, w, 3)``
+        uint8, metric depth ``(h, w)`` float32 (0 = invalid), intrinsics ``(3, 3)``
+        scaled to ``target_hw``, and rectified-left → ego ``(4, 4)``, all float32.
+    """
+    if sd is None:
+        sd = stereo_depth(sample, sgbm_cfg)
+    th, tw = target_hw
+    ih, iw = sd.rect_left.shape[:2]
+
+    image = cv2.resize(sd.rect_left, (tw, th), interpolation=cv2.INTER_AREA)
+    depth = cv2.resize(sd.depth, (tw, th), interpolation=cv2.INTER_NEAREST)
+
+    K = sd.rect.P1[:3, :3].astype(np.float32).copy()
+    K[0] *= tw / iw  # fx, cx
+    K[1] *= th / ih  # fy, cy
+
+    R1T = np.eye(4)
+    R1T[:3, :3] = sd.rect.R1.T
+    T_cam2ego = (sample.calibration.left_to_ego @ R1T).astype(np.float32)
+    return image, depth.astype(np.float32), K, T_cam2ego
+
+
+def load_stereo_inputs(cache_root: str | Path, log_name: str, iteration: int):
+    """Load one cached ``(image, depth, K, T_cam2ego)`` bundle, or ``None``."""
+    path = stereo_cache_path(cache_root, log_name, iteration)
+    if not path.exists():
+        return None
+    with np.load(path) as z:
+        return z["image"], z["depth"], z["K"], z["T_cam2ego"]
+
+
+def precompute_stereo_inputs(
+    frames,
+    cache_root: str | Path | None = None,
+    target_hw: tuple[int, int] = (192, 640),
+    sgbm_cfg: StereoSGBMConfig | None = None,
+    overwrite: bool = False,
+    log_every: int = 25,
+) -> Path:
+    """Precompute the camera-branch input bundle for every frame.
+
+    The depth source is whatever ``sgbm_cfg.matcher`` selects — ``"sgbm"``
+    (default), ``"sgbm_wls"``, or any learned matcher registered in
+    :data:`LEARNED_MATCHERS` (e.g. ``"igev"``; register it first, see
+    ``igev_matcher.register``). A learned matcher is GPU-expensive but, like
+    SGBM, depends only on the images, so the cache pays it **once** and training
+    reads dense depth per step at zero marginal cost.
+
+    :param frames: Iterable of :class:`Frame` (e.g. a :class:`Py123dDataset`).
+    :param cache_root: Output dir; when ``None``, defaults to
+        :func:`stereo_cache_root` **for the config's matcher**, so an ``igev``
+        run lands in ``stereo_inputs_igev`` and never clobbers the ``sgbm`` cache.
+    :param sgbm_cfg: Matcher + depth config; its ``matcher`` field picks the
+        depth source (kept named ``sgbm_cfg`` for back-compat).
+    :returns: The cache root written to. Existing files are skipped unless
+        ``overwrite`` — safe to re-run / resume.
+    """
+    if cache_root is None:
+        matcher = sgbm_cfg.matcher if sgbm_cfg is not None else "sgbm"
+        cache_root = stereo_cache_root(matcher=matcher)
+    else:
+        cache_root = Path(cache_root)
+    n_done = n_skipped = 0
+    for i, frame in enumerate(frames):
+        path = stereo_cache_path(cache_root, frame.log_name, frame.iteration)
+        if path.exists() and not overwrite:
+            n_skipped += 1
+            continue
+        # The cache only stores image + depth + K + extrinsic, so skip the
+        # in-box point mask / box assembly (the dominant ~0.9 s/frame cost).
+        sample = frame.to_stereo_sample(point_mask=False)
+        image, depth, K, T = stereo_branch_inputs(sample, target_hw, sgbm_cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(path, image=image, depth=depth, K=K, T_cam2ego=T)
+        n_done += 1
+        if log_every and (n_done % log_every == 0):
+            print(f"  precomputed {n_done} frames (+{n_skipped} cached) ...")
+    print(f"stereo input cache: {n_done} written, {n_skipped} already cached "
+          f"→ {cache_root}")
+    return cache_root
 
 
 # ===========================================================================
@@ -1486,7 +1829,7 @@ def cluster_points(
 if __name__ == "__main__":
 
     sample = Py123dDataset(
-        split_names=["av2-sensor_val"])[0].to_stereo_sample()
+        split_names=[G.TRAIN_SPLIT])[0].to_stereo_sample()
     print(dir(sample))
     sd = stereo_depth(sample)
     bev = stereo_bev(sample)

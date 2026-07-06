@@ -19,7 +19,8 @@ it follows the data flow:
        Assembly ──────────────────────────  BEVDetector (fusion + head);
                                             PipelineA / PipelineB / PipelineC
                                             (branches + detector, end-to-end)
-                                            + LidarOnlyDetector baseline
+                                            + LidarOnlyDetector /
+                                            CameraOnlyDetector baselines
 
 The two branches (Stage A) emit grid-aligned ``(C, nx, ny)`` BEV maps; the
 fusion + head (Stage B) consume them. Output is **2D only** — centre (x, y) +
@@ -141,15 +142,30 @@ class YOLOBackbone(nn.Module):
         # the Detect head receives [P3, P4, P5]; capture them before it runs
         self.head.register_forward_pre_hook(self._grab)
 
+        self._frozen = freeze
         if freeze:
             for p in self.det.parameters():
                 p.requires_grad_(False)
+            self.det.eval()  # freeze BatchNorm running stats too (see train())
 
         # discover P3's channel count with one dummy pass, then size the 1x1
         with torch.no_grad():
             self.det(torch.zeros(1, 3, 320, 320))
         c3 = self._feats[0].shape[1]
         self.proj = nn.Conv2d(c3, out_dim, 1)
+
+    def train(self, mode: bool = True):
+        """Keep a frozen backbone in eval mode regardless of parent ``.train()``.
+
+        Freezing weights (``requires_grad=False``) does *not* stop BatchNorm from
+        updating its running mean/var in train mode, which would drift the
+        pretrained statistics. When frozen we hold ``self.det`` in eval so only
+        the trainable ``proj`` (and everything downstream) sees train mode.
+        """
+        super().train(mode)
+        if self._frozen:
+            self.det.eval()
+        return self
 
     def _grab(self, module: nn.Module, args: tuple) -> None:
         self._feats = args[0]                  # args[0] == [P3, P4, P5]
@@ -721,12 +737,24 @@ class StereoBEVBranch(nn.Module):
             cfg: StereoBEVConfig | None = None,
             sgbm_cfg: "StereoSGBMConfig | None" = None,
             target_hw: tuple[int, int] = (192, 640),
+            cache_root=None,
     ):
         super().__init__()
         self.cfg = cfg or StereoBEVConfig()
         self.sgbm_cfg = sgbm_cfg  # None = stereo_depth uses its defaults
         self.target_hw = target_hw
+        self.cache_root = cache_root  # data.precompute_stereo_inputs output dir
         self.model = StereoBEV(self.cfg)
+        self._sd_key, self._sd = None, None  # last-frame SGBM memo
+
+    def _stereo_depth_memo(self, sample):
+        """Live SGBM, memoised for the last-seen frame (overfit/debug loops)."""
+        from data import stereo_depth
+        key = (sample.log_name, sample.iteration)
+        if self._sd_key != key:
+            self._sd = stereo_depth(sample, self.sgbm_cfg)
+            self._sd_key = key
+        return self._sd
 
     def forward(
             self,
@@ -736,67 +764,68 @@ class StereoBEVBranch(nn.Module):
     ) -> torch.Tensor:
         """Run the full stereo BEV branch on one sample.
 
-        Parameters
-        ----------
-        sd : data.StereoDepth, optional
-            Precomputed SGBM output for this sample. SGBM is CPU-expensive and
-            depends only on the images, so training loops that revisit a frame
-            should compute it once (or load it from a disk cache) and pass it
-            here instead of paying for it every forward.
+        Input resolution order: the precomputed disk cache (``cache_root``,
+        see :func:`data.precompute_stereo_inputs`) when it holds this frame;
+        else the ``sd`` argument; else live SGBM (memoised for the last-seen
+        frame). All paths share :func:`data.stereo_branch_inputs`, so they are
+        bit-identical.
 
         Returns
         -------
         bev : (C, nx, ny) float32 tensor on *device*.
         """
-        import torch.nn.functional as _F
+        from data import load_stereo_inputs, stereo_branch_inputs
+
+        if sd is None and self.cache_root is not None:
+            bundle = load_stereo_inputs(self.cache_root, sample.log_name,
+                                        sample.iteration)
+            if bundle is not None:
+                return self.forward_tensors(*bundle, device=device)
+        if sd is None:
+            if sample.image_left is None:
+                raise RuntimeError(
+                    f"live SGBM needs the stereo images, but the sample was "
+                    f"loaded with load_images=False and frame "
+                    f"{sample.log_name}/{sample.iteration} is not in the "
+                    f"stereo cache — run data.precompute_stereo_inputs first "
+                    f"or load the sample with images.")
+            sd = self._stereo_depth_memo(sample)
+        image, depth, K, T_cam2ego = stereo_branch_inputs(
+            sample, self.target_hw, self.sgbm_cfg, sd=sd)
+        return self.forward_tensors(image, depth, K, T_cam2ego, device=device)
+
+    def forward_tensors(
+            self,
+            image: np.ndarray,      # (h, w, 3) uint8 rectified-left, resized
+            depth: np.ndarray,      # (h, w) float32 metric depth, 0 = invalid
+            K: np.ndarray,          # (3, 3) intrinsics scaled to (h, w)
+            T_cam2ego: np.ndarray,  # (4, 4) rectified-left -> ego
+            device: torch.device = torch.device("cpu"),
+    ) -> torch.Tensor:
+        """Run the branch on a precomputed input bundle (see
+        :func:`data.stereo_branch_inputs` / :func:`data.load_stereo_inputs`).
+
+        Train/eval mode and grad tracking are the *caller's* choice: wrap in
+        ``torch.no_grad()`` + ``.eval()`` for inference, leave as-is to train
+        the context head / backbone through the splat.
+        """
         import torchvision.transforms.functional as TF
 
-        from data import stereo_depth as _stereo_depth
-
-        target_h, target_w = self.target_hw
-
-        # 1. stereo depth (rectified frame) — reuse the precomputed one if given
-        if sd is None:
-            sd = _stereo_depth(sample, self.sgbm_cfg)
-        img_np = sd.rect_left  # (H, W, 3) uint8, rectified-left
-        depth_np = sd.depth  # (H, W) float32, 0 = invalid
-        img_h, img_w = img_np.shape[:2]
-
-        # 2. image → normalised tensor
-        img_t = TF.to_tensor(img_np)  # HWC uint8 → CHW float in [0, 1]
-        img_t = TF.resize(img_t, [target_h, target_w])  # exact size, no letterbox
+        img_t = TF.to_tensor(image)  # HWC uint8 -> CHW float in [0, 1]
         # Backbone-specific normalisation: ImageNet stats for the CNN backbone,
         # plain [0, 1] for YOLO (which expects /255 with no mean/std subtraction).
         if self.cfg.img_backbone == "efficientnet":
             img_t = TF.normalize(img_t,
                                  mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
-        img_batch = img_t.unsqueeze(0).to(device)  # (1, 3, H, W)
+        img_batch = img_t.unsqueeze(0).to(device)                    # (1, 3, h, w)
+        depth_batch = (torch.from_numpy(depth)
+                       .unsqueeze(0).unsqueeze(0).to(device))        # (1, 1, h, w)
+        K_t = torch.from_numpy(np.asarray(K, dtype=np.float32)).to(device)
+        T_t = torch.from_numpy(np.asarray(T_cam2ego, dtype=np.float32)).to(device)
 
-        # 3. depth → tensor, resize
-        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0)
-        depth_t = _F.interpolate(depth_t,
-                                 size=(target_h, target_w),
-                                 mode="nearest")
-        depth_batch = depth_t.to(device)  # (1, 1, H, W)
-
-        # 4. intrinsics: rectified P1[:3,:3], scaled to target resolution
-        K_np = sd.rect.P1[:3, :3].astype(np.float32)
-        K_np[0] *= target_w / img_w  # fx, cx
-        K_np[1] *= target_h / img_h  # fy, cy
-        K = torch.from_numpy(K_np).to(device)  # (3, 3)
-
-        # 5. extrinsic: rectified-left → ego  (T_left2ego @ R1^T)
-        R1T_4x4 = np.eye(4)
-        R1T_4x4[:3, :3] = sd.rect.R1.T
-        T_cam2ego = torch.from_numpy((sample.calibration.left_to_ego.astype(
-            np.float64) @ R1T_4x4).astype(np.float32)).to(device)  # (4, 4)
-
-        # Train/eval mode and grad tracking are the *caller's* choice: wrap in
-        # ``torch.no_grad()`` + ``.eval()`` for inference, leave as-is to train
-        # the context head / backbone through the splat (P1 camera baseline, P2).
         self.model.to(device)
-        bev = self.model(img_batch, depth_batch, K, T_cam2ego)
+        bev = self.model(img_batch, depth_batch, K_t, T_t)
         return bev.squeeze(0)  # (C, nx, ny)
 
 
@@ -821,7 +850,8 @@ class PillarConfig:
 
 def pillarize(points: np.ndarray, cfg: PillarConfig):
     """
-    points: (N, 4) array [x, y, z, intensity] -- Argoverse 2 sweep format.
+    points: (N, 4) array [x, y, z, intensity] -- one LiDAR sweep (KITTI-360 /
+        AV2 / any py123d dataset).
 
     Returns:
         pillar_points: (P, max_points_per_pillar, 9) augmented features per point
@@ -852,10 +882,11 @@ def pillarize(points: np.ndarray, cfg: PillarConfig):
                  ny - 1)
     pillar_keys = ix * ny + iy  # unique scalar id per cell
 
-    # 3. group points per pillar (sort by key, then take contiguous blocks)
+    # 3. group points per pillar (sort by key, then work on contiguous blocks;
+    # fully vectorised — the per-pillar Python loop cost ~50 ms/frame and
+    # dominated the training-step CPU time)
     order = np.argsort(pillar_keys, kind="stable")
-    pts_sorted = pts[order]
-    ix_sorted, iy_sorted = ix[order], iy[order]
+    pts_sorted = pts[order].astype(np.float32)
     keys_sorted = pillar_keys[order]
 
     unique_keys, start_idx, counts = np.unique(keys_sorted,
@@ -869,32 +900,46 @@ def pillarize(points: np.ndarray, cfg: PillarConfig):
             top], counts[top]
 
     P = unique_keys.shape[0]
+    npoints = np.minimum(counts, cfg.max_points_per_pillar)
+
+    # per-point rank inside its pillar + pillar id, for the selected pillars'
+    # contiguous blocks; keep the first max_points_per_pillar of each block
+    # (identical selection to the old per-pillar loop)
+    total = int(counts.sum())
+    rank_cov = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+    covered = np.repeat(start_idx, counts) + rank_cov  # index into pts_sorted
+    pillar_cov = np.repeat(np.arange(P), counts)
+    keep = rank_cov < cfg.max_points_per_pillar
+
+    kept_pos = covered[keep]                # index into pts_sorted
+    kept_rank = rank_cov[keep]
+    kept_pillar = pillar_cov[keep]
+
+    kept_pts = pts_sorted[kept_pos]         # (M, 4) x, y, z, intensity
+
+    # per-pillar centroid over the *kept* points (matches the old loop)
+    sums = np.zeros((P, 3), dtype=np.float64)
+    np.add.at(sums, kept_pillar, kept_pts[:, :3].astype(np.float64))
+    mean_xyz = (sums / npoints[:, None]).astype(np.float32)  # (P, 3)
+
+    # cell centres from the flat key
+    cell_ix = (unique_keys // ny).astype(np.int64)
+    cell_iy = (unique_keys % ny).astype(np.int64)
+    x_center = (x_min + (cell_ix + 0.5) * cfg.pillar_size).astype(np.float32)
+    y_center = (y_min + (cell_iy + 0.5) * cfg.pillar_size).astype(np.float32)
+
+    # decorated features (original paper): offsets from the pillar centroid
+    # (xc, yc, zc) and from the geometric cell centre (xp, yp)
+    feat = np.empty((kept_pts.shape[0], 9), dtype=np.float32)
+    feat[:, :4] = kept_pts
+    feat[:, 4:7] = kept_pts[:, :3] - mean_xyz[kept_pillar]
+    feat[:, 7] = kept_pts[:, 0] - x_center[kept_pillar]
+    feat[:, 8] = kept_pts[:, 1] - y_center[kept_pillar]
+
     pillar_points = np.zeros((P, cfg.max_points_per_pillar, 9),
                              dtype=np.float32)
-    pillar_coords = np.zeros((P, 2), dtype=np.int64)
-    npoints = np.zeros((P, ), dtype=np.int64)
-
-    for i, (start, count) in enumerate(zip(start_idx, counts)):
-        n = min(count, cfg.max_points_per_pillar)
-        sl = pts_sorted[start:start + n]  # (n, 4) -> x, y, z, intensity
-
-        cell_ix, cell_iy = ix_sorted[start], iy_sorted[start]
-        x_center = x_min + (cell_ix + 0.5) * cfg.pillar_size
-        y_center = y_min + (cell_iy + 0.5) * cfg.pillar_size
-
-        mean_xyz = sl[:, :3].mean(axis=0)
-        x, y, z, intensity = sl[:, 0], sl[:, 1], sl[:, 2], sl[:, 3]
-
-        # features "decorated" as in the original paper:
-        # offset from the centroid of points in the pillar (xc,yc,zc) and from the geometric center of the cell (xp,yp)
-        xc, yc, zc = x - mean_xyz[0], y - mean_xyz[1], z - mean_xyz[2]
-        xp, yp = x - x_center, y - y_center
-
-        feat = np.stack([x, y, z, intensity, xc, yc, zc, xp, yp],
-                        axis=1)  # (n, 9)
-        pillar_points[i, :n] = feat
-        pillar_coords[i] = (cell_ix, cell_iy)
-        npoints[i] = n
+    pillar_points[kept_pillar, kept_rank] = feat
+    pillar_coords = np.stack([cell_ix, cell_iy], axis=1)
 
     return pillar_points, pillar_coords, npoints
 
@@ -1471,7 +1516,34 @@ class LidarOnlyDetector(nn.Module):
     def forward(self, points: np.ndarray,
                 device: torch.device = torch.device("cpu")
                 ) -> dict[str, torch.Tensor]:
+        self.to(device)  # keep weights with the requested device (no-op if there)
         bev = self.branch(points, device=device)  # (C, nx, ny), grad-enabled
+        return self.head(bev.unsqueeze(0))
+
+
+class CameraOnlyDetector(nn.Module):
+    """Camera-only baseline (TODO P1): StereoBEV grounded splat → head, no LiDAR.
+
+    The single-sensor counterpart of :class:`LidarOnlyDetector`; together they
+    set the floor the fused pipelines must beat (design doc §05). ``forward``
+    takes a :class:`~data.StereoSample` (needs images + calibration) and
+    returns the head dict with batch dim 1. Pass ``stereo_cache_root`` to read
+    precomputed SGBM inputs (:func:`data.precompute_stereo_inputs`).
+    """
+
+    def __init__(self, num_classes: int = G.NUM_CLASSES,
+                 stereo_cache_root=None,
+                 stereo_cfg: "StereoBEVConfig | None" = None):
+        super().__init__()
+        self.branch = StereoBEVBranch(cfg=stereo_cfg,
+                                      cache_root=stereo_cache_root)
+        self.head = CenterPointHead(CAMERA_BEV_CHANNELS, num_classes)
+
+    def forward(self, sample,
+                device: torch.device = torch.device("cpu")
+                ) -> dict[str, torch.Tensor]:
+        self.to(device)
+        bev = self.branch(sample, device=device)  # (C, nx, ny), grad-enabled
         return self.head(bev.unsqueeze(0))
 
 
@@ -1501,38 +1573,60 @@ class Pipeline(nn.Module):
     :func:`utils.record_activations` instead — it hooks any dotted submodule
     path without touching this class.
 
-    The SGBM stereo depth of the last-seen frame is cached: it is
-    CPU-expensive and depends only on the images (never the weights), so an
-    overfit loop or repeated debugging of one frame pays for it once. Replace
-    with the planned on-disk depth cache for multi-frame training (TODO P1).
+    **Stereo-depth cost** — SGBM is CPU-expensive (~1-2 s/frame) and depends
+    only on the images, never the weights. Pass ``stereo_cache_root`` (see
+    :func:`data.precompute_stereo_inputs`) to load precomputed camera-branch
+    inputs from disk — the multi-frame training path; frames missing from the
+    cache fall back to live SGBM, memoised for the last-seen frame (enough for
+    overfit/debug loops).
+
+    **Branch-contribution ablation** — set ``pipeline.drop_branch = "camera"``
+    or ``"lidar"`` to replace that branch's BEV with zeros at forward time
+    (the branch is skipped entirely, so it's also faster). Evaluating a
+    *trained* pipeline with each branch dropped measures the marginal
+    contribution of the other; remember to reset to ``None``. Note the caveat:
+    a zeroed map means "silent sensor", which the fusion conv never saw in
+    training — it bounds the contribution, it is not a retrained baseline.
     """
 
     fusion_cls: type[BEVFusion] = ConcatConvFusion
 
-    def __init__(self, num_classes: int = G.NUM_CLASSES):
+    def __init__(self, num_classes: int = G.NUM_CLASSES,
+                 stereo_cache_root=None,
+                 stereo_cfg: "StereoBEVConfig | None" = None):
         super().__init__()
         self.lidar_branch = PointPillarsBranch(PillarConfig())
-        self.camera_branch = StereoBEVBranch()
+        self.camera_branch = StereoBEVBranch(cfg=stereo_cfg,
+                                             cache_root=stereo_cache_root)
         self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes),
                                     fusion_cls=type(self).fusion_cls)
+        self.drop_branch: str | None = None  # None | "camera" | "lidar"
         self.debug = False
         self.intermediates: dict[str, torch.Tensor] = {}
-        self._sd_key, self._sd = None, None  # single-frame stereo-depth cache
 
-    def _stereo_depth_cached(self, sample):
-        from data import stereo_depth
-        key = (sample.log_name, sample.iteration)
-        if self._sd_key != key:
-            self._sd = stereo_depth(sample, self.camera_branch.sgbm_cfg)
-            self._sd_key = key
-        return self._sd
+    @property
+    def stereo_cache_root(self):
+        return self.camera_branch.cache_root
+
+    @stereo_cache_root.setter
+    def stereo_cache_root(self, value):
+        self.camera_branch.cache_root = value
 
     def forward(self, sample, device: torch.device = torch.device("cpu")
                 ) -> dict[str, torch.Tensor]:
+        assert self.drop_branch in (None, "camera", "lidar"), self.drop_branch
         self.to(device)  # keep weights with the requested device (no-op if there)
-        bev_lidar = self.lidar_branch(lidar_points(sample), device=device)
-        bev_camera = self.camera_branch(sample, device=device,
-                                        sd=self._stereo_depth_cached(sample))
+        cfg = self.detector.cfg
+        if self.drop_branch == "lidar":
+            bev_lidar = torch.zeros(cfg.lidar_channels, *cfg.grid_size,
+                                    device=device)
+        else:
+            bev_lidar = self.lidar_branch(lidar_points(sample), device=device)
+        if self.drop_branch == "camera":
+            bev_camera = torch.zeros(cfg.camera_channels, *cfg.grid_size,
+                                     device=device)
+        else:
+            bev_camera = self.camera_branch(sample, device=device)
         fused = self.detector.fusion(bev_camera, bev_lidar)  # (1, C, nx, ny)
         out = self.detector.head(fused)
         if self.debug:
@@ -1561,14 +1655,14 @@ class PipelineB(PipelineA):
     """
 
     def __init__(self, num_classes: int = G.NUM_CLASSES,
-                 use_painted_range: bool = True):
+                 use_painted_range: bool = True, **kwargs):
         if use_painted_range:
             raise NotImplementedError(
                 "Pipeline B painted-range wiring is TODO (P0): inject "
                 "sample.depth_left as a 4th image channel (sparsity-aware "
                 "conv) in the camera branch. Pass use_painted_range=False "
                 "for the A-control arm.")
-        super().__init__(num_classes)
+        super().__init__(num_classes, **kwargs)
         self.use_painted_range = use_painted_range
 
 

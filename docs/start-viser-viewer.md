@@ -7,30 +7,31 @@ Already installed (`viser 1.0.24`). It reads dataset paths from env vars.
 
 ```bash
 cd /home/leonardo/Desktop/AIRO/stereo-lidar-perception
-export PY123D_DATA_ROOT="$PWD/data"   # converted logs/maps
-export AV2_DATA_ROOT="$PWD/data"      # raw sensor blobs ($AV2_DATA_ROOT/sensor)
-py123d-viser scene_filter=av2-sensor
+export PY123D_DATA_ROOT="$PWD/data"          # converted logs/maps
+export KITTI360_DATA_ROOT="$PWD/KITTI-360"   # raw images + LiDAR blobs
+py123d-viser scene_filter=kitti360
 ```
 
 Then open **http://localhost:8080**.
 
-**Both env vars are required.** AV2 conversion stores only *relative* sensor
-paths: `PY123D_DATA_ROOT` finds the logs, `AV2_DATA_ROOT` finds the images/lidar.
+**Both env vars are required.** The py123d conversion stores only *relative*
+sensor paths: `PY123D_DATA_ROOT` finds the converted Arrow logs,
+`KITTI360_DATA_ROOT` finds the original images/LiDAR scans.
 Omit the second → `AssertionError: Dataset path for sensor loading not found`.
 
 ## Common options
 
 ```bash
-py123d-viser scene_filter=av2-sensor \
-  'scene_filter.split_names=[av2-sensor_val]' \   # one split
-  scene_filter.max_num_scenes=3                    # cap scenes (default: all, shuffled)
+py123d-viser scene_filter=kitti360 \
+  'scene_filter.split_names=[kitti360_val]' \   # one split
+  scene_filter.max_num_scenes=3                  # cap scenes (default: all, shuffled)
 ```
 
 Also: `viser_config.server.port=8081`, `scene_filter.shuffle=false`.
 
-> No data yet? `py123d-conversion dataset=av2-sensor-stream ...` downloads +
-> converts into `PY123D_DATA_ROOT` (sensors embedded, so `AV2_DATA_ROOT` isn't
-> needed), then launch as above.
+> No data yet? Run `scripts/get_kitti360.sh` to download, extract and convert
+> the KITTI-360 sequences into `data/logs/kitti360_{train,val}/`, then launch
+> as above. See the main README for details.
 
 ---
 

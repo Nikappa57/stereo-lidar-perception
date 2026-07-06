@@ -210,10 +210,10 @@ def save_fusion_figure(save_path: str = "docs/img/bev_fusion_test_output.png") -
     from data import Py123dDataset
     from network import _lidar_bev, _stereo_bev
 
-    dataset = Py123dDataset(split_names=["av2-sensor_val"], max_num_scenes=1)
-    frame   = dataset.get_frame(0, dataset.scenes[0].number_of_history_iterations + 13)
-    sample  = frame.to_stereo_sample()
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset = Py123dDataset(split_names=["kitti360_train"], max_num_scenes=1)
+    frame = dataset.get_frame(0, dataset.scenes[0].number_of_history_iterations + 13)
+    sample = frame.to_stereo_sample()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Stage A: the two grid-aligned BEV maps (untrained branches).
     bev_lidar  = _lidar_bev(sample, device)    # (128, nx, ny)
@@ -228,8 +228,9 @@ def save_fusion_figure(save_path: str = "docs/img/bev_fusion_test_output.png") -
     heatmap = out["heatmap"].sigmoid().amax(dim=1)[0].detach().cpu().numpy()
 
     x_range, y_range = (0.0, 50.0), (-20.0, 20.0)
-    centres = (sample.boxes_3d_ego[:, :2]
-               if len(sample.boxes_3d_ego) else np.zeros((0, 2)))
+    # Keep only GT centres that actually fall on the BEV grid (KITTI-360 labels
+    # are 360°, including boxes behind the ego and beyond 50 m — not targets here).
+    centres = sample.boxes_3d_ego[:, :2] if len(sample.boxes_3d_ego) else np.zeros((0, 2))
     in_grid = (
         (centres[:, 0] >= x_range[0]) & (centres[:, 0] < x_range[1])
         & (centres[:, 1] >= y_range[0]) & (centres[:, 1] < y_range[1])
