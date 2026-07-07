@@ -681,6 +681,7 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                 val_metrics: bool = True, log_every: int = 50,
                 nms_radius_by_class: "dict[int, float] | None" = None,
                 seed: int = 0, sample_kwargs: dict | None = None,
+                patience: "int | None" = None, min_delta: float = 0.0,
                 device: torch.device = torch.device("cpu")) -> dict:
     """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
 
@@ -699,6 +700,8 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
     :param input_fn: ``sample -> model input``; identity for the
         :class:`network.Pipeline` classes (default), ``network.lidar_points``
         for :class:`network.LidarOnlyDetector`.
+    :param patience: stop after this many consecutive epochs with no val-loss
+        improvement (> ``min_delta``); ``None`` (default) disables early stop.
     :returns: history dict — per-epoch ``"train"`` / ``"val"`` mean losses and
         the per-step ``"steps"`` list (for plotting).
     """
@@ -730,6 +733,7 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                      "val_precision": [], "val_recall": [], "val_f1": [],
                      "val_mAP": []}
     best_val = float("inf")
+    epochs_no_improve = 0
     for epoch in range(1, epochs + 1):
         model.train()
         rng.shuffle(order)
@@ -784,13 +788,21 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                 "epoch": epoch, "train_loss": train_mean, "val_loss": val_mean,
                 "precision": p, "recall": r, "f1": f1, "mAP": mAP})
 
-        if ckpt_path is not None and val_mean < best_val:
+        if val_mean < best_val - min_delta:
             best_val = val_mean
-            ckpt = Path(ckpt_path)
-            ckpt.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"model": model.state_dict(), "epoch": epoch,
-                        "val_loss": val_mean}, ckpt)
-            print(f"  new best val — checkpoint saved → {ckpt}")
+            epochs_no_improve = 0
+            if ckpt_path is not None:
+                ckpt = Path(ckpt_path)
+                ckpt.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({"model": model.state_dict(), "epoch": epoch,
+                            "val_loss": val_mean}, ckpt)
+                print(f"  new best val — checkpoint saved → {ckpt}")
+        else:
+            epochs_no_improve += 1
+            if patience is not None and epochs_no_improve >= patience:
+                print(f"  early stop: no val improvement for "
+                      f"{epochs_no_improve} epochs (patience={patience})")
+                break
 
     if run_dir is not None:
         _save_loss_curves(run_dir / "plots" / "loss_curves.png", history)
