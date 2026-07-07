@@ -4,6 +4,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as _pe
 
 import globals as G
 from data import StereoSample, frustum_points, voxel_grid, cluster_points
@@ -358,6 +359,22 @@ def visualize_encoded_targets(sample: StereoSample, save_path: str | None = None
         return save_path
     plt.show()
 
+
+def _label_scores(ax, det_xy, det_sc, *, fontsize=7):
+    """Annotate each decoded ``x`` marker with its confidence score.
+
+    BEV axes plot lateral ``y`` on x and forward ``x`` on y (see the callers),
+    so a detection at ego ``(x, y)`` sits at plot ``(y, x)``. The label is nudged
+    a little +y (left, toward the un-inverted origin) so it doesn't sit on the
+    marker.
+    """
+    for (x_fwd, y_lat), s in zip(np.asarray(det_xy), np.asarray(det_sc).reshape(-1)):
+        ax.annotate(f"{float(s):.2f}", (y_lat, x_fwd),
+                    textcoords="offset points", xytext=(4, 3),
+                    fontsize=fontsize, color="white",
+                    path_effects=[_pe.withStroke(linewidth=1.5, foreground="black")])
+
+
 def visualize_detections(sample: StereoSample, detections: dict,
                          save_path: str | None = None, model=None):
     """Decoded detections vs GT centres over a density BEV.
@@ -400,6 +417,7 @@ def visualize_detections(sample: StereoSample, detections: dict,
     det_xy = detections["boxes_2d"]
     det_xy = det_xy.numpy() if isinstance(det_xy, torch.Tensor) else np.asarray(det_xy)
     det_cls = np.asarray(detections["classes"]).astype(int)
+    det_sc = np.asarray(detections["scores"]).reshape(-1)
 
     fig, ax = plt.subplots(figsize=(7, 9))
     ax.imshow(np.log1p(grid), origin="lower", cmap="bone", extent=extent,
@@ -411,6 +429,7 @@ def visualize_detections(sample: StereoSample, detections: dict,
         c = colors[np.clip(det_cls, 0, len(colors) - 1)]
         ax.scatter(det_xy[:, 1], det_xy[:, 0], s=30, c=c, marker="x", lw=1.5,
                    label=f"decoded ({len(det_xy)})")
+        _label_scores(ax, det_xy, det_sc)
     ax.legend(loc="upper right")
     ax.set_xlabel("Y lateral (m)")
     ax.invert_xaxis()  # +y (ego-left) on the left, matching the camera
@@ -510,6 +529,7 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
         out["heatmap"].cpu(), out["offset"].cpu())[0]
     det_xy = det["boxes_2d"].numpy()          # (D, 2) ego x, y
     det_cls = det["classes"].numpy().astype(int)
+    det_sc = det["scores"].numpy().reshape(-1)  # (D,) confidence per detection
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 11))
 
@@ -561,6 +581,7 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
         ax.scatter(det_xy[:, 1], det_xy[:, 0], s=55,
                    c=CLASS_COLORS[np.clip(det_cls, 0, len(CLASS_COLORS) - 1)],
                    marker="x", lw=1.8, label=f"decoded ({len(det_xy)})")
+        _label_scores(ax, det_xy, det_sc)
     ax.set_xlim(y_min, y_max)
     ax.set_ylim(x_min, x_max)
     ax.set_xlabel("Y lateral (m)")
@@ -587,6 +608,7 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
         ax.scatter(det_xy[:, 1], det_xy[:, 0], s=55,
                    c=CLASS_COLORS[np.clip(det_cls, 0, len(CLASS_COLORS) - 1)],
                    marker="x", lw=1.8, label=f"decoded ({len(det_xy)})")
+        _label_scores(ax, det_xy, det_sc)
     if len(gt_xy) or len(det_xy):
         ax.legend(loc="upper right", fontsize=8, markerscale=1.5)
     ax.set_xlabel("Y lateral (m)")
