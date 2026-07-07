@@ -13,7 +13,7 @@ TEST efficient network instead of yolo26
 
 ## ▶ Now — collect the numbers
 
-- [ ] Train **camera** baseline + **pipeline_a / b / c** (`training.ipynb`, same split/seed).
+- [ ] Train **camera** baseline + **pipeline_a / b / c** (`notebooks/training.ipynb`, same split/seed).
 - [ ] Run **Pipeline D** (§8b) and fill the **`confronto.ipynb`** table (baselines vs fusion).
 
 ## Camera-branch experiments (active)
@@ -61,9 +61,9 @@ back into [`docs/experiments.md`](docs/experiments.md).
 
 - [x] **`train.py`** — training loop: `train_model` (per-log train/val split, batch-1 + gradient accumulation, shuffling, best-val checkpoint) over the CenterPoint loss (focal heatmap + masked L1 offset; classification implicit per-channel). Stereo input cache (`data.precompute_stereo_inputs` → `Pipeline(stereo_cache_root=…)`) removes SGBM from the step cost. Still TODO: BEV augmentation (rotation/flip/scale, GT sampling), warm-start, batched branches for throughput.
 - [ ] **Camera-only BEV** baseline (stereo-depth splat → head).
-- [ ] **LiDAR-only BEV** baseline (pillars → head) — run via `training.ipynb` (`MODEL="lidar"`) on the 4/1-log split; numbers pending.
+- [ ] **LiDAR-only BEV** baseline (pillars → head) — run via `notebooks/training.ipynb` (`MODEL="lidar"`) on the 4/1-log split; numbers pending.
 - [x] **`evaluation.py`** — AV2 **distance-AP** @0.5/1/2/4 m per class + mAP + mean centre error (`evaluate_model` / `print_ap_report`). Still TODO: CDS, per-range bins (0–15/15–30/30–50 m), Orin latency/FPS.
-- [ ] **Training notebook** (`training.ipynb`) — imports/globals/data/cache/network/train/test blocks calling the modules; used for the baseline runs.
+- [ ] **Training notebook** (`notebooks/training.ipynb`) — imports/globals/data/cache/network/train/test blocks calling the modules; used for the baseline runs.
 
 ---
 
