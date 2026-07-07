@@ -271,3 +271,9 @@ mAP 0.205 | macro P 0.312 R 0.340 F1 0.325 @2 m | mean centre error (TP@2m) 0.59
 
 ![alt text](docs/img/train/train2-example.png)
 
+#### 6) DEPTH + P3P4 + AdamW + Dropout
+
+WEIGHT_DECAY = 1e-4
+HEAD_DROPOUT = 0.1
+
+CameraOnlyDetector: 809,350 trainable | 2,572,280 frozen (yolo26 backbone)
