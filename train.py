@@ -562,13 +562,16 @@ def validate(model: nn.Module, frames, *, input_fn=None,
              encoder: "TargetEncoder | None" = None,
              sample_kwargs: dict | None = None,
              report: bool = False, score_threshold: float = 0.1,
+             nms_radius_by_class: "dict[int, float] | None" = None,
              device: torch.device = torch.device("cpu")):
     """Mean :class:`CenterPointLoss` over ``frames`` (no grad, eval mode).
 
     With ``report=True`` the same forward pass *also* decodes each frame and
     returns ``(mean_loss, ap_report)`` — so detection P/R/F1/mAP come for free
     alongside the loss (no second pass). Default returns the mean loss (float).
-    Detection metrics use a plain decoder (no NMS radius) at ``score_threshold``.
+    Pass ``nms_radius_by_class`` to decode with the *same* metric NMS as the
+    final :func:`evaluation.evaluate_model` so the per-epoch P/R/F1 are
+    comparable to the eval report (default ``None`` = no NMS radius).
     """
     input_fn = input_fn or (lambda s: s)
     encoder = encoder or TargetEncoder()
@@ -579,7 +582,9 @@ def validate(model: nn.Module, frames, *, input_fn=None,
     if report:
         from evaluation import (CenterPointDecoder, _build_report,
                                 _det_to_numpy, frame_ground_truth)
-        decoder = CenterPointDecoder(score_threshold=score_threshold)
+        decoder = CenterPointDecoder(
+            score_threshold=score_threshold,
+            nms_radius_by_class=nms_radius_by_class)
         frame_dets, frame_gts = [], []
     with torch.no_grad():
         for frame in frames:
@@ -674,6 +679,7 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                 ckpt_path: str | Path | None = None,
                 run_dir: str | Path | None = None,
                 val_metrics: bool = True, log_every: int = 50,
+                nms_radius_by_class: "dict[int, float] | None" = None,
                 seed: int = 0, sample_kwargs: dict | None = None,
                 device: torch.device = torch.device("cpu")) -> dict:
     """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
@@ -752,7 +758,8 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         if val_metrics:
             val_mean, val_report = validate(
                 model, val_frames, input_fn=input_fn, encoder=encoder,
-                sample_kwargs=sample_kwargs, report=True, device=device)
+                sample_kwargs=sample_kwargs, report=True,
+                nms_radius_by_class=nms_radius_by_class, device=device)
             p, r = val_report["precision"], val_report["recall"]
             f1, mAP = val_report["f1"], val_report["mAP"]
         else:
