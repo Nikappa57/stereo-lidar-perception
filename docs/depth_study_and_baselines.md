@@ -18,34 +18,45 @@ scored with center-distance AP.
   **worsens metric accuracy at every setting** → rejected. **IGEV-Stereo**
   (learned, KITTI-15 weights) is **dense (~100 %) *and* accurate** → adopted as
   the camera-branch depth source.
-- **Detection (center-distance AP, val = KITTI-360 drive 0007, 2890 frames):**
+- **Detection (center-distance AP, real split: train = drives 0003+0007+0009,
+  val = held-out drive 0010, 3026 frames, all 4 classes, yolo26 camera stem):**
 
-  | model | mAP | VEHICLE mean AP | VEHICLE AP@0.5 | VEHICLE F1@2 m | centre err (TP@2 m) |
-  |---|---|---|---|---|---|
-  | Camera-only (IGEV depth) | 0.046 | 0.139 | 0.019 | 0.35 | 0.92 m |
-  | LiDAR-only (PointPillars) | 0.100 | 0.299 | 0.153 | 0.43 | 0.64 m |
-  | **Pipeline A (fusion)** | **0.104** | **0.312** | **0.176** | **0.48** | **0.54 m** |
+  | model | mAP | VEHICLE mean AP | PERSON mean AP | TWO_WHEELER mean AP | TRAFFIC_SIGN mean AP | centre err |
+  |---|---|---|---|---|---|---|
+  | Camera-only (IGEV depth) | 0.156 | 0.424 | 0.159 | 0.131 | 0.067 | 0.61 m |
+  | LiDAR-only (PointPillars) | 0.222 | 0.543 | 0.156 | 0.140 | 0.269 | 0.47 m |
+  | Pipeline D (late fusion) | 0.260 | 0.601 | 0.239 | 0.194 | 0.264 | 0.48 m |
+  | **Pipeline A (mid fusion)** | **0.374** | **0.721** | **0.476** | **0.386** | **0.290** | **0.35 m** |
 
-  Fusion beats both baselines. The gain over LiDAR-only is small in mAP but
-  clear in **localization**: tighter AP@0.5 (0.153 → 0.176) and lower centre
-  error (0.64 → 0.54 m) — the dense stereo depth sharpens where centres land.
-- `PERSON` / `TWO_WHEELER` are **0.0 AP** everywhere: KITTI-360 drive 0007 has
-  only 80 / 43 such GT boxes — too few to learn. More urban drives are needed.
+  Mid fusion (Pipeline A) beats every other model on every class, and clearly
+  beats late fusion (mAP 0.374 vs 0.260) — fusing *before* the head lets the
+  network use both sensors' geometry jointly instead of only merging their
+  final boxes. See §3 for the full per-threshold table and caveats.
+- With the full 3-drive training split, `PERSON` / `TWO_WHEELER` are no longer
+  0 AP (unlike the early single-drive runs below) — more urban data made them
+  learnable.
 
 ---
 
 ## 1. Setup
 
 - **Hardware:** NVIDIA RTX 2060 (6 GB), PyTorch 2.9.1 + CUDA 12.8.
-- **Dataset:** KITTI-360 via `py123d`. `kitti360_train` = drives **0003** (1010
-  frames) + **0007** (2890 frames). Split by log (`split_frames(val_scenes=1)`):
-  **train = drive 0003 (1010)**, **val = drive 0007 (2890)**. Drive 0010
-  (`kitti360_val`) is **reserved** for final evaluation and was not used here.
-- **Classes:** `VEHICLE`, `PERSON`, `TWO_WHEELER` (`globals.CLASSES`).
-- **Training (all models identical):** 8 epochs, Adam, lr 1e-3, gradient
-  accumulation 4 (batch-1 branches), seed 0, best-val checkpoint. Loss =
-  CenterPoint 2D (Gaussian-focal heatmap + masked L1 centre offset). Camera stem
-  = `efficientnet` **trained from scratch** (YOLO backbone left untouched).
+- **Dataset (current, §3):** KITTI-360 via `py123d`, the real split baked in at
+  convert time — `kitti360_train` = drives **0003+0007+0009**,
+  `kitti360_val` = held-out drive **0010** (3026 frames). This is what
+  `training.ipynb`'s `SPLIT_MODE="auto"` picks up once both named splits exist
+  (`scripts/get_kitti360.sh`).
+- **Dataset (matcher study, §2, and the early single-drive runs in §3.2):** an
+  earlier, smaller interim split used before drive 0010 was converted —
+  `kitti360_train` = drives **0003** (1010 frames) + **0007** (2890 frames),
+  held out one log via `split_frames(val_scenes=1)`. Kept here because the
+  matcher-study conclusion (§2) doesn't depend on the split or the backbone.
+- **Classes:** `VEHICLE`, `PERSON`, `TWO_WHEELER`, `TRAFFIC_SIGN` (`globals.CLASSES`).
+- **Training:** Adam/AdamW, lr 1e-3, gradient accumulation 4 (batch-1 branches),
+  seed 0, best-val checkpoint. Loss = CenterPoint 2D (Gaussian-focal heatmap +
+  masked L1 centre offset). §3.1's models each use their own best-known config
+  (camera stem, YOLO taps, dropout, depth-context — see §3.1 note); §3.2's
+  history rows share one fixed config as originally designed.
 - **Detection metric:** center-distance AP at 0.5 / 1 / 2 / 4 m (AV2 bands), per
   class; `mAP` = mean over classes with GT; `centre err` = mean centre error of
   true positives at the 2 m band. (Only needs GT centres — dataset-agnostic.)
@@ -181,9 +192,47 @@ once, ~28 min/split on the RTX 2060).
 
 ## 3. Detection baselines & Pipeline A
 
-Same split / seed / 8 epochs for all three; val = drive 0007 (2890 frames).
+### 3.1 Current results — full split, all 4 classes, yolo26 + IGEV
 
-### 3.1 Results — center-distance AP (VEHICLE; the only class with enough GT)
+`val` = held-out drive **0010**, 3026 frames, all four `globals.CLASSES`. Each
+model below is its own best-known config so far (camera stem always yolo26
+COCO-pretrained frozen; Pipeline A additionally uses `yolo_levels="p3p4"` +
+`use_depth_context=True` + `head_dropout=0.1`, camera-only uses `"p3"` and no
+dropout/depth-context) — **this is not a controlled single-variable ablation**,
+just the current best number per model. See §3.2 for the controlled comparison.
+
+| model | mAP | mean err | VEHICLE | PERSON | TWO_WHEELER | TRAFFIC_SIGN |
+|---|---|---|---|---|---|---|
+| Camera-only (IGEV) | 0.156 | 0.61 m | 0.424 | 0.159 | 0.131 | 0.067 |
+| LiDAR-only | 0.222 | 0.47 m | 0.543 | 0.156 | 0.140 | 0.269 |
+| Pipeline D (late fusion) | 0.260 | 0.48 m | 0.601 | 0.239 | 0.194 | 0.264 |
+| **Pipeline A (mid fusion)** | **0.374** | **0.35 m** | **0.721** | **0.476** | **0.386** | **0.290** |
+
+(columns = mean AP over the 0.5/1/2/4 m thresholds, per class.) Pipeline A wins
+every class and both the mAP and centre-error columns by a wide margin over
+every other model, including late fusion — see §4.
+
+![camera-only loss](img/camera_yolo26_igev_loss.png)
+![pipeline A loss](img/pipeline_a_yolo26_igev_loss.png)
+![mAP comparison](img/compare_map.png)
+![per-class AP comparison](img/compare_per_class_ap.png)
+![val loss comparison](img/compare_val_loss.png)
+
+Qualitative detections: `docs/img/{camera,pipeline_a}_yolo26_igev_det_*.png`
+(decoded boxes vs GT), `docs/img/lidar_det_*.png`, and the stereo→BEV
+diagnostics `docs/img/{camera,pipeline_a}_yolo26_igev_{diagnostics,stereobev_*}.png`
+(does the net *see* objects but fail to *place* them, or vice versa).
+
+Result files: `results/{camera_yolo26_igev, pipeline_a_yolo26_igev, lidar,
+pipeline_d}.json` (+ `*_history.json` for camera/pipeline_a). Checkpoints:
+`checkpoints/{camera_yolo26_igev, pipeline_a_yolo26_igev, lidar}.pt`.
+
+### 3.2 Historical: controlled comparison on the interim single-drive split
+
+Superseded by §3.1 (more data, better backbone) but kept because it is a
+*controlled* A/B — same split / seed / 8 epochs / `efficientnet`-from-scratch
+camera stem for all three models, `val` = drive 0007 (2890 frames), 3 classes
+(`TRAFFIC_SIGN` wasn't tracked yet):
 
 | model | params | best val loss | AP@0.5 | AP@1 | AP@2 | AP@4 | **mean AP** | **mAP** | F1@2 m | centre err |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -192,13 +241,13 @@ Same split / seed / 8 epochs for all three; val = drive 0007 (2890 frames).
 | **Pipeline A (fusion)** | 1.62 M | 1.40 | **0.176** | 0.305 | **0.363** | **0.404** | **0.312** | **0.104** | **0.48** | **0.54 m** |
 
 `mAP` averages over all three classes; `PERSON`/`TWO_WHEELER` contribute 0.0
-(GT counts 80 / 43 in val), which drags mAP well below the VEHICLE mean AP.
+(GT counts 80 / 43 in val 0007) — too little data on a single drive, fixed by
+moving to the 3-drive train split in §3.1.
 
-### 3.2 Branch-dropout ablation (Pipeline A)
-
-Zeroing one branch's BEV at inference bounds the marginal contribution of the
-other (caveat: a zeroed map is a "silent sensor" the fusion never saw in
-training, so this bounds — it is not a retrained single-branch baseline):
+**Branch-dropout ablation (Pipeline A, this run):** zeroing one branch's BEV at
+inference bounds the marginal contribution of the other (a zeroed map is a
+"silent sensor" the fusion never saw in training, so this bounds — it is not a
+retrained single-branch baseline):
 
 | Pipeline A configuration | mAP | VEHICLE mean AP | centre err |
 |---|---|---|---|
@@ -206,33 +255,9 @@ training, so this bounds — it is not a retrained single-branch baseline):
 | Camera branch dropped (LiDAR only) | 0.098 | 0.293 | 0.44 m |
 | LiDAR branch dropped (camera only) | 0.001 | 0.003 | 1.39 m |
 
-**Reading:** LiDAR carries the fusion (dropping the camera keeps it at 0.098);
-dropping LiDAR collapses it (0.001) — the fused head learned to rely on LiDAR
-geometry. The camera branch's contribution is a **modest sharpening on top**:
-full fusion improves AP@0.5 (0.174 → 0.176 vs the LiDAR-only branch) and, versus
-the standalone LiDAR-only baseline, lifts mean AP 0.299 → 0.312 and cuts centre
-error 0.64 → 0.54 m.
-
-### 3.3 Loss curves (train / val per epoch)
-
-| epoch | Camera train/val | LiDAR train/val | Pipeline A train/val |
-|---|---|---|---|
-| 1 | 30.31 / 9.74 | 16.86 / 2.90 | 19.86 / 3.00 |
-| 2 | 3.54 / 5.92 | 2.14 / 1.76 | 2.40 / 1.82 |
-| 3 | 2.44 / 4.08 | 1.50 / 1.63 | 1.60 / 1.49 |
-| 4 | 1.97 / 4.44 | 1.24 / 1.43 | 1.28 / 1.45 |
-| 5 | 1.69 / 3.07 | 1.10 / **1.40** | 1.08 / **1.40** |
-| 6 | 1.58 / 3.24 | 0.98 / 1.43 | 0.94 / 1.40 |
-| 7 | 1.44 / **2.42** | 0.91 / 1.77 | 0.84 / 1.76 |
-| 8 | 1.31 / 2.85 | 0.81 / 1.50 | 0.76 / 1.50 |
-
-(Bold = best-val checkpoint used for the AP report.) All three converge; the
-camera-only run has the largest train/val gap (0003 → 0007 domain shift + a
-from-scratch backbone on 1010 frames).
-
-Result files: `results/{camera_only_igev, lidar_only, pipeline_a_igev,
-pipeline_a_drop_camera, pipeline_a_drop_lidar}.json` (+ `*_history.json`).
-Checkpoints: `checkpoints/{camera_only_igev, lidar_only, pipeline_a_igev}.pt`.
+LiDAR carried this fusion (dropping the camera only cost 0.098 vs 0.104);
+dropping LiDAR collapsed it (0.001) — the fused head had learned to rely on
+LiDAR geometry, with the camera contributing a modest sharpening on top.
 
 ---
 
@@ -245,13 +270,16 @@ Checkpoints: `checkpoints/{camera_only_igev, lidar_only, pipeline_a_igev}.pt`.
    the near/mid field**, at < 1 GB VRAM and ~0.5 s/frame (cached once).
 3. **Passive stereo is baseline-limited past ~30 m** (0.594 m baseline); no
    matcher fixes this — it is the physics, and it is beyond the 50 m BEV grid.
-4. **Fusion beats both single-sensor baselines** (mAP 0.104 > 0.100 > 0.046),
-   with the camera's dense stereo depth contributing **sharper localization**
-   (AP@0.5 and centre error), while LiDAR provides the recall backbone.
-5. **Data, not architecture, is the limiter for small classes** — PERSON /
-   TWO_WHEELER stay at 0.0 AP because the val drive has 80 / 43 GT boxes.
-6. These are **weak floors on purpose**: 1010 training frames, a from-scratch
-   efficientnet stem, no augmentation. They exist to be beaten.
+4. **Mid fusion clearly beats every other option** (§3.1: mAP 0.374 vs 0.260
+   late-fusion vs 0.222 LiDAR-only vs 0.156 camera-only) — fusing *before* the
+   head lets the network reason jointly over both sensors' geometry, which
+   merging final boxes (Pipeline D) cannot recover.
+5. **More data made the small classes learnable.** On the single-drive interim
+   split (§3.2) `PERSON`/`TWO_WHEELER` sat at 0.0 AP (80/43 GT boxes); on the
+   full 3-drive split (§3.1) every class has non-trivial AP.
+6. §3.1's numbers are **not yet a controlled ablation** — each model used its
+   own best-so-far config (YOLO taps, dropout, depth-context). The clean A/B
+   methodology from §3.2 should be re-run on the full split next.
 
 ---
 
@@ -293,14 +321,15 @@ version); without it `matcher="sgbm_wls"` falls back to a built-in equivalent
 ## 6. Status & next steps
 
 - **Done:** pluggable matcher + IGEV integration + dense cache; camera-only,
-  LiDAR-only and Pipeline A baselines with distance-AP; depth→BEV study.
-- **Next (P3 ablations):** IGEV vs SGBM depth *through the full network* — i.e.
-  train camera-only (and Pipeline A) on the SGBM cache and compare distance-AP to
-  the IGEV runs of §3, isolating the depth source's effect on detection. **Not
-  done yet:** every §3 number uses IGEV; the SGBM cache is currently only partial
-  (build it first). Then StereoBEV (grounded) vs MonoBEV (predicted); beam density.
-- **Data:** add more KITTI-360 urban drives (`scripts/get_kitti360.sh`) so
-  PERSON / TWO_WHEELER become learnable; keep drive 0010 for final eval.
+  LiDAR-only, Pipeline A and Pipeline D (late fusion) on the full 3-drive
+  split with distance-AP; depth→BEV study; MonoBEV (predicted-depth) baseline;
+  regularization sweep (dropout/weight-decay/patch-split/YOLO neck taps/
+  depth-context); early stopping.
+- **Next:** re-run §3.1 as a controlled ablation (fixed config across models,
+  per §3.2's methodology) now that the full split exists; IGEV vs SGBM depth
+  *through the full network* (§3's numbers all use IGEV; the SGBM cache is
+  still partial); StereoBEV (grounded) vs MonoBEV (predicted) head-to-head on
+  the same split.
 - **Later:** Pipeline B (painted range), Pipeline C (cross-attention fusion),
   CDS + per-range AP bins, Jetson Orin latency, FS-car deployment (ZED depth).
 
