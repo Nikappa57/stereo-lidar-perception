@@ -20,6 +20,43 @@ CLASS_COLORS = np.concatenate([
 
 
 # --------------------------------------------------------------------------- #
+# Checkpoint loading — tolerate the BEVBackbone2D dropout index shift
+# --------------------------------------------------------------------------- #
+def load_state_dict_compat(model, state_dict, *, strict: bool = True):
+    """``model.load_state_dict`` that tolerates the ``BEVBackbone2D`` dropout shift.
+
+    Checkpoints trained while ``Dropout2d`` was an *unconditional* member of
+    ``BEVBackbone2D.block`` carry the tail conv/BN one ``nn.Sequential`` index
+    higher (``block.7``=conv, ``block.8``=BN) than the current architecture,
+    which inserts the dropout module only when ``p>0`` (so ``p=0`` keeps the
+    original ``block.6``=conv, ``block.7``=BN layout — see
+    ``network.BEVBackbone2D``). Load as-is when the keys line up; if the only
+    problem is that shift, collapse the checkpoint's tail indices down and retry
+    so those in-between checkpoints still load. Any *other* mismatch (e.g. a
+    different class count) is re-raised unchanged.
+    """
+    try:
+        model.load_state_dict(state_dict, strict=strict)
+        return
+    except RuntimeError:
+        msd = model.state_dict()
+        ckpt_shifted = any(".block.8." in k for k in state_dict)
+        model_shifted = any(".block.8." in k for k in msd)
+        if not (ckpt_shifted and not model_shifted):
+            raise  # not the dropout-shift problem — surface it honestly
+
+    def _down(k):  # collapse the dropout-shifted tail: block.8->7, block.7->6
+        if ".block.8." in k:
+            return k.replace(".block.8.", ".block.7.")
+        if ".block.7." in k:
+            return k.replace(".block.7.", ".block.6.")
+        return k
+
+    model.load_state_dict({_down(k): v for k, v in state_dict.items()},
+                          strict=strict)
+
+
+# --------------------------------------------------------------------------- #
 # Network debugging — capture and plot intermediate outputs
 # --------------------------------------------------------------------------- #
 @contextmanager
@@ -424,6 +461,7 @@ def _backproject_depth(depth, K, T_cam2ego):
 
 def visualize_stereo_bev_diagnostic(model, sample, device=None,
                                     score_threshold: float = 0.1,
+                                    nms_radius_by_class: "dict[int, float] | None" = None,
                                     save_path: str | None = None,
                                     show_lidar: bool = True,
                                     heat_gamma: float = 1.0):
@@ -467,7 +505,8 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     with torch.no_grad():
         out = model(sample, device=device)
     heat = out["heatmap"].sigmoid().max(dim=1).values[0].cpu().numpy()  # (nx, ny)
-    det = CenterPointDecoder(score_threshold=score_threshold)(
+    det = CenterPointDecoder(score_threshold=score_threshold,
+                             nms_radius_by_class=nms_radius_by_class)(
         out["heatmap"].cpu(), out["offset"].cpu())[0]
     det_xy = det["boxes_2d"].numpy()          # (D, 2) ego x, y
     det_cls = det["classes"].numpy().astype(int)
