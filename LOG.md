@@ -98,7 +98,8 @@ Issue with encoder nms
 ![alt text](docs/img/train/train1-example4.png)
 
 
-# 3) Efficient Network, nms fix
+### 3) Efficient Network, nms fix
+/home/lorenzo/Desktop/repo/AIRO/stereo-lidar-perception/runs/camera_efficientnet_igev_20260707_033656
 
 fix: nms decoder
 new file organization
@@ -108,3 +109,139 @@ CameraOnlyDetector: 1,066,790 trainable
 Note: more trainable parameters, but no tranferlearning
 TODO: test also unfreezed yolo (maybe not the whole network)
 
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.101   0.275   0.420   0.467   0.316  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.067   0.105   0.130   0.140   0.110  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.616   0.448   0.519   0.135   
+PERSON        0.000   0.000   0.000   0.161   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.237   0.223   0.230   0.218   
+
+mAP 0.142 | macro P 0.284 R 0.224 F1 0.250 @2 m | mean centre error (TP@2m) 0.707 m | 1010 frames
+
+/home/lorenzo/Desktop/repo/AIRO/stereo-lidar-perception/runs/camera_efficientnet_igev_20260707_155342/plots/evaluation.png
+/home/lorenzo/Desktop/repo/AIRO/stereo-lidar-perception/runs/camera_efficientnet_igev_20260707_155342/plots/loss_curves.png
+
+### 4) Yolo p3p4
+/home/lorenzo/Desktop/repo/AIRO/stereo-lidar-perception/runs/camera_yolo26_igev_20260707_162407
+
+CameraOnlyDetector: 804,742 trainable | 2,572,280 frozen (yolo26 backbone)
+
+fix nms in visualization
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.189   0.458   0.606   0.648   0.475  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.166   0.202   0.212   0.215   0.199  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.730   0.548   0.626   0.199   
+PERSON        0.000   0.000   0.000   0.153   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.355   0.354   0.355   0.214   
+
+mAP 0.225 | macro P 0.362 R 0.301 F1 0.327 @2 m | mean centre error (TP@2m) 0.617 m | 1010 frames
+
+
+
+### 4) FIX NMS
+
+bigger nsm for vehicles
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.187   0.451   0.603   0.650   0.473  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.166   0.202   0.212   0.215   0.199  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.747   0.544   0.630   0.199   
+PERSON        0.000   0.000   0.000   0.153   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.355   0.354   0.355   0.214   
+
+mAP 0.224 | macro P 0.368 R 0.299 F1 0.328 @2 m | mean centre error (TP@2m) 0.614 m | 1010 frames
+
+![alt text](docs/img/traintest-example.png)
+
+
+### 5) yolo p3p4p5
+
+CameraOnlyDetector: 870,278 trainable | 2,572,280 frozen (yolo26 backbone)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.179   0.461   0.656   0.680   0.494  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.110   0.148   0.158   0.181   0.149  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.713   0.643   0.677   0.180   
+PERSON        0.000   0.000   0.000   0.112   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.242   0.369   0.292   0.185   
+
+mAP 0.215 | macro P 0.318 R 0.337 F1 0.323 @2 m | mean centre error (TP@2m) 0.648 m | 1010 frames
+
+Better for vehicles, worst for small objects
+Maybe keep only p3p4
+
+
+### 5) MONO BEV
+
+onoOnlyDetector: 1,372,847 trainable | 2,572,280 frozen (yolo26 backbone)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.016   0.086   0.252   0.435   0.197  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.000   0.000   0.000   0.001   0.000  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.437   0.348   0.387   0.145   
+PERSON        0.000   0.000   0.000   nan     
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.000   0.000   0.000   0.103   
+
+mAP 0.066 | macro P 0.146 R 0.116 F1 0.129 @2 m | mean centre error (TP@2m) 1.000 m | 1010 frames
+
+
+#### 6) DEPTH + P3P4
+
+CameraOnlyDetector: 809,350 trainable | 2,572,280 frozen (yolo26 backbone)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.123   0.424   0.644   0.684   0.469  805
+PERSON        0.002   0.002   0.002   0.002   0.002  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.124   0.174   0.185   0.200   0.171  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.742   0.583   0.653   0.184   
+PERSON        0.043   0.056   0.049   0.102   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.316   0.310   0.313   0.282   
+
+mAP 0.214 | macro P 0.367 R 0.316 F1 0.338 @2 m | mean centre error (TP@2m) 0.673 m | 1010 frames
