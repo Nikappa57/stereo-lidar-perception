@@ -1634,6 +1634,87 @@ class CameraOnlyDetector(nn.Module):
         return self.head(bev.unsqueeze(0))
 
 
+class MonoBEVBranch(nn.Module):
+    """End-to-end camera branch: single left image → BEV via **predicted** depth.
+
+    The Lift-Splat-Shoot counterpart of :class:`StereoBEVBranch`. It wraps
+    :class:`MonoBEV` with the same ``forward(sample, device)`` contract as the
+    stereo branch, so it is a drop-in Stage-A camera branch — but it needs
+    **no stereo depth**: :class:`MonoBEV` predicts a depth distribution from the
+    left image alone, so there is no SGBM/IGEV cost and **no stereo cache**.
+    Only the rectified left image + its intrinsics + the camera→ego extrinsic are
+    consumed (same tensors as :func:`_camera_bev`, but grad-enabled/trainable).
+    """
+
+    def __init__(self, cfg: "MonoBEVConfig | None" = None,
+                 target_hw: tuple[int, int] = (192, 640)):
+        super().__init__()
+        self.cfg = cfg or MonoBEVConfig()
+        self.target_hw = target_hw
+        self.model = MonoBEV(self.cfg)
+
+    def forward(self, sample,
+                device: torch.device = torch.device("cpu")) -> torch.Tensor:
+        """StereoSample → ``(C, nx, ny)`` predicted-depth camera BEV on *device*."""
+        import torchvision.transforms.functional as TF
+
+        target_h, target_w = self.target_hw
+        img_np = sample.image_left
+        if img_np is None:
+            raise RuntimeError(
+                f"MonoBEV needs the left image, but frame "
+                f"{sample.log_name}/{sample.iteration} was loaded with "
+                f"load_images=False.")
+        img_h, img_w = img_np.shape[:2]
+
+        img_t = TF.to_tensor(img_np)                       # HWC uint8 -> CHW [0,1]
+        img_t = TF.resize(img_t, [target_h, target_w])
+        # ImageNet stats for the CNN backbone; plain [0, 1] for YOLO (same rule
+        # as StereoBEVBranch.forward_tensors — test YOLO, the odd one out).
+        if self.cfg.img_backbone.lower() not in ("yolo", "yolo26"):
+            img_t = TF.normalize(img_t, mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        img_batch = img_t.unsqueeze(0).to(device)          # (1, 3, h, w)
+
+        # scale intrinsics to the resized resolution (fx, cx / fy, cy)
+        K_np = sample.calibration.left_intrinsics.copy().astype(np.float32)
+        K_np[0] *= target_w / img_w
+        K_np[1] *= target_h / img_h
+        K = torch.from_numpy(K_np).to(device)
+        T = torch.from_numpy(
+            sample.calibration.left_to_ego.astype(np.float32)).to(device)
+
+        self.model.to(device)
+        bev = self.model(img_batch, K, T)                  # (1, C, nx, ny)
+        return bev.squeeze(0)
+
+
+class MonoOnlyDetector(nn.Module):
+    """Camera-only baseline via **predicted-depth** Lift-Splat-Shoot → head.
+
+    Same role and ``forward(sample, device)`` contract as
+    :class:`CameraOnlyDetector`, but the camera branch is :class:`MonoBEVBranch`
+    (mono predicted depth) instead of the grounded stereo splat. This is the
+    *MonoBEV vs StereoBEV* control arm — the headline ablation for whether
+    grounded stereo depth earns its place (doc §P3). Needs **no stereo cache**.
+    """
+
+    def __init__(self, num_classes: int = G.NUM_CLASSES,
+                 mono_cfg: "MonoBEVConfig | None" = None,
+                 head_dropout: float = 0.0):
+        super().__init__()
+        self.branch = MonoBEVBranch(cfg=mono_cfg)
+        self.head = CenterPointHead(CAMERA_BEV_CHANNELS, num_classes,
+                                    dropout=head_dropout)
+
+    def forward(self, sample,
+                device: torch.device = torch.device("cpu")
+                ) -> dict[str, torch.Tensor]:
+        self.to(device)
+        bev = self.branch(sample, device=device)  # (C, nx, ny), grad-enabled
+        return self.head(bev.unsqueeze(0))
+
+
 class Pipeline(nn.Module):
     """Base assembly: the two Stage A branches + BEV fusion + CenterPoint head.
 
@@ -1833,13 +1914,15 @@ def _stereo_bev(
         return branch(sample, device)
 
 
-def build_detector(name: str, *, stereo_cache_root=None, stereo_cfg=None):
+def build_detector(name: str, *, stereo_cache_root=None, stereo_cfg=None,
+                   mono_cfg=None):
     """Factory: model name -> ``(model, input_fn)``, the single source of truth
     for the name→class mapping shared by the training + presentation notebooks.
 
-    ``name`` ∈ ``lidar`` | ``camera`` | ``pipeline_a`` | ``pipeline_b`` |
-    ``pipeline_c``. ``input_fn`` is ``lidar_points`` for the LiDAR baseline and
-    ``None`` (identity — the model consumes the sample) for everything else.
+    ``name`` ∈ ``lidar`` | ``camera`` (stereo splat) | ``mono`` (predicted-depth
+    splat) | ``pipeline_a`` | ``pipeline_b`` | ``pipeline_c``. ``input_fn`` is
+    ``lidar_points`` for the LiDAR baseline and ``None`` (identity — the model
+    consumes the sample) for everything else. ``mono`` needs **no stereo cache**.
     Pipeline D is late fusion (no model) — see ``evaluation.evaluate_late_fusion``.
     """
     name = name.lower()
@@ -1848,6 +1931,8 @@ def build_detector(name: str, *, stereo_cache_root=None, stereo_cfg=None):
     if name in ("camera", "camera_only"):
         return CameraOnlyDetector(stereo_cache_root=stereo_cache_root,
                                   stereo_cfg=stereo_cfg), None
+    if name in ("mono", "mono_only", "monobev"):
+        return MonoOnlyDetector(mono_cfg=mono_cfg), None
     pipelines = {"pipeline_a": PipelineA, "pipeline_b": PipelineB,
                  "pipeline_c": PipelineC}
     if name not in pipelines:
