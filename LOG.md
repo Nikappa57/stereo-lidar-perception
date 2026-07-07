@@ -119,6 +119,14 @@ PERSON        0.000   0.000   0.000   0.000   0.000  729
 TWO_WHEELER   0.000   0.000   0.000   0.000   0.000  521
 TRAFFIC_SIGN  0.011   0.014   0.015   0.031   0.018  375
 
+F1-optimal operating point @2 m:
+class         prec    recall  F1      score
+----------------------------------------------
+VEHICLE       0.643   0.525   0.578   0.150
+PERSON        0.041   0.004   0.007   0.102
+TWO_WHEELER   0.000   0.000   0.000   nan
+TRAFFIC_SIGN  0.103   0.104   0.104   0.105
+
 mAP 0.095 | macro P 0.197 R 0.158 F1 0.172 @2 m | centre err (TP@2m) 0.736 m | 757 frames
 ```
 
@@ -147,6 +155,14 @@ PERSON        0.000   0.000   0.001   0.003   0.001  729
 TWO_WHEELER   0.000   0.000   0.000   0.000   0.000  521
 TRAFFIC_SIGN  0.021   0.026   0.031   0.052   0.033  375
 
+F1-optimal operating point @2 m:
+class         prec    recall  F1      score
+----------------------------------------------
+VEHICLE       0.655   0.507   0.571   0.177
+PERSON        0.051   0.010   0.016   0.104
+TWO_WHEELER   0.000   0.000   0.000   0.102
+TRAFFIC_SIGN  0.108   0.179   0.134   0.111
+
 mAP 0.106 | macro P 0.203 R 0.174 F1 0.180 @2 m | centre err (TP@2m) 0.674 m | 757 frames
 ```
 
@@ -172,6 +188,14 @@ VEHICLE       0.185   0.403   0.540   0.583   0.428  3985
 PERSON        0.110   0.127   0.137   0.144   0.130  729
 TWO_WHEELER   0.070   0.095   0.105   0.112   0.096  521
 TRAFFIC_SIGN  0.061   0.077   0.089   0.114   0.085  375
+
+F1-optimal operating point @2 m:
+class         prec    recall  F1      score
+----------------------------------------------
+VEHICLE       0.711   0.582   0.640   0.162
+PERSON        0.372   0.174   0.237   0.117
+TWO_WHEELER   0.411   0.150   0.219   0.105
+TRAFFIC_SIGN  0.199   0.176   0.187   0.183
 
 mAP 0.184 | macro P 0.423 R 0.270 F1 0.321 @2 m | centre err (TP@2m) 0.622 m | 757 frames
 ```
