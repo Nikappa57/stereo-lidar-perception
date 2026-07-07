@@ -143,6 +143,21 @@ PERSON        0.000   0.000   0.000   0.000   0.000  18
 TWO_WHEELER   —       —       —       —       —      0
 TRAFFIC_SIGN  0.166   0.202   0.212   0.215   0.199  274
 
+### 4) WEIGHT_DECAY = 1e-4 (AdamW, dropout still 0)
+
+Phase 1 regularization A/B: only weight decay on (head_dropout=0), yolo26 backbone frozen, MATCHER=igev, YOLO_LEVELS=p3. Dataset pinned to same drives as entry 1 (kitti360_train=0007 (2,890) / kitti360_val=0003 (1,010)).
+
+CameraOnlyDetector: 804,742 trainable | 2,572,280 frozen (yolo26 backbone)
+
+![alt text](docs/img/train/train2-loss.png)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.205   0.431   0.573   0.626   0.459  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.123   0.153   0.166   0.179   0.155  274
+
 F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
 class         prec    recall  F1      score   
 ----------------------------------------------
@@ -245,3 +260,14 @@ TWO_WHEELER   —       —       —       —
 TRAFFIC_SIGN  0.316   0.310   0.313   0.282   
 
 mAP 0.214 | macro P 0.367 R 0.316 F1 0.338 @2 m | mean centre error (TP@2m) 0.673 m | 1010 frames
+VEHICLE       0.619   0.645   0.632   0.104   
+PERSON        0.000   0.000   0.000   0.117   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.318   0.376   0.344   0.129   
+
+mAP 0.205 | macro P 0.312 R 0.340 F1 0.325 @2 m | mean centre error (TP@2m) 0.593 m | 1010 frames
+
+![alt text](docs/img/train/train2-result.png)
+
+![alt text](docs/img/train/train2-example.png)
+
