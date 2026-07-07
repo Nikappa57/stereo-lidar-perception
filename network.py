@@ -249,21 +249,29 @@ class BEVBackbone2D(nn.Module):
     def __init__(self, in_channels: int = 64, out_channels: int = 128,
                  dropout: float = 0.0):
         super().__init__()
-        # Dropout2d after the mid ReLU regularizes the shared BEV features.
-        # p=0.0 (default) is a no-op passthrough with no state_dict keys, so the
-        # architecture + old checkpoints are unchanged unless opted in.
-        self.block = nn.Sequential(
+        # Dropout2d after the mid ReLU regularizes the shared BEV features. It is
+        # inserted ONLY when dropout>0: an unconditional module would sit at a
+        # fixed Sequential index and renumber every layer after it, so a p=0.0
+        # "no-op" would still shift the tail conv/BN keys and break loading of
+        # every pre-dropout checkpoint. Conditional insertion keeps p=0.0 truly
+        # architecture-identical to the original (old checkpoints load as-is);
+        # a regularized run (p>0) is a deliberately fresh architecture anyway.
+        layers = [
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(dropout))
+        layers += [
             nn.Conv2d(64, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-        )
+        ]
+        self.block = nn.Sequential(*layers)
 
     def forward(self, bev: torch.Tensor) -> torch.Tensor:
         return self.block(bev)
