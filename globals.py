@@ -81,8 +81,12 @@ RIGHT_CAMERA: str = "pcam_stereo_r"
 # a class with zero GT only wastes a head channel and a permanently-0 AP row.
 # Class-frequency notes (measured on drives 0003/0007/0009/0010, see docs):
 #   * GENERIC_OBJECT (bigPole/smallPole/lamp/box/trashbin/vendingmachine) is a
-#     heterogeneous, noisy bucket (mostly thin poles) — **excluded**: those raw
-#     labels now fall into the ignore bucket (class_index -> None).
+#     heterogeneous, noisy bucket (mostly thin poles) — **excluded** (class_index
+#     -> None). Adding it as an explicit class was considered: it would absorb
+#     the pole/lamp false positives the TRAFFIC_SIGN head otherwise scores
+#     against no GT, which should lift *sign precision*. But it needs its own
+#     retrain + seeds, and the bucket's own AP is noise — so it's deferred, not
+#     rejected. Revisit on the full 3-drive split. See docs / LOG.
 #   * TRAIN is emitted but rare and only on drive 0010 → **excluded**: with 0010
 #     as the val split it never appears in training (0 GT on drives 0003/0007/
 #     0009), so a TRAIN channel only wastes head capacity on a permanently-0 AP.
