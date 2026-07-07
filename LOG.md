@@ -278,11 +278,24 @@ HEAD_DROPOUT = 0.1
 
 CameraOnlyDetector: 809,350 trainable | 2,572,280 frozen (yolo26 backbone)
 
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.184   0.448   0.631   0.688   0.488  805
+PERSON        0.007   0.008   0.008   0.008   0.007  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.153   0.184   0.196   0.211   0.186  274
 
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.761   0.573   0.653   0.190   
+PERSON        0.029   0.222   0.052   0.109   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.323   0.376   0.347   0.200   
 
+mAP 0.227 | macro P 0.371 R 0.390 F1 0.351 @2 m | mean centre error (TP@2m) 0.613 m | 1010 frames
 
-
-#### 7) DEPTH + P3
+#### 7) DEPTH + P3 (ignore it!)
 
 class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
 -----------------------------------------------------------
