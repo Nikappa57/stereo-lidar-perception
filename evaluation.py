@@ -17,15 +17,53 @@ class CenterPointDecoder:
     to find local peaks in the heatmap.
     """
 
-    def __init__(self, score_threshold: float = 0.2, max_objects: int = 100):
+    def __init__(self, score_threshold: float = 0.2, max_objects: int = 100,
+                 nms_radius_m: float = 0.0,
+                 nms_radius_by_class: "dict[int, float] | None" = None):
         self.score_threshold = score_threshold
         self.max_objects = max_objects
+
+        # Metric-space greedy NMS layered on top of the 3x3 max-pool. The
+        # max-pool only suppresses *adjacent* cells (~1 cell = BEV_RES_M): a
+        # large object (a car spans many cells) can hold several local peaks
+        # farther apart that all survive the pool -> duplicate detections on one
+        # object. A greedy within-class metric NMS merges peaks within
+        # ``nms_radius_m`` metres of a higher-scoring one. ``0`` disables it
+        # (max-pool only = legacy behaviour); ``nms_radius_by_class`` overrides
+        # per class index (e.g. a larger radius for VEHICLE than for a sign).
+        self.nms_radius_m = nms_radius_m
+        self.nms_radius_by_class = nms_radius_by_class or {}
 
         # Grid geometry imported directly from globals.py
         # to ensure the mapping matches the one used during splatting.
         self.x_min = G.X_RANGE[0]
         self.y_min = G.Y_RANGE[0]
         self.res = G.BEV_RES_M
+
+    def _nms_radius(self, cls: int) -> float:
+        """Per-class NMS radius (falls back to the scalar ``nms_radius_m``)."""
+        return float(self.nms_radius_by_class.get(int(cls), self.nms_radius_m))
+
+    def _greedy_metric_nms(self, xy: torch.Tensor, scores: torch.Tensor,
+                           classes: torch.Tensor) -> torch.Tensor:
+        """Greedy within-class metric NMS → kept indices (highest score first).
+
+        Visit detections by descending score; keep each, then suppress every
+        *same-class* detection within its radius. O(N^2) but N <= max_objects.
+        """
+        keep: list[int] = []
+        suppressed = torch.zeros(len(scores), dtype=torch.bool)
+        for i in torch.argsort(scores, descending=True).tolist():
+            if suppressed[i]:
+                continue
+            keep.append(i)
+            r = self._nms_radius(int(classes[i]))
+            if r > 0:
+                dist = torch.linalg.norm(xy - xy[i], dim=1)
+                hit = (classes == classes[i]) & (dist < r)
+                hit[i] = False
+                suppressed |= hit
+        return torch.tensor(keep, dtype=torch.long, device=scores.device)
 
     def __call__(self, heatmap: torch.Tensor,
                  offset: torch.Tensor) -> list[dict[str, torch.Tensor]]:
@@ -66,32 +104,32 @@ class CenterPointDecoder:
             # Indices of valid candidates.
             # idx_c: class, idx_flat: flat 1D index in the grid
             idx_c, idx_flat = valid_mask.nonzero(as_tuple=True)
-
             val_scores = scores_b[idx_c, idx_flat]
 
-            # Apply maximum object limit per frame (e.g., top 100)
-            if len(val_scores) > self.max_objects:
-                val_scores, topk_idx = torch.topk(val_scores, self.max_objects)
-                idx_c = idx_c[topk_idx]
-                idx_flat = idx_flat[topk_idx]
-
-            # Reconstruct grid coordinates (ix, iy)
+            # Reconstruct grid coordinates (ix, iy) + sub-cell offset -> metric
+            # ego (x, y). Done for *all* candidates so metric NMS (below) can
+            # merge duplicate peaks on one object before the max_objects cap.
             ix = torch.div(idx_flat, ny, rounding_mode='trunc')
             iy = idx_flat % ny
-
-            # Extract sub-pixel offsets for selected cells
-            dx = offset_b[0, idx_flat]
-            dy = offset_b[1, idx_flat]
-
-            # Continuous coordinates on the grid
-            grid_x = ix.float() + dx
-            grid_y = iy.float() + dy
-
-            # Inverse mapping: Grid coordinates -> Metric coordinates (Ego frame)
+            grid_x = ix.float() + offset_b[0, idx_flat]
+            grid_y = iy.float() + offset_b[1, idx_flat]
             metric_x = grid_x * self.res + self.x_min
             metric_y = grid_y * self.res + self.y_min
-
             boxes_2d = torch.stack([metric_x, metric_y], dim=-1)
+
+            # Greedy within-class metric NMS (opt-in): removes the extra peaks a
+            # large object holds that the 3x3 max-pool leaves behind.
+            if len(val_scores) and (self.nms_radius_m > 0
+                                    or self.nms_radius_by_class):
+                keep = self._greedy_metric_nms(boxes_2d, val_scores, idx_c)
+                boxes_2d, val_scores, idx_c = (boxes_2d[keep],
+                                               val_scores[keep], idx_c[keep])
+
+            # Cap to the per-frame object budget (highest scores kept).
+            if len(val_scores) > self.max_objects:
+                val_scores, topk_idx = torch.topk(val_scores, self.max_objects)
+                boxes_2d = boxes_2d[topk_idx]
+                idx_c = idx_c[topk_idx]
 
             results.append({
                 "boxes_2d": boxes_2d,
@@ -197,6 +235,8 @@ def _average_precision(scores, xy, frame_ids, gt_by_frame, n_gt,
 def evaluate_model(model, frames, *, input_fn=None,
                    device: torch.device = torch.device("cpu"),
                    score_threshold: float = 0.1,
+                   nms_radius_m: float = 0.0,
+                   nms_radius_by_class: "dict[int, float] | None" = None,
                    sample_kwargs: dict | None = None,
                    thresholds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)) -> dict:
     """Center-distance AP of a detector over a list of :class:`~data.Frame`.
@@ -219,7 +259,9 @@ def evaluate_model(model, frames, *, input_fn=None,
     # the camera branch reads the precomputed stereo cache. Pass {} for full samples.
     if sample_kwargs is None:
         sample_kwargs = {"load_images": False, "point_mask": False}
-    decoder = CenterPointDecoder(score_threshold=score_threshold)
+    decoder = CenterPointDecoder(score_threshold=score_threshold,
+                                 nms_radius_m=nms_radius_m,
+                                 nms_radius_by_class=nms_radius_by_class)
 
     frame_dets: list[dict] = []          # raw per-frame preds
     frame_gts: list[tuple] = []          # raw per-frame GT (centres, classes)
