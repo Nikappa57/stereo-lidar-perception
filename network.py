@@ -108,8 +108,20 @@ class _EfficientNetBackbone(nn.Module):
         return self.proj(self.block2(self.block1(self.stem(x))))
 
 
+#: Named multi-scale taps into the YOLO neck's ``[P3, P4, P5]`` feature list.
+#: ``"p3"`` (stride 8) is the finest and the default — P4/P5 (stride 16/32) are
+#: coarser but see larger context; when included they are up-sampled to P3's
+#: resolution and concatenated before the 1×1 projection, so the ``H/8`` output
+#: contract is preserved regardless of how many levels are used.
+_YOLO_LEVELS: dict[str, tuple[int, ...]] = {
+    "p3": (0,),
+    "p3p4": (0, 1),
+    "p3p4p5": (0, 1, 2),
+}
+
+
 class YOLOBackbone(nn.Module):
-    """YOLO26 backbone+neck tapped at P3 (stride 8), RGB only.
+    """YOLO26 backbone+neck tapped at P3 (+ optionally P4/P5), RGB only.
 
     A drop-in replacement for :class:`_EfficientNetBackbone`: same 1/8 stride and
     the same ``(B, out_dim, H/8, W/8)`` output contract, so the dynamic
@@ -118,8 +130,12 @@ class YOLOBackbone(nn.Module):
     expect (``MonoBEVConfig.img_backbone_out``).
 
     The Detect head runs but is ignored; a forward pre-hook on it captures the
-    ``[P3, P4, P5]`` feature list and we keep P3. A 1×1 conv (sized lazily from
-    P3's channel count via one dummy pass) projects to ``out_dim``.
+    ``[P3, P4, P5]`` feature list. ``levels`` (``"p3"`` | ``"p3p4"`` |
+    ``"p3p4p5"``, see :data:`_YOLO_LEVELS`) selects which of those to keep: the
+    coarser P4/P5 taps are bilinearly up-sampled to P3's resolution and
+    concatenated, then a 1×1 conv (sized lazily from the concatenated channel
+    count via one dummy pass) projects to ``out_dim``. More levels = multi-scale
+    context (small + large objects) at the cost of a wider projection.
 
     ``ultralytics`` is imported lazily here so the rest of the network (fusion,
     head, EfficientNet path) stays importable without it installed.
@@ -130,13 +146,20 @@ class YOLOBackbone(nn.Module):
         weights: str = "yolo26n.pt",
         freeze: bool = False,
         out_dim: int = 256,
+        levels: str = "p3",
     ):
         super().__init__()
         from ultralytics import YOLO  # lazy: only the YOLO path needs it
 
+        self.levels = _YOLO_LEVELS.get(levels.lower())
+        if self.levels is None:
+            raise ValueError(
+                f"unknown yolo levels {levels!r}; expected one of "
+                f"{list(_YOLO_LEVELS)}")
+
         self.det = YOLO(weights).model        # the DetectionModel (an nn.Module)
         self.head = self.det.model[-1]        # the Detect head (last layer)
-        self.stride = 8                        # P3
+        self.stride = 8                        # P3 (output resolution = finest tap)
         self._feats: list[torch.Tensor] | None = None
 
         # the Detect head receives [P3, P4, P5]; capture them before it runs
@@ -148,11 +171,12 @@ class YOLOBackbone(nn.Module):
                 p.requires_grad_(False)
             self.det.eval()  # freeze BatchNorm running stats too (see train())
 
-        # discover P3's channel count with one dummy pass, then size the 1x1
+        # discover the selected taps' channel counts with one dummy pass, then
+        # size the 1x1 to the sum (P3 kept native, P4/P5 upsampled to P3 res).
         with torch.no_grad():
             self.det(torch.zeros(1, 3, 320, 320))
-        c3 = self._feats[0].shape[1]
-        self.proj = nn.Conv2d(c3, out_dim, 1)
+        c_in = sum(self._feats[i].shape[1] for i in self.levels)
+        self.proj = nn.Conv2d(c_in, out_dim, 1)
 
     def train(self, mode: bool = True):
         """Keep a frozen backbone in eval mode regardless of parent ``.train()``.
@@ -173,8 +197,16 @@ class YOLOBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 3, H, W)  →  (B, out_dim, H/8, W/8)"""
         self._feats = None
-        self.det(x)                            # runs backbone+neck+head; hook grabs P3
-        return self.proj(self._feats[0])       # P3 -> (B, out_dim, H/8, W/8)
+        self.det(x)                            # runs backbone+neck+head; hook grabs [P3,P4,P5]
+        feats = [self._feats[i] for i in self.levels]
+        if len(feats) == 1:                    # P3 only — no resample needed
+            return self.proj(feats[0])
+        ref_hw = feats[0].shape[-2:]           # P3 (finest) sets the output grid
+        feats = [feats[0]] + [
+            F.interpolate(f, size=ref_hw, mode="bilinear", align_corners=False)
+            for f in feats[1:]
+        ]
+        return self.proj(torch.cat(feats, dim=1))  # (B, out_dim, H/8, W/8)
 
 
 def build_camera_backbone(
@@ -183,13 +215,15 @@ def build_camera_backbone(
     *,
     weights: str = "yolo26n.pt",
     freeze: bool = False,
+    yolo_levels: str = "p3",
 ) -> nn.Module:
     """Factory for the Stage 1 camera backbone (the one swappable image stem).
 
     ``name`` is the value of ``MonoBEVConfig.img_backbone`` / ``StereoBEVConfig``:
 
     * ``"efficientnet"`` (default) → :class:`_EfficientNetBackbone`
-    * ``"yolo26"`` / ``"yolo"``    → :class:`YOLOBackbone` (``weights``/``freeze``)
+    * ``"yolo26"`` / ``"yolo"``    → :class:`YOLOBackbone` (``weights`` / ``freeze`` /
+      ``yolo_levels`` for the P3(+P4+P5) multi-scale tap)
 
     Both honour the same ``(B, out_ch, H/8, W/8)`` contract.
     """
@@ -197,7 +231,8 @@ def build_camera_backbone(
     if key in ("efficientnet", "effnet", "default"):
         return _EfficientNetBackbone(out_ch=out_ch)
     if key in ("yolo", "yolo26"):
-        return YOLOBackbone(weights=weights, freeze=freeze, out_dim=out_ch)
+        return YOLOBackbone(weights=weights, freeze=freeze, out_dim=out_ch,
+                            levels=yolo_levels)
     raise ValueError(
         f"unknown camera backbone {name!r}; expected 'efficientnet' or 'yolo26'"
     )
@@ -481,6 +516,7 @@ class MonoBEVConfig:
     img_backbone: str = "efficientnet"  # "efficientnet" | "yolo26"
     yolo_weights: str = "yolo26n.pt"  # used when img_backbone == "yolo26"
     yolo_freeze: bool = False  # freeze YOLO backbone+neck weights
+    yolo_levels: str = "p3"  # YOLO multi-scale tap: "p3" | "p3p4" | "p3p4p5"
     img_backbone_out: int = 256  # channels out of shared backbone
     context_channels: int = G.CAMERA_BEV_CHANNELS  # C  semantic feature depth
 
@@ -528,6 +564,7 @@ class MonoBEV(nn.Module):
         self.backbone = build_camera_backbone(
             c.img_backbone, out_ch=c.img_backbone_out,
             weights=c.yolo_weights, freeze=c.yolo_freeze,
+            yolo_levels=c.yolo_levels,
         )
 
         mid = c.img_backbone_out
@@ -600,8 +637,17 @@ class StereoBEVConfig:
     img_backbone: str = "efficientnet"  # "efficientnet" | "yolo26"
     yolo_weights: str = "yolo26n.pt"  # used when img_backbone == "yolo26"
     yolo_freeze: bool = False  # freeze YOLO backbone+neck weights
+    yolo_levels: str = "p3"  # YOLO multi-scale tap: "p3" | "p3p4" | "p3p4p5"
     img_backbone_out: int = 256  # channels out of shared backbone
     context_channels: int = G.CAMERA_BEV_CHANNELS  # C  — feature depth splatted to BEV
+
+    # ---- depth → context feature (feed grounded depth into the context head) ----
+    # When True the metric depth + a validity mask are concatenated (at 1/8 res)
+    # onto the backbone features before the context head, so the splatted
+    # features are geometry-aware ("features see the depth"). No BEV-projection
+    # change — the splat still emits ``context_channels``. Default off = the
+    # architecture / old checkpoints are unchanged.
+    use_depth_context: bool = False
 
     # ---- depth filtering ----
     min_depth_m: float = 0.5
@@ -645,11 +691,18 @@ class StereoBEV(nn.Module):
         self.backbone = build_camera_backbone(
             c.img_backbone, out_ch=mid,
             weights=c.yolo_weights, freeze=c.yolo_freeze,
+            yolo_levels=c.yolo_levels,
         )
 
-        # context head: (B, mid, H', W') → (B, C, H', W')
+        # context head: (B, mid[+2], H', W') → (B, C, H', W'). With
+        # use_depth_context the grounded depth + validity mask are appended to
+        # the backbone features (see forward), so the first conv sees mid + 2
+        # input channels; the output width (C) — and thus the splat contract —
+        # is unchanged.
+        self.use_depth_context = c.use_depth_context
+        ctx_in = mid + (2 if c.use_depth_context else 0)
         self.context_head = nn.Sequential(
-            nn.Conv2d(mid, mid, 3, padding=1, bias=False),
+            nn.Conv2d(ctx_in, mid, 3, padding=1, bias=False),
             nn.BatchNorm2d(mid),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid, C, 1),
@@ -682,13 +735,22 @@ class StereoBEV(nn.Module):
         shared = self.backbone(image)  # (B, mid, H', W')
         stride = image.shape[-1] // shared.shape[-1]  # e.g. 8
 
-        # Step 2: context features
-        context = self.context_head(shared)  # (B, C, H', W')
-
-        # Step 3: downsample depth to backbone resolution
+        # Step 2: downsample depth to backbone resolution (nearest keeps the hard
+        # metric measurement; 0 stays 0 so the validity mask is exact)
         _, _, Hf, Wf = shared.shape
         depth_small = F.interpolate(depth, size=(Hf, Wf),
                                     mode="nearest")  # (B, 1, H', W')
+
+        # Step 3: context features. Optionally give the head the geometry it is
+        # about to be splatted with: normalised depth + validity as 2 extra
+        # channels (image-space, no BEV projection). Output width (C) unchanged.
+        if self.use_depth_context:
+            depth_norm = depth_small / self.cfg.max_depth_m  # ~[0, 1]
+            valid_ch = (depth_small > 0).float()             # 1 where measured
+            ctx_in = torch.cat([shared, depth_norm, valid_ch], dim=1)
+        else:
+            ctx_in = shared
+        context = self.context_head(ctx_in)  # (B, C, H', W')
 
         # Step 4: scale K to backbone feature resolution
         K_small = K.clone()
@@ -819,7 +881,9 @@ class StereoBEVBranch(nn.Module):
         img_t = TF.to_tensor(image)  # HWC uint8 -> CHW float in [0, 1]
         # Backbone-specific normalisation: ImageNet stats for the CNN backbone,
         # plain [0, 1] for YOLO (which expects /255 with no mean/std subtraction).
-        if self.cfg.img_backbone == "efficientnet":
+        # Test for YOLO (the odd one out) so every EfficientNet alias
+        # ("effnet"/"default") normalises — matching build_camera_backbone.
+        if self.cfg.img_backbone.lower() not in ("yolo", "yolo26"):
             img_t = TF.normalize(img_t,
                                  mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])

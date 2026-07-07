@@ -30,12 +30,12 @@ back into [`docs/experiments.md`](docs/experiments.md).
 - [x] **Patch-based split** — `train.split_patches(dataset, val_frac, patch_len, seed, gap)` chops each drive into contiguous `patch_len` patches and assigns whole patches per-scene (less leakage than per-frame — only patch boundaries straddle the split, and `gap` buffers even those; more balanced than whole-log — every drive feeds both sides). Notebook knob `SPLIT_MODE="patch"` (+ `PATCH_LEN/PATCH_VAL_FRAC/PATCH_GAP`, snapshotted into `config.json`). **Drive 0010 (kitti360_val) stays an untouched test set** — never patched; evaluate on it separately.
 
 **Phase 1 — attack overfitting** (the actual bottleneck: best-val ~epoch 2)
-- [ ] **Weight decay** (AdamW) + **BEV augmentation** (rotation/flip/scale) — see *Training quality* below.
-- [ ] **Dropout** in the head / BEV backbone.
+- [x] **Weight decay** (AdamW) — `train_model(weight_decay=…)` switched Adam→AdamW (decoupled L2; `0.0` ≡ plain Adam). Notebook knob `WEIGHT_DECAY`. Still TODO here: **BEV augmentation** (rotation/flip/scale) — see *Training quality* below.
+- [x] **Dropout** in the head / BEV backbone — `Dropout2d` in `CenterPointHead` (`dropout=`, threaded via `head_dropout` on Camera/LidarOnlyDetector) and `BEVBackbone2D` (`dropout=`). `p=0.0` default = no-op, no new state_dict keys (old checkpoints load). Notebook knob `HEAD_DROPOUT`. **First check whether overfitting is even real** (best-val epoch, train-vs-val gap in `metrics.csv`) before dialing these up.
 
 **Phase 2 — feature & capacity upgrades** (after Phase 1 + more data)
-- [ ] **YOLO neck P3+P4(+P5)** — concat multi-scale image features (the hook already captures all three); orthogonal, applies to every camera variant.
-- [ ] **Depth → context head** — concat depth + validity mask into the image context features at 1/8 res (image-space; **no BEV projection needed**). With SGBM/IGEV depth = "features see geometry"; with LiDAR depth = Pipeline B at feature level.
+- [x] **YOLO neck P3+P4(+P5)** — `YOLOBackbone(levels=…)` concats the selected neck taps (P4/P5 upsampled to P3, so the `H/8` output contract holds) before the 1×1 projection. Notebook knob `YOLO_LEVELS` (`"p3"` | `"p3p4"` | `"p3p4p5"`, snapshotted); `"p3"` default = current single-scale. Orthogonal — applies to every yolo26 camera variant.
+- [x] **Depth → context head** — `StereoBEV(use_depth_context=True)` concats the grounded metric depth (÷max_depth) + a validity mask onto the 1/8-res backbone features before the context head ("features see geometry"); splat width (C) unchanged, so fusion/head contract holds. Notebook knob `USE_DEPTH_CONTEXT`; `p=0`/off default adds no state_dict keys (old checkpoints load). A/B: off vs on.
 
 **Phase 3 — diagnostics / deferred**
 - [ ] **LiDAR range-map instead of stereo depth** — diagnostic *upper bound* on what better depth buys (uses LiDAR → not camera-only; not a deployment arm).
