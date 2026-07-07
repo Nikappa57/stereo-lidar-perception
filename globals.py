@@ -83,8 +83,9 @@ RIGHT_CAMERA: str = "pcam_stereo_r"
 #   * GENERIC_OBJECT (bigPole/smallPole/lamp/box/trashbin/vendingmachine) is a
 #     heterogeneous, noisy bucket (mostly thin poles) — **excluded**: those raw
 #     labels now fall into the ignore bucket (class_index -> None).
-#   * TRAIN is emitted but rare and only on drive 0010 (the val split) → it
-#     never appears in training; expect ~0 AP. Kept for taxonomy completeness.
+#   * TRAIN is emitted but rare and only on drive 0010 → **excluded**: with 0010
+#     as the val split it never appears in training (0 GT on drives 0003/0007/
+#     0009), so a TRAIN channel only wastes head capacity on a permanently-0 AP.
 # TRAFFIC_CONE (the Formula-Student deployment target) does not exist in
 # KITTI-360; it must come from AV2 (CONSTRUCTION_CONE) or CARLA later.
 CLASSES: tuple[str, ...] = (
@@ -92,7 +93,6 @@ CLASSES: tuple[str, ...] = (
     "PERSON",
     "TWO_WHEELER",
     "TRAFFIC_SIGN",
-    "TRAIN",
 )
 NUM_CLASSES: int = len(CLASSES)
 

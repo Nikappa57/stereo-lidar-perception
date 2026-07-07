@@ -1,16 +1,45 @@
 # TODO — Stereo + LiDAR BEV Fusion
 
 Output: **2D BEV `(x, y) + class`** (no yaw/z). Metric: center-distance
-**AP @0.5/1/2/4 m**. Dataset: **KITTI-360**, **5-class unified**
-(`VEHICLE / PERSON / TWO_WHEELER / TRAFFIC_SIGN / TRAIN`). Split by drive:
-train `0003+0007+0009`, val `0010`.
+**AP @0.5/1/2/4 m**. Dataset: **KITTI-360**, **4-class**
+(`VEHICLE / PERSON / TWO_WHEELER / TRAFFIC_SIGN`; TRAIN dropped — 0 GT on the
+train drives). Split by drive: train `0003+0007+0009`, val `0010`.
+Only **VEHICLE** and **TRAFFIC_SIGN** have enough GT to learn/eval;
+PERSON/TWO_WHEELER are sparse — compare **per-class AP**, not just mAP.
 
 ---
+
+TEST efficient network instead of yolo26
 
 ## ▶ Now — collect the numbers
 
 - [ ] Train **camera** baseline + **pipeline_a / b / c** (`training.ipynb`, same split/seed).
 - [ ] Run **Pipeline D** (§8b) and fill the **`confronto.ipynb`** table (baselines vs fusion).
+
+## Camera-branch experiments (active)
+
+Test each modification in isolation (one variable, fixed seed/split) and read
+the delta from the auto-saved run dirs (`runs/<name>_<ts>/`, compared in §9).
+Data is tiny + overfitting-dominated, so single-run gaps are often noise — use
+≥2–3 seeds and judge on **per-class AP** (VEHICLE / TRAFFIC_SIGN). Fold outcomes
+back into [`docs/experiments.md`](docs/experiments.md).
+
+**Phase 0 — measurement rig** (do before trusting any comparison)
+- [x] **Run-dir autosave** (ultralytics-style) — `train.create_run` + `train_model(run_dir=…)` write `weights/{best,last}.pt`, `metrics.csv` (loss + P/R/F1/mAP per epoch), `results.json`, `summary.txt`, `plots/`, `config.json` (+ git SHA); `utils.save_eval_artifacts`.
+- [x] **Decoder NMS** — greedy within-class **metric radius** removes duplicate peaks on large objects (a car holds several the 3×3 max-pool misses). Knob `NMS_RADIUS_BY_CLASS`; default off. A/B: `{}` vs `{0:2.0,1:0.5,2:1.0,3:0.5}`.
+- [x] **Patch-based split** — `train.split_patches(dataset, val_frac, patch_len, seed, gap)` chops each drive into contiguous `patch_len` patches and assigns whole patches per-scene (less leakage than per-frame — only patch boundaries straddle the split, and `gap` buffers even those; more balanced than whole-log — every drive feeds both sides). Notebook knob `SPLIT_MODE="patch"` (+ `PATCH_LEN/PATCH_VAL_FRAC/PATCH_GAP`, snapshotted into `config.json`). **Drive 0010 (kitti360_val) stays an untouched test set** — never patched; evaluate on it separately.
+
+**Phase 1 — attack overfitting** (the actual bottleneck: best-val ~epoch 2)
+- [ ] **Weight decay** (AdamW) + **BEV augmentation** (rotation/flip/scale) — see *Training quality* below.
+- [ ] **Dropout** in the head / BEV backbone.
+
+**Phase 2 — feature & capacity upgrades** (after Phase 1 + more data)
+- [ ] **YOLO neck P3+P4(+P5)** — concat multi-scale image features (the hook already captures all three); orthogonal, applies to every camera variant.
+- [ ] **Depth → context head** — concat depth + validity mask into the image context features at 1/8 res (image-space; **no BEV projection needed**). With SGBM/IGEV depth = "features see geometry"; with LiDAR depth = Pipeline B at feature level.
+
+**Phase 3 — diagnostics / deferred**
+- [ ] **LiDAR range-map instead of stereo depth** — diagnostic *upper bound* on what better depth buys (uses LiDAR → not camera-only; not a deployment arm).
+- [ ] **Loss tweaks** — class weighting for imbalance, Gaussian-radius / offset-weight tuning; defer until a specific symptom appears.
 
 ## Eval extensions
 

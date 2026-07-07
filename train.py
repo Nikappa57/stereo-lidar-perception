@@ -485,6 +485,73 @@ def split_frames(dataset, val_scenes: "int | list[int]" = 1) -> tuple[list, list
     return train_frames, val_frames
 
 
+def split_patches(dataset, *, val_frac: float = 0.2, patch_len: int = 100,
+                  seed: int = 0, gap: int = 0) -> tuple[list, list]:
+    """Split a dataset into train/val by **contiguous frame patches**.
+
+    Each scene is chopped into consecutive patches of ``patch_len`` frames and
+    whole patches are assigned to train or val. This sits between the two
+    extremes we otherwise have to choose from:
+
+    * A **per-frame** random split *leaks*: a val frame's temporal neighbours
+      land in train, so the model has effectively already seen it (consecutive
+      timesteps of one drive are near-identical) and the AP is optimistic.
+    * A **whole-log** split (:func:`split_frames`) doesn't leak but is
+      *unbalanced*: a class that lives mostly on one drive lands entirely on one
+      side, and with few drives val may miss a class the model was trained on.
+
+    Patch-splitting keeps almost every neighbour on the same side — only the two
+    frames either side of a patch boundary straddle the split — while letting
+    **every drive feed both train and val**, so the class mix stays balanced.
+    Set ``gap>0`` to drop a buffer of that many frames on each side of every
+    train↔val boundary and remove even that residual adjacency.
+
+    Assignment is per-scene (each scene contributes ~``val_frac`` of its patches
+    to val) and reproducible for a given ``seed``. Note this is orthogonal to the
+    *test* set: keep the untouched held-out drive (KITTI-360 ``0010``) as its own
+    named split and never feed it here — patch only the training drives.
+
+    :param val_frac: target fraction of frames (via whole patches) held out to val.
+    :param patch_len: frames per contiguous patch. Larger ⇒ fewer boundaries
+        (less leakage) but coarser balance; ~a few seconds of driving is typical.
+    :param seed: seeds which patches within each scene go to val.
+    :param gap: frames dropped on each side of a train↔val boundary (buffer).
+    :returns: ``(train_frames, val_frames)`` — lists of :class:`~data.Frame`.
+    """
+    assert 0.0 < val_frac < 1.0, f"val_frac must be in (0, 1), got {val_frac}"
+    assert patch_len > 0, "patch_len must be positive"
+    rng = random.Random(seed)
+    train_frames, val_frames = [], []
+    for scene_index in range(dataset.scene_count):
+        frames = list(dataset.frames_in_scene(scene_index))
+        n = len(frames)
+        if n == 0:
+            continue
+        patches = [(s, min(s + patch_len, n)) for s in range(0, n, patch_len)]
+        # ≥1 val patch per multi-patch scene so every drive reaches val; a scene
+        # short enough to be one patch stays whole (goes to train).
+        n_val = max(1, round(val_frac * len(patches))) if len(patches) > 1 else 0
+        val_pids = set(rng.sample(range(len(patches)), n_val))
+        label: list[str | None] = [None] * n
+        for pid, (s, e) in enumerate(patches):
+            tag = "val" if pid in val_pids else "train"
+            for k in range(s, e):
+                label[k] = tag
+        if gap > 0:  # null out a buffer around every train<->val boundary
+            drop = set()
+            for k in range(1, n):
+                if label[k] != label[k - 1]:
+                    drop.update(range(max(0, k - gap), min(n, k + gap)))
+            for j in drop:
+                label[j] = None
+        for k, frame in enumerate(frames):
+            if label[k] == "val":
+                val_frames.append(frame)
+            elif label[k] == "train":
+                train_frames.append(frame)
+    return train_frames, val_frames
+
+
 # Training needs neither the images (LiDAR path; the camera branch reads the
 # precomputed stereo cache) nor the LiDAR-in-box mask — skipping both cuts
 # sample assembly from ~0.9 s to ~30 ms (see to_stereo_sample docstring).
@@ -494,14 +561,26 @@ FAST_SAMPLE_KWARGS = {"load_images": False, "point_mask": False}
 def validate(model: nn.Module, frames, *, input_fn=None,
              encoder: "TargetEncoder | None" = None,
              sample_kwargs: dict | None = None,
-             device: torch.device = torch.device("cpu")) -> float:
-    """Mean :class:`CenterPointLoss` over ``frames`` (no grad, eval mode)."""
+             report: bool = False, score_threshold: float = 0.1,
+             device: torch.device = torch.device("cpu")):
+    """Mean :class:`CenterPointLoss` over ``frames`` (no grad, eval mode).
+
+    With ``report=True`` the same forward pass *also* decodes each frame and
+    returns ``(mean_loss, ap_report)`` — so detection P/R/F1/mAP come for free
+    alongside the loss (no second pass). Default returns the mean loss (float).
+    Detection metrics use a plain decoder (no NMS radius) at ``score_threshold``.
+    """
     input_fn = input_fn or (lambda s: s)
     encoder = encoder or TargetEncoder()
     sample_kwargs = FAST_SAMPLE_KWARGS if sample_kwargs is None else sample_kwargs
     loss_fn = CenterPointLoss()
     model.eval()
     losses = []
+    if report:
+        from evaluation import (CenterPointDecoder, _build_report,
+                                _det_to_numpy, frame_ground_truth)
+        decoder = CenterPointDecoder(score_threshold=score_threshold)
+        frame_dets, frame_gts = [], []
     with torch.no_grad():
         for frame in frames:
             sample = frame.to_stereo_sample(**sample_kwargs)
@@ -509,13 +588,91 @@ def validate(model: nn.Module, frames, *, input_fn=None,
             pred = model(input_fn(sample), device=device)
             loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
             losses.append(float(loss))
-    return sum(losses) / max(1, len(losses))
+            if report:
+                det = decoder(pred["heatmap"].cpu(), pred["offset"].cpu())[0]
+                frame_dets.append(_det_to_numpy(det))
+                frame_gts.append(frame_ground_truth(sample))
+    mean = sum(losses) / max(1, len(losses))
+    if report:
+        return mean, _build_report(frame_dets, frame_gts)
+    return mean
+
+
+def create_run(config: dict, base_dir: str | Path = "runs") -> Path:
+    """Create an ultralytics-style run directory and snapshot the config.
+
+    Layout::
+
+        runs/<name>_<timestamp>/
+        ├── config.json     # the passed config + git SHA + timestamp
+        ├── weights/        # best.pt / last.pt (written by train_model)
+        └── plots/          # loss_curves.png, evaluation.png (train/eval)
+
+    ``config["name"]`` (or ``config["model"]``) seeds the dir name. Returns the
+    run dir; pass it to :func:`train_model` (``run_dir=``) and
+    :func:`utils.save_eval_artifacts`.
+    """
+    import datetime
+    import json
+    import subprocess
+
+    name = config.get("name") or config.get("model", "run")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(base_dir) / f"{name}_{ts}"
+    (run_dir / "weights").mkdir(parents=True, exist_ok=True)
+    (run_dir / "plots").mkdir(parents=True, exist_ok=True)
+    try:  # provenance: which commit produced this run
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent, text=True,
+            stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        sha = None
+    meta = dict(config)
+    meta.update(git_sha=sha, created=ts)
+    (run_dir / "config.json").write_text(json.dumps(meta, indent=2, default=str))
+    print(f"run dir: {run_dir}")
+    return run_dir
+
+
+def _append_metrics(path: Path, row: dict) -> None:
+    """Append one epoch's metrics to a CSV (writing the header on first call)."""
+    new = not path.exists()
+    with open(path, "a") as f:
+        if new:
+            f.write(",".join(row.keys()) + "\n")
+        f.write(",".join(f"{v:.6f}" if isinstance(v, float) else str(v)
+                         for v in row.values()) + "\n")
+
+
+def _save_loss_curves(path: Path, history: dict) -> None:
+    """Save the per-step + per-epoch loss curves as a PNG (no display).
+
+    Uses ``matplotlib.figure.Figure`` directly (not pyplot) so it renders
+    headless without a display and without touching the caller's backend — the
+    notebook keeps its inline backend, scripts don't need X/Qt.
+    """
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(13, 4))
+    ax = fig.subplots(1, 2)
+    ax[0].plot(history["steps"], alpha=0.6)
+    ax[0].set_yscale("log")
+    ax[0].set_title("per-step loss")
+    ax[0].set_xlabel("step")
+    ax[1].plot(history["train"], "o-", label="train")
+    ax[1].plot(history["val"], "s-", label="val")
+    ax[1].set_title("per-epoch mean loss")
+    ax[1].set_xlabel("epoch")
+    ax[1].legend()
+    fig.savefig(path, dpi=110, bbox_inches="tight")
 
 
 def train_model(model: nn.Module, train_frames, val_frames, *,
                 input_fn=None, epochs: int = 5, lr: float = 1e-3,
                 accum: int = 4, encoder: "TargetEncoder | None" = None,
-                ckpt_path: str | Path | None = None, log_every: int = 50,
+                ckpt_path: str | Path | None = None,
+                run_dir: str | Path | None = None,
+                val_metrics: bool = True, log_every: int = 50,
                 seed: int = 0, sample_kwargs: dict | None = None,
                 device: torch.device = torch.device("cpu")) -> dict:
     """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
@@ -545,6 +702,10 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
     sample_kwargs = FAST_SAMPLE_KWARGS if sample_kwargs is None else sample_kwargs
     loss_fn = CenterPointLoss()
     model.to(device)
+    if run_dir is not None:
+        run_dir = Path(run_dir)
+        if ckpt_path is None:  # default best-checkpoint destination
+            ckpt_path = run_dir / "weights" / "best.pt"
     opt = torch.optim.Adam(
         (p for p in model.parameters() if p.requires_grad), lr=lr)
     rng = random.Random(seed)
@@ -555,7 +716,9 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         tgt_hm, tgt_off = encode_sample(sample, encoder)
         return input_fn(sample), tgt_hm, tgt_off
 
-    history: dict = {"train": [], "val": [], "steps": []}
+    history: dict = {"train": [], "val": [], "steps": [],
+                     "val_precision": [], "val_recall": [], "val_f1": [],
+                     "val_mAP": []}
     best_val = float("inf")
     for epoch in range(1, epochs + 1):
         model.train()
@@ -581,13 +744,34 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                           f"loss {float(loss):.3f}")
 
         train_mean = total / max(1, len(order))
-        val_mean = validate(model, val_frames, input_fn=input_fn,
-                            encoder=encoder, sample_kwargs=sample_kwargs,
-                            device=device)
+        # one val pass; with val_metrics it also decodes -> detection P/R/F1/mAP
+        if val_metrics:
+            val_mean, val_report = validate(
+                model, val_frames, input_fn=input_fn, encoder=encoder,
+                sample_kwargs=sample_kwargs, report=True, device=device)
+            p, r = val_report["precision"], val_report["recall"]
+            f1, mAP = val_report["f1"], val_report["mAP"]
+        else:
+            val_mean = validate(model, val_frames, input_fn=input_fn,
+                                encoder=encoder, sample_kwargs=sample_kwargs,
+                                device=device)
+            p = r = f1 = mAP = float("nan")
         history["train"].append(train_mean)
         history["val"].append(val_mean)
+        for key, v in (("val_precision", p), ("val_recall", r),
+                       ("val_f1", f1), ("val_mAP", mAP)):
+            history[key].append(v)
         print(f"epoch {epoch}/{epochs}  train {train_mean:.3f}  "
-              f"val {val_mean:.3f}")
+              f"val {val_mean:.3f}" +
+              (f"  |  P {p:.3f} R {r:.3f} F1 {f1:.3f} mAP {mAP:.3f}"
+               if val_metrics else ""))
+
+        if run_dir is not None:  # last.pt + per-epoch metrics row every epoch
+            torch.save({"model": model.state_dict(), "epoch": epoch,
+                        "val_loss": val_mean}, run_dir / "weights" / "last.pt")
+            _append_metrics(run_dir / "metrics.csv", {
+                "epoch": epoch, "train_loss": train_mean, "val_loss": val_mean,
+                "precision": p, "recall": r, "f1": f1, "mAP": mAP})
 
         if ckpt_path is not None and val_mean < best_val:
             best_val = val_mean
@@ -596,4 +780,7 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
             torch.save({"model": model.state_dict(), "epoch": epoch,
                         "val_loss": val_mean}, ckpt)
             print(f"  new best val — checkpoint saved → {ckpt}")
+
+    if run_dir is not None:
+        _save_loss_curves(run_dir / "plots" / "loss_curves.png", history)
     return history

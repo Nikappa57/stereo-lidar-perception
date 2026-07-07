@@ -147,12 +147,15 @@ def configure_dataset_paths(data_root: str | Path | None = None) -> Path:
     print(f"DEBUG: PY123D_DATA_ROOT resolved to {resolved}", flush=True)
 
     os.environ["PY123D_DATA_ROOT"] = str(resolved)
-    # The raw KITTI-360 sensor blobs live in ``<repo>/KITTI-360`` (calibration/
-    # data_2d_raw/data_3d_raw), NOT under the logs root — point KITTI360_DATA_ROOT
-    # there when present, before the generic fill-in below defaults it to ``resolved``.
-    kitti360_root = _REPO_ROOT / "KITTI-360"
-    if kitti360_root.is_dir():
-        os.environ.setdefault("KITTI360_DATA_ROOT", str(kitti360_root))
+    # The raw KITTI-360 sensor blobs (calibration/ data_2d_raw/ data_3d_raw) live
+    # in a ``KITTI-360`` dir, NOT under the logs root — point KITTI360_DATA_ROOT
+    # there when present, before the generic fill-in below defaults it to
+    # ``resolved``. Check the data root first (``<root>/KITTI-360``, e.g.
+    # ``dataset/KITTI-360``), then the repo top level (``<repo>/KITTI-360``).
+    for kitti360_root in (resolved / "KITTI-360", _REPO_ROOT / "KITTI-360"):
+        if kitti360_root.is_dir():
+            os.environ.setdefault("KITTI360_DATA_ROOT", str(kitti360_root))
+            break
     for env_var in _DATASET_ROOT_ENV_VARS:
         # ``setdefault`` keeps user-provided roots; only fills in the gaps.
         os.environ.setdefault(env_var, str(resolved))
