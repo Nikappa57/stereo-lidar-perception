@@ -130,6 +130,7 @@ class YOLOBackbone(nn.Module):
         weights: str = "yolo26n.pt",
         freeze: bool = False,
         out_dim: int = 256,
+        unfreeze_last: int = 0,
     ):
         super().__init__()
         from ultralytics import YOLO  # lazy: only the YOLO path needs it
@@ -143,9 +144,26 @@ class YOLOBackbone(nn.Module):
         self.head.register_forward_pre_hook(self._grab)
 
         self._frozen = freeze
+        # top-level layer indices left trainable while the rest stays frozen
+        self._trainable_layers: set[int] = set()
         if freeze:
             for p in self.det.parameters():
                 p.requires_grad_(False)
+            if unfreeze_last > 0:
+                # Fine-tune the last `unfreeze_last` neck layers **that produce
+                # P3** — the only feature we keep (tapped via the hook). The
+                # Detect head takes [P3, P4, P5] from three taps (head.f); its P4
+                # /P5 branch and the head itself feed nothing we use, so a naive
+                # "last layers before the head" window would sit off the P3 path
+                # and get *zero* gradient. We anchor on P3's source layer
+                # (head.f[0]) and walk back along the neck instead.
+                layers = list(self.det.model)  # DetectionModel.model: Sequential
+                p3_src = int(self.head.f[0])  # e.g. 16 on yolo26n
+                start = max(0, p3_src - unfreeze_last + 1)
+                self._trainable_layers = set(range(start, p3_src + 1))
+                for i in self._trainable_layers:
+                    for p in layers[i].parameters():
+                        p.requires_grad_(True)
             self.det.eval()  # freeze BatchNorm running stats too (see train())
 
         # discover P3's channel count with one dummy pass, then size the 1x1
@@ -155,16 +173,20 @@ class YOLOBackbone(nn.Module):
         self.proj = nn.Conv2d(c3, out_dim, 1)
 
     def train(self, mode: bool = True):
-        """Keep a frozen backbone in eval mode regardless of parent ``.train()``.
+        """Keep the frozen part of the backbone in eval mode.
 
         Freezing weights (``requires_grad=False``) does *not* stop BatchNorm from
         updating its running mean/var in train mode, which would drift the
         pretrained statistics. When frozen we hold ``self.det`` in eval so only
-        the trainable ``proj`` (and everything downstream) sees train mode.
+        the trainable ``proj`` (and everything downstream) sees train mode. With
+        partial unfreeze (``unfreeze_last``) the unfrozen layers follow ``mode``
+        so their BatchNorm adapts, while the frozen bulk stays in eval.
         """
         super().train(mode)
         if self._frozen:
             self.det.eval()
+            for i in self._trainable_layers:
+                self.det.model[i].train(mode)
         return self
 
     def _grab(self, module: nn.Module, args: tuple) -> None:
@@ -183,6 +205,7 @@ def build_camera_backbone(
     *,
     weights: str = "yolo26n.pt",
     freeze: bool = False,
+    unfreeze_last: int = 0,
 ) -> nn.Module:
     """Factory for the Stage 1 camera backbone (the one swappable image stem).
 
@@ -197,7 +220,8 @@ def build_camera_backbone(
     if key in ("efficientnet", "effnet", "default"):
         return _EfficientNetBackbone(out_ch=out_ch)
     if key in ("yolo", "yolo26"):
-        return YOLOBackbone(weights=weights, freeze=freeze, out_dim=out_ch)
+        return YOLOBackbone(weights=weights, freeze=freeze, out_dim=out_ch,
+                            unfreeze_last=unfreeze_last)
     raise ValueError(
         f"unknown camera backbone {name!r}; expected 'efficientnet' or 'yolo26'"
     )
@@ -481,6 +505,7 @@ class MonoBEVConfig:
     img_backbone: str = "efficientnet"  # "efficientnet" | "yolo26"
     yolo_weights: str = "yolo26n.pt"  # used when img_backbone == "yolo26"
     yolo_freeze: bool = False  # freeze YOLO backbone+neck weights
+    yolo_unfreeze_last: int = 0  # if frozen, keep the last N neck layers trainable
     img_backbone_out: int = 256  # channels out of shared backbone
     context_channels: int = G.CAMERA_BEV_CHANNELS  # C  semantic feature depth
 
@@ -528,6 +553,7 @@ class MonoBEV(nn.Module):
         self.backbone = build_camera_backbone(
             c.img_backbone, out_ch=c.img_backbone_out,
             weights=c.yolo_weights, freeze=c.yolo_freeze,
+            unfreeze_last=c.yolo_unfreeze_last,
         )
 
         mid = c.img_backbone_out
@@ -584,6 +610,55 @@ class MonoBEV(nn.Module):
         return bev
 
 
+class DepthContextNet(nn.Module):
+    """Inject the stereo depth into the camera context features (depth pre-BEV).
+
+    Lorenzo's "depth pre-BEV": today the grounded camera branch *positions*
+    splatted features with the raw SGBM/IGEV depth, but the feature *values*
+    never see that depth — and because the splat assigns cells with a hard
+    ``.long()`` index, the depth→position path carries **no gradient**, so a
+    residual-on-depth net could never train. We therefore exploit stereo on the
+    differentiable side: this small CNN encodes the raw depth + validity mask
+    into a feature map added (residually) to the image features *before* the
+    context head, so the splatted features carry geometry and the detection loss
+    trains "how to read depth". The grounded positions still use the raw metric
+    depth (lift unchanged) — this only enriches the features.
+
+    The output conv is zero-initialised, so at init the injected residual is 0
+    (identity — reproduces the raw-depth baseline) and training departs smoothly.
+    Off by default (:attr:`StereoBEVConfig.refine_depth`) — no extra state_dict
+    keys, architecture + old checkpoints unchanged unless opted in.
+    """
+
+    def __init__(self, feat_ch: int, hidden: int = 32,
+                 max_depth_m: float = 80.0):
+        super().__init__()
+        self.max_depth_m = max_depth_m
+        # input = [normalised depth, validity mask] → feat_ch residual
+        self.net = nn.Sequential(
+            nn.Conv2d(2, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, feat_ch, 1),
+        )
+        # Tiny (not zero) last-layer init: the residual starts ~0 so we depart
+        # from the raw-depth baseline, but a nonzero weight lets gradient reach
+        # every layer from step 1 (pure zeros would starve the upstream convs).
+        nn.init.normal_(self.net[-1].weight, std=1e-3)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, feats: torch.Tensor,
+                depth: torch.Tensor) -> torch.Tensor:
+        """feats: (B, feat_ch, h, w) image features; depth: (B, 1, h, w) raw
+        metric depth (0 = invalid). Returns feats + depth-derived residual."""
+        valid = (depth > 0).float()
+        depth_norm = (depth / self.max_depth_m).clamp(0.0, 1.0) * valid
+        return feats + self.net(torch.cat([depth_norm, valid], dim=1))
+
+
 @dataclass
 class StereoBEVConfig:
     """Hyper-parameters for the grounded stereo-depth BEV pipeline.
@@ -600,8 +675,13 @@ class StereoBEVConfig:
     img_backbone: str = "efficientnet"  # "efficientnet" | "yolo26"
     yolo_weights: str = "yolo26n.pt"  # used when img_backbone == "yolo26"
     yolo_freeze: bool = False  # freeze YOLO backbone+neck weights
+    yolo_unfreeze_last: int = 0  # if frozen, keep the last N neck layers trainable
     img_backbone_out: int = 256  # channels out of shared backbone
     context_channels: int = G.CAMERA_BEV_CHANNELS  # C  — feature depth splatted to BEV
+
+    # ---- depth pre-BEV: inject stereo depth into the context features ----
+    refine_depth: bool = False  # True → DepthContextNet before the context head
+    refine_hidden: int = 32  # hidden channels in the depth-injection CNN
 
     # ---- depth filtering ----
     min_depth_m: float = 0.5
@@ -645,6 +725,7 @@ class StereoBEV(nn.Module):
         self.backbone = build_camera_backbone(
             c.img_backbone, out_ch=mid,
             weights=c.yolo_weights, freeze=c.yolo_freeze,
+            unfreeze_last=c.yolo_unfreeze_last,
         )
 
         # context head: (B, mid, H', W') → (B, C, H', W')
@@ -654,6 +735,12 @@ class StereoBEV(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(mid, C, 1),
         )
+
+        # optional depth→context injection before the lift (depth pre-BEV)
+        self.depth_refine = (
+            DepthContextNet(mid, hidden=c.refine_hidden,
+                            max_depth_m=c.max_depth_m)
+            if c.refine_depth else None)
 
         # BEV CNN refinement (same as MonoBEV)
         self.bev_backbone = BEVBackbone2D(in_channels=C, out_channels=C)
@@ -682,13 +769,20 @@ class StereoBEV(nn.Module):
         shared = self.backbone(image)  # (B, mid, H', W')
         stride = image.shape[-1] // shared.shape[-1]  # e.g. 8
 
-        # Step 2: context features
-        context = self.context_head(shared)  # (B, C, H', W')
-
-        # Step 3: downsample depth to backbone resolution
+        # Step 2: downsample depth to backbone resolution
         _, _, Hf, Wf = shared.shape
         depth_small = F.interpolate(depth, size=(Hf, Wf),
                                     mode="nearest")  # (B, 1, H', W')
+
+        # Step 2b: depth→context injection (depth pre-BEV) — enrich the image
+        # features with the stereo depth before the context head, so the
+        # splatted features carry geometry and the loss trains on it. Trainable
+        # even with a frozen backbone (the injection net is separate).
+        if self.depth_refine is not None:
+            shared = self.depth_refine(shared, depth_small)
+
+        # Step 3: context features (now depth-aware when refinement is on)
+        context = self.context_head(shared)  # (B, C, H', W')
 
         # Step 4: scale K to backbone feature resolution
         K_small = K.clone()
@@ -1454,13 +1548,15 @@ class BEVDetector(nn.Module):
 
     def __init__(self,
                  cfg: BEVFusionConfig | None = None,
-                 fusion_cls: type[BEVFusion] = ConcatConvFusion):
+                 fusion_cls: type[BEVFusion] = ConcatConvFusion,
+                 head_dropout: float = 0.0):
         super().__init__()
         self.cfg = cfg or BEVFusionConfig()
         self.fusion = fusion_cls(self.cfg)
         self.head = CenterPointHead(self.cfg.out_channels,
                                     self.cfg.num_classes,
-                                    self.cfg.head_channels)
+                                    self.cfg.head_channels,
+                                    dropout=head_dropout)
 
     @classmethod
     def from_bev_maps(
@@ -1608,13 +1704,15 @@ class Pipeline(nn.Module):
 
     def __init__(self, num_classes: int = G.NUM_CLASSES,
                  stereo_cache_root=None,
-                 stereo_cfg: "StereoBEVConfig | None" = None):
+                 stereo_cfg: "StereoBEVConfig | None" = None,
+                 head_dropout: float = 0.0):
         super().__init__()
         self.lidar_branch = PointPillarsBranch(PillarConfig())
         self.camera_branch = StereoBEVBranch(cfg=stereo_cfg,
                                              cache_root=stereo_cache_root)
         self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes),
-                                    fusion_cls=type(self).fusion_cls)
+                                    fusion_cls=type(self).fusion_cls,
+                                    head_dropout=head_dropout)
         self.drop_branch: str | None = None  # None | "camera" | "lidar"
         self.debug = False
         self.intermediates: dict[str, torch.Tensor] = {}
