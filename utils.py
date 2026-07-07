@@ -566,6 +566,39 @@ def visualize_stereo_bev_diagnostic(model, sample, device=None,
     plt.show()
 
 
+def save_eval_artifacts(run_dir, report: dict) -> None:
+    """Dump an eval report into a run dir (ultralytics-style artifacts).
+
+    Writes ``results.json`` (full report), ``plots/evaluation.png`` (the PR /
+    F1 / confusion panel) and a grep-able ``summary.txt`` (mAP + per-class mean
+    AP + macro P/R/F1). Pair with :func:`train.create_run` / ``train_model``.
+    """
+    from pathlib import Path
+
+    from evaluation import save_report
+
+    run_dir = Path(run_dir)
+    (run_dir / "plots").mkdir(parents=True, exist_ok=True)
+    save_report(report, run_dir / "results.json")
+    visualize_evaluation(report, save_path=str(run_dir / "plots" / "evaluation.png"))
+
+    op = report.get("op_threshold_m", 2.0)
+    lines = [
+        f"frames: {report.get('n_frames', '?')}",
+        f"mAP: {report.get('mAP', float('nan')):.4f}",
+        f"macro @ {op:g} m  P {report.get('precision', float('nan')):.3f} "
+        f"R {report.get('recall', float('nan')):.3f} "
+        f"F1 {report.get('f1', float('nan')):.3f}",
+        f"mean centre err (TP@{op:g}m): {report.get('mean_error_m', float('nan')):.3f} m",
+        "",
+        "per-class mean AP:",
+    ]
+    for name, row in report.get("per_class", {}).items():
+        mean = row.get("mean", float("nan"))
+        lines.append(f"  {name:<14}{mean:>7.4f}  (n_gt {row.get('n_gt', 0)})")
+    (run_dir / "summary.txt").write_text("\n".join(lines) + "\n")
+
+
 def visualize_evaluation(report: dict, save_path: str | None = None):
     """Diagnostic panel for an :func:`evaluation.evaluate_model` report.
 
