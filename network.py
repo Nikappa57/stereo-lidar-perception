@@ -211,8 +211,12 @@ class BEVBackbone2D(nn.Module):
     over the fused grid lives in :class:`ConcatConvFusion`'s conv stack instead.
     """
 
-    def __init__(self, in_channels: int = 64, out_channels: int = 128):
+    def __init__(self, in_channels: int = 64, out_channels: int = 128,
+                 dropout: float = 0.0):
         super().__init__()
+        # Dropout2d after the mid ReLU regularizes the shared BEV features.
+        # p=0.0 (default) is a no-op passthrough with no state_dict keys, so the
+        # architecture + old checkpoints are unchanged unless opted in.
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
@@ -220,6 +224,7 @@ class BEVBackbone2D(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
             nn.Conv2d(64, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
@@ -1410,12 +1415,18 @@ class CenterPointHead(nn.Module):
     def __init__(self,
                  in_channels: int,
                  num_classes: int,
-                 head_channels: int = 64):
+                 head_channels: int = 64,
+                 dropout: float = 0.0):
         super().__init__()
+        # Spatial (channel-wise) dropout on the shared features regularizes the
+        # head against the tiny dataset. Dropout2d(0.0) is a no-op passthrough
+        # and adds no state_dict keys, so dropout=0 leaves old checkpoints and
+        # the architecture unchanged (the default — opt in via config).
         self.shared = nn.Sequential(
             nn.Conv2d(in_channels, head_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(head_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
         )
         self.heatmap = nn.Conv2d(head_channels, num_classes, 1)
         self.offset = nn.Conv2d(head_channels, 2, 1)
@@ -1508,10 +1519,12 @@ class LidarOnlyDetector(nn.Module):
     """
 
     def __init__(self, pillar_cfg: PillarConfig | None = None,
-                 num_classes: int = G.NUM_CLASSES):
+                 num_classes: int = G.NUM_CLASSES,
+                 head_dropout: float = 0.0):
         super().__init__()
         self.branch = PointPillarsBranch(pillar_cfg or PillarConfig())
-        self.head = CenterPointHead(LIDAR_BEV_CHANNELS, num_classes)
+        self.head = CenterPointHead(LIDAR_BEV_CHANNELS, num_classes,
+                                    dropout=head_dropout)
 
     def forward(self, points: np.ndarray,
                 device: torch.device = torch.device("cpu")
@@ -1533,11 +1546,13 @@ class CameraOnlyDetector(nn.Module):
 
     def __init__(self, num_classes: int = G.NUM_CLASSES,
                  stereo_cache_root=None,
-                 stereo_cfg: "StereoBEVConfig | None" = None):
+                 stereo_cfg: "StereoBEVConfig | None" = None,
+                 head_dropout: float = 0.0):
         super().__init__()
         self.branch = StereoBEVBranch(cfg=stereo_cfg,
                                       cache_root=stereo_cache_root)
-        self.head = CenterPointHead(CAMERA_BEV_CHANNELS, num_classes)
+        self.head = CenterPointHead(CAMERA_BEV_CHANNELS, num_classes,
+                                    dropout=head_dropout)
 
     def forward(self, sample,
                 device: torch.device = torch.device("cpu")

@@ -669,7 +669,8 @@ def _save_loss_curves(path: Path, history: dict) -> None:
 
 def train_model(model: nn.Module, train_frames, val_frames, *,
                 input_fn=None, epochs: int = 5, lr: float = 1e-3,
-                accum: int = 4, encoder: "TargetEncoder | None" = None,
+                accum: int = 4, weight_decay: float = 0.0,
+                encoder: "TargetEncoder | None" = None,
                 ckpt_path: str | Path | None = None,
                 run_dir: str | Path | None = None,
                 val_metrics: bool = True, log_every: int = 50,
@@ -706,8 +707,11 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         run_dir = Path(run_dir)
         if ckpt_path is None:  # default best-checkpoint destination
             ckpt_path = run_dir / "weights" / "best.pt"
-    opt = torch.optim.Adam(
-        (p for p in model.parameters() if p.requires_grad), lr=lr)
+    # AdamW so weight_decay is decoupled (true L2 regularization, not folded
+    # into the adaptive moment). weight_decay=0.0 (default) ≡ plain Adam.
+    opt = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=lr, weight_decay=weight_decay)
     rng = random.Random(seed)
     order = list(range(len(train_frames)))
 
