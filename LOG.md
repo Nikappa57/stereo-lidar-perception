@@ -248,7 +248,7 @@ class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
 -----------------------------------------------------------
 VEHICLE       0.123   0.424   0.644   0.684   0.469  805
 PERSON        0.002   0.002   0.002   0.002   0.002  18
-TWO_WHEELER   —       —       —       —       —      0
+TWO_WHEELER   #### 6) DEPTH + P3P4—       —       —       —       —      0
 TRAFFIC_SIGN  0.124   0.174   0.185   0.200   0.171  274
 
 F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
@@ -270,4 +270,28 @@ mAP 0.205 | macro P 0.312 R 0.340 F1 0.325 @2 m | mean centre error (TP@2m) 0.59
 ![alt text](docs/img/train/train2-result.png)
 
 ![alt text](docs/img/train/train2-example.png)
+
+#### 7) DEPTH + P3
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.172   0.454   0.633   0.677   0.484  805
+PERSON        0.000   0.000   0.000   0.000   0.000  18
+TWO_WHEELER   —       —       —       —       —      0
+TRAFFIC_SIGN  0.092   0.132   0.134   0.147   0.126  274
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.703   0.625   0.661   0.206   
+PERSON        0.000   0.000   0.000   0.132   
+TWO_WHEELER   —       —       —       —       
+TRAFFIC_SIGN  0.241   0.318   0.274   0.205   
+
+mAP 0.204 | macro P 0.315 R 0.314 F1 0.312 @2 m | mean centre error (TP@2m) 0.651 m | 1010 frames
+
+![alt text](docs/img/train/train3-result.png)
+![alt text](docs/img/train/train3-example.png)
+
+
 
