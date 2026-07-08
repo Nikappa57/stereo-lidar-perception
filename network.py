@@ -1145,6 +1145,7 @@ class BEVFusionConfig:
                      int] = G.GRID_SIZE  # (nx, ny), shared by both branches
     num_classes: int = G.NUM_CLASSES  # set by the class filter (doc §05)
     head_channels: int = 64
+    use_gaussian_attn: bool = G.USE_GAUSSIAN_ATTN
 
     @classmethod
     def from_bev_maps(cls, bev_camera: torch.Tensor, bev_lidar: torch.Tensor,
@@ -1223,7 +1224,6 @@ class ConcatConvFusion(BEVFusion):
         return self.block(torch.cat([cam, lid],
                                     dim=1))  # (B, out_channels, nx, ny)
 
-
 class _WindowCrossAttention(nn.Module):
     """Windowed cross-attention: camera queries attend to LiDAR keys/values.
 
@@ -1247,6 +1247,11 @@ class _WindowCrossAttention(nn.Module):
     out_dim : output channel depth.
     num_heads : attention heads (must divide ``out_dim``).
     win_h, win_w : window size in BEV cells.
+    use_gaussian_attn : if True, replace the dot-product similarity with a
+        Gaussian kernel (negative pairwise-L2 distance) as in UniCorrn Eq. 5:
+        ``A = Softmax(-Pair_L2(Q, K) / D)``. Captures non-linear correlations
+        and is scale-invariant to feature magnitude, unlike the linear
+        dot-product kernel used by vanilla attention.
     """
 
     def __init__(
@@ -1257,6 +1262,7 @@ class _WindowCrossAttention(nn.Module):
         num_heads: int = 4,
         win_h: int = 8,
         win_w: int = 8,
+        use_gaussian_attn: bool = False,
     ):
         super().__init__()
         self.win_h = win_h
@@ -1271,28 +1277,28 @@ class _WindowCrossAttention(nn.Module):
         self.out_proj = nn.Linear(out_dim, out_dim, bias=False)
         self.norm_q   = nn.LayerNorm(out_dim)
         self.norm_kv  = nn.LayerNorm(out_dim)
-        self.scale    = (out_dim // num_heads) ** -0.5
+
+        self.use_gaussian_attn = use_gaussian_attn
+        head_dim = out_dim // num_heads
+        # Dot-product attention: scale = 1/sqrt(d)  (standard scaled dot-product)
+        # Gaussian attention:     scale = 1/d        (matches Pair_L2(...) / D in the paper)
+        self.scale = head_dim ** -0.5 if not use_gaussian_attn else 1.0 / head_dim
 
         # ---- Learnable relative position bias (Swin-style) ----
-        # One scalar per (Δrow, Δcol, head). Table has (2·wh-1)·(2·ww-1) rows.
-        # Initialised near zero with small std so it starts as a mild prior.
         self.rel_pos_bias_table = nn.Parameter(
             torch.zeros((2 * win_h - 1) * (2 * win_w - 1), num_heads)
         )
         nn.init.trunc_normal_(self.rel_pos_bias_table, std=0.02)
 
-        # Relative position index for every (query, key) token pair in one
-        # window — shape (n, n) where n = win_h * win_w.  Precomputed once and
-        # stored as a non-learnable buffer so it travels with `.to(device)`.
         coords_h = torch.arange(win_h)
         coords_w = torch.arange(win_w)
         grid = torch.stack(
-            torch.meshgrid(coords_h, coords_w, indexing="ij"))   # (2, wh, ww)
-        flat = grid.reshape(2, -1)                                # (2, n)
-        rel  = flat[:, :, None] - flat[:, None, :]               # (2, n, n)
-        rel[0] += win_h - 1                                       # shift to ≥ 0
+            torch.meshgrid(coords_h, coords_w, indexing="ij"))
+        flat = grid.reshape(2, -1)
+        rel  = flat[:, :, None] - flat[:, None, :]
+        rel[0] += win_h - 1
         rel[1] += win_w - 1
-        rel_idx = rel[0] * (2 * win_w - 1) + rel[1]              # (n, n)
+        rel_idx = rel[0] * (2 * win_w - 1) + rel[1]
         self.register_buffer("relative_position_index", rel_idx)
 
     # ------------------------------------------------------------------
@@ -1311,8 +1317,8 @@ class _WindowCrossAttention(nn.Module):
         _, _, Hp, Wp = x.shape
         nwh, nww = Hp // wh, Wp // ww
         x = x.reshape(B, C, nwh, wh, nww, ww)
-        x = x.permute(0, 2, 4, 3, 5, 1)           # (B, nwh, nww, wh, ww, C)
-        x = x.reshape(B * nwh * nww, wh * ww, C)   # (B*nW, n, C)
+        x = x.permute(0, 2, 4, 3, 5, 1)
+        x = x.reshape(B * nwh * nww, wh * ww, C)
         return x, Hp, Wp
 
     def _unpartition(
@@ -1323,44 +1329,61 @@ class _WindowCrossAttention(nn.Module):
         C = x.shape[-1]
         nwh, nww = Hp // wh, Wp // ww
         x = x.reshape(B, nwh, nww, wh, ww, C)
-        x = x.permute(0, 5, 1, 3, 2, 4)            # (B, C, nwh, wh, nww, ww)
+        x = x.permute(0, 5, 1, 3, 2, 4)
         return x.reshape(B, C, Hp, Wp)
 
     # ------------------------------------------------------------------
+    def _pairwise_neg_l2(self, Q: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        """Negative squared L2 distance between every (query, key) pair.
+
+        Q, K : (nW_B, h, n, d)  ->  returns (nW_B, h, n, n)
+
+        Uses the expansion ||q-k||^2 = ||q||^2 + ||k||^2 - 2*q.k, which is
+        just as cheap as the dot-product path (one extra matmul-free norm
+        term per side) and avoids materialising an (n, n, d) tensor.
+        """
+        q_sq = Q.pow(2).sum(dim=-1, keepdim=True)          # (nW_B, h, n, 1)
+        k_sq = K.pow(2).sum(dim=-1, keepdim=True)           # (nW_B, h, n, 1)
+        cross = Q @ K.transpose(-2, -1)                      # (nW_B, h, n, n)
+        dist2 = q_sq + k_sq.transpose(-2, -1) - 2.0 * cross
+        return -dist2.clamp_min(0.0)  # clamp for numerical safety (fp error can make dist2 slightly < 0)
+
     def forward(self, cam: torch.Tensor, lid: torch.Tensor) -> torch.Tensor:
         """cam: (B, q_dim, H, W), lid: (B, kv_dim, H, W) -> (B, out_dim, H, W)."""
         B, _, H, W = cam.shape
 
-        cam_w, Hp, Wp = self._partition(cam)   # (B*nW, n, q_dim)
-        lid_w, _,  _  = self._partition(lid)   # (B*nW, n, kv_dim)
+        cam_w, Hp, Wp = self._partition(cam)
+        lid_w, _,  _  = self._partition(lid)
 
-        Q = self.norm_q( self.q_proj(cam_w))   # (B*nW, n, E)
+        Q = self.norm_q( self.q_proj(cam_w))
         K = self.norm_kv(self.k_proj(lid_w))
         V = self.v_proj(lid_w)
 
         nW_B, n, E = Q.shape
         hd = E // self.num_heads
 
-        # Multi-head attention
         Q = Q.reshape(nW_B, n, self.num_heads, hd).transpose(1, 2)  # (nW_B, h, n, d)
         K = K.reshape(nW_B, n, self.num_heads, hd).transpose(1, 2)
         V = V.reshape(nW_B, n, self.num_heads, hd).transpose(1, 2)
 
-        attn = (Q @ K.transpose(-2, -1)) * self.scale   # (nW_B, h, n, n)
+        if self.use_gaussian_attn:
+            # Gaussian kernel attention (UniCorrn Eq. 5):
+            # A = Softmax( -Pair_L2(Q, K) / D )
+            attn = self._pairwise_neg_l2(Q, K) * self.scale   # (nW_B, h, n, n)
+        else:
+            # Standard scaled dot-product attention (linear kernel)
+            attn = (Q @ K.transpose(-2, -1)) * self.scale
 
         # relative position bias: look up table -> (n*n, h) -> (h, n, n)
-        # NOTE: use the `n` captured before the multi-head reshape (= win_h * win_w),
-        # not Q.shape[1] which is num_heads after the .transpose(1, 2) above.
         bias = self.rel_pos_bias_table[
-            self.relative_position_index.view(-1)]               # (n*n, h)
-        bias = bias.view(n, n, self.num_heads).permute(2, 0, 1).contiguous()  # (h, n, n)
-        attn = (attn + bias.unsqueeze(0)).softmax(dim=-1)        # (nW_B, h, n, n)
+            self.relative_position_index.view(-1)]
+        bias = bias.view(n, n, self.num_heads).permute(2, 0, 1).contiguous()
+        attn = (attn + bias.unsqueeze(0)).softmax(dim=-1)
 
         out = (attn @ V).transpose(1, 2).reshape(nW_B, n, E)
         out = self.out_proj(out)
 
-        # Unpartition and trim padding
-        out = self._unpartition(out, B, Hp, Wp)   # (B, E, Hp, Wp)
+        out = self._unpartition(out, B, Hp, Wp)
         return out[..., :H, :W]
 
 
@@ -1424,6 +1447,7 @@ class CrossAttentionFusion(BEVFusion):
             num_heads=num_heads,
             win_h=win_h,
             win_w=win_w,
+            use_gaussian_attn=cfg.use_gaussian_attn
         )
 
         # 3. Near/far gate: 1x1 conv on cat([cam_proj, lid_proj]) -> scalar
@@ -1796,12 +1820,14 @@ class Pipeline(nn.Module):
 
     def __init__(self, num_classes: int = G.NUM_CLASSES,
                  stereo_cache_root=None,
-                 stereo_cfg: "StereoBEVConfig | None" = None):
+                 stereo_cfg: "StereoBEVConfig | None" = None,
+                 use_gaussian_attn: bool = G.USE_GAUSSIAN_ATTN):
         super().__init__()
         self.lidar_branch = PointPillarsBranch(PillarConfig())
         self.camera_branch = StereoBEVBranch(cfg=stereo_cfg,
                                              cache_root=stereo_cache_root)
-        self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes),
+        self.detector = BEVDetector(BEVFusionConfig(num_classes=num_classes,
+                                                    use_gaussian_attn=use_gaussian_attn),
                                     fusion_cls=type(self).fusion_cls)
         self.drop_branch: str | None = None  # None | "camera" | "lidar"
         self.debug = False
