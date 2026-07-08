@@ -221,9 +221,13 @@ print("Fused BEV shape: ", model.intermediates["fused"].shape)       # (128, 200
 ```
 
 ### 6.3 Diagnostic Visualization & Verification
-Because Pipeline C introduces non-trivial gating and cross-attention dynamics, `tests/test_network.py` and `utils.py` provide specialized verification suites:
+Because Pipeline C introduces non-trivial gating and cross-attention dynamics, `tests/test_network.py`, `tests/test_overfit.py` and `utils.py` provide specialized verification suites:
 * **Gradient Verification (`test_cross_attention_gradients_flow`):** Confirms that loss gradients backpropagate cleanly through the window partitioning, attention projection matrices (`q_proj`, `k_proj`, `v_proj`), and the sigmoid near/far gate.
 * **Visual Inspection (`save_fusion_figure`):** Generates a 4-panel comparison rendering the mean absolute activation of `bev_camera`, `bev_lidar`, `fused`, and the final CenterPoint heatmap against ground-truth ego bounding box centers.
+* **Overfit sanity (`tests/test_overfit.py`):** drives encoder → model → loss → backward → decoder on one real frame until the GT centres are recovered, for both `PipelineA` (`ConcatConvFusion`) and `PipelineC` (`CrossAttentionFusion`):
+
+  ![Pipeline A overfit output](img/overfit_fused_output.png)
+  ![Pipeline C overfit output](img/overfit_pipeline_c_output.png)
 
 ---
 

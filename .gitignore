@@ -255,3 +255,7 @@ igev_cache.tar
 
 # Vendored IGEV-Stereo code + weights (large; fetch/rebuild, do not commit)
 third_party/
+
+# Local-only tooling — kept out of git going forward (share by hand if needed)
+scripts/
+igev_matcher.py

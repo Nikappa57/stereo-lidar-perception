@@ -4,7 +4,12 @@ Documentation for the **data loading** stage of `stereo-lidar-perception`, plus
 everything we verified about the `py123d` dataset library while building it.
 
 All facts below were confirmed against **`py123d` 0.5.1** and the local
-Argoverse 2 Sensor sample in `data/` (5 validation logs).
+Argoverse 2 Sensor sample this reference was originally written against.
+**KITTI-360 is now the project's primary dataset** (see
+[dataset.md](dataset.md) for why); the `py123d` API, `data.py` contract and
+gotchas below are dataset-agnostic and apply unchanged — only the dataset
+name, split names and `KITTI360_DATA_ROOT` env var differ (see
+[start-viser-viewer.md](start-viser-viewer.md) for the KITTI-360 env setup).
 
 ---
 

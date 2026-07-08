@@ -106,8 +106,12 @@ out = detector(bev_camera, bev_lidar)
 
 ---
 
-## 7. What's next
+## 7. Status
 
-The target side of this contract is now in place: `train.TargetEncoder` rasterises the ego-frame GT boxes (`StereoSample.boxes_3d_ego` centres + class) into the **same** `heatmap (num_classes, nx, ny)` + `offset (2, nx, ny)` tensors the head produces, `train.CenterPointLoss` scores them (Gaussian-focal heatmap + masked L1 offset), and `evaluation.CenterPointDecoder` inverts the head output back to metric ego `(x, y)` + class. The encode→decode round-trip is covered by `tests/test_encoder_decoder.py`, and `train.overfit_one_frame` drives the whole loop (encoder → head → loss → backward → decode) on one frame.
+The full contract is now exercised end to end: `train.TargetEncoder` rasterises the ego-frame GT boxes (`StereoSample.boxes_3d_ego` centres + class) into the **same** `heatmap (num_classes, nx, ny)` + `offset (2, nx, ny)` tensors the head produces, `train.CenterPointLoss` scores them (Gaussian-focal heatmap + masked L1 offset), `train.train_model` runs the multi-frame training loop over a real KITTI-360 split, and `evaluation.CenterPointDecoder` + `evaluation.evaluate_model` invert the head output back to metric ego `(x, y)` + class and score it with distance-AP. The encode→decode round-trip is covered by `tests/test_encoder_decoder.py`; `tests/test_overfit.py` drives the whole loop (encoder → head → loss → backward → decode) on one frame; `training.ipynb` runs it over the full dataset. Current baseline + Pipeline A numbers: [`depth_study_and_baselines.md`](depth_study_and_baselines.md).
 
-The remaining gap is the **multi-frame training loop + AP/CDS evaluation harness** (TODO P1): batch the branches over a real train split, then score the single-sensor baselines and the fused detector with distance-AP.
+`tests/test_network.py` (`save_fusion_figure`) renders the fused BEV end to end on a real frame:
+
+![BEV fusion test output](img/bev_fusion_test_output.png)
+
+Remaining gap: the **CDS composite metric** and per-range AP bins.

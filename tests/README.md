@@ -24,3 +24,17 @@ Flags: `--split`, `--scene`, `--iteration`, `--camera pcam_f0`, `--max-scenes N`
 `--save PATH` (saves a 9-camera grid), `--no-show`.
 
 Paths default to the repo `data/` dir, so no env vars are needed.
+
+## Other test files
+
+Each has the same two-mode pattern (`pytest` = headless assertions, `python
+tests/<file>.py` = a runnable visual check saved under `docs/img/`):
+
+- `test_stereo.py` — SGBM rectification/disparity/depth + stereo-vs-LiDAR
+  accuracy check (`data.py`).
+- `test_network.py` — BEV fusion + head shape/contract guards, random-tensor
+  fast tests, plus a real-frame fused-BEV figure (`network.py`).
+- `test_encoder_decoder.py` — GT boxes survive the encode→decode round-trip
+  (`train.TargetEncoder` ↔ `evaluation.CenterPointDecoder`).
+- `test_overfit.py` — end-to-end sanity: overfit one real frame
+  (LiDAR-only / Pipeline A / Pipeline C) and recover the GT centres.

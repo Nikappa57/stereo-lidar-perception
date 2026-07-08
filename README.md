@@ -112,18 +112,18 @@ Six modules (the prescribed layout):
 | `train.py` | BEV target encoder (`TargetEncoder`), CenterPoint loss (Gaussian-focal heatmap + masked L1 offset), single-frame overfit harness + multi-frame training loop (`train_model`). |
 | `evaluation.py` | `CenterPointDecoder` (max-pool NMS → metric `(x, y)` + class + score), center-distance AP (`evaluate_model` @0.5/1/2/4 m, per class), `evaluate_late_fusion` (Pipeline D), and `save_report`/`save_history` (the on-disk record). CDS *(TODO)*. |
 
-### Notebooks
+### Notebook
 
-All notebooks live in [`notebooks/`](notebooks/) and are thin wiring over the `.py` modules (which stay at the repo root — the prescribed 6-module layout). Each starts with a one-line *repo-root bootstrap* cell, so it runs whether the kernel's working directory is `notebooks/` or the repo root. Split by role:
+[`training.ipynb`](training.ipynb) (repo root) is the single entry point — thin wiring over the `.py` modules, which stay at the repo root (the prescribed 6-module layout). Set `MODEL = "lidar" | "camera" | "mono" | "pipeline_a"` and re-run:
 
-| Notebook | Role |
-| --- | --- |
-| `notebooks/training.ipynb` | **Train** every model (set `MODEL` = `lidar` / `camera` / `pipeline_a` / `pipeline_b` / `pipeline_c`, re-run). Each run writes `checkpoints/<model>.pt`, `results/<model>.json` (AP report) and `results/<model>_history.json` (loss curves). §8b runs **Pipeline D** (late fusion of the lidar + camera checkpoints). |
-| `notebooks/{lidar,camera,pipeline_a,pipeline_b,pipeline_c,pipeline_d}.ipynb` | **Presentation, one per model** — they *don't train*: they load that model's `results/*.json` + checkpoint and render loss curves, the AP table, PR/F1/confusion diagnostics and qualitative BEV detections. Figures are written to `docs/img/`. Keep each one's outputs to have a persistent, shareable page per model. |
-| `notebooks/confronto.ipynb` | **Comparison hub** — loads every `results/*.json` into one AP table, per-class AP bars, overall-mAP + fusion-gain chart, and overlaid validation curves. Reads only from disk. |
-| `notebooks/debug_network.ipynb` | **Dev tool** — inspect any intermediate network output (stage-level debug panel, `record_activations` taps, single-frame overfit sanity). |
+1. **Train** — writes `runs/<name>_<timestamp>/` (`weights/{best,last}.pt`, `metrics.csv`, `results.json`, `plots/loss_curves.png`, `config.json`).
+2. **Test** — distance-AP on the held-out split, PR/F1 curves, qualitative BEV detections, a stereo→BEV diagnostic (does the net *see* objects but fail to *place* them?).
+3. **Branch-contribution ablation** (fused runs only) — zero one BEV branch at inference to bound its marginal contribution.
+4. **Compare** — loads every `runs/*/results.json` into one AP table / per-class bars / loss-curve overlay. Pure disk read, no re-evaluation.
 
-`results/*.json` is the single source of truth for the numbers; graphs are regenerated from it (not stored as the primary artifact), so they never go stale.
+`Pipeline B/C` exist in `network.py` but aren't wired into the notebook yet. `Pipeline D` (late fusion of separately-trained lidar + camera checkpoints) is scored via `evaluation.evaluate_late_fusion`, not a network class.
+
+`results/*.json` / `runs/*/results.json` are the single source of truth for the numbers; graphs are regenerated from them (not stored as the primary artifact), so they never go stale.
 
 ## Evaluation
 
