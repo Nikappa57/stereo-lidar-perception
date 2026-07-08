@@ -452,3 +452,67 @@ TRAFFIC_SIGN  0.586   0.254   0.355   0.342
 mAP 0.437 | macro P 0.590 R 0.470 F1 0.511 @2 m | mean centre error (TP@2m) 0.339 m | 3026 frames
 
 ![alt text](image-1.png)
+
+#### 9) PIPELINE A, depth-ctx
+
+runs/pipeline_a_yolo26_igev_20260707_203755 — git 68414af
+
+PipelineA: 1,364,294 trainable | 2,572,280 frozen (yolo26 backbone)
+
+EPOCHS=50, PATIENCE=50, but the run only got to 7 epochs (best-val checkpoint = epoch 3, lowest val_loss 2.224; val_loss climbs after that — overfitting past ep3). ~3h48m wall clock.
+
+![alt text](docs/img/train/train4-loss.png)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.583   0.696   0.745   0.760   0.696  15975
+PERSON        0.407   0.410   0.414   0.426   0.414  2911
+TWO_WHEELER   0.332   0.372   0.381   0.395   0.370  2090
+TRAFFIC_SIGN  0.287   0.292   0.302   0.318   0.300  1503
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.741   0.802   0.771   0.198   
+PERSON        0.492   0.450   0.470   0.188   
+TWO_WHEELER   0.471   0.404   0.435   0.193   
+TRAFFIC_SIGN  0.398   0.319   0.354   0.233   
+
+mAP 0.445 | macro P 0.526 R 0.494 F1 0.507 @2 m | mean centre error (TP@2m) 0.325 m | 3026 frames
+
+![alt text](docs/img/train/train4-result.png)
+
+![alt text](docs/img/train/train4-example.png)
+
+#### 10) PIPELINE A, no depth-ctx
+
+runs/pipeline_a_yolo26_igev_20260708_004840 — git 378f6c9
+
+PipelineA: 1,359,686 trainable | 2,572,280 frozen (yolo26 backbone)
+
+Same config as #9 minus depth context (use_depth_context=false). EPOCHS=50, PATIENCE=5 — ran 8 epochs and stopped on patience (best-val checkpoint = epoch 3, lowest val_loss 2.184). ~3h34m wall clock.
+
+![alt text](docs/img/train/train5-loss.png)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.590   0.703   0.757   0.773   0.706  15975
+PERSON        0.438   0.446   0.448   0.465   0.449  2911
+TWO_WHEELER   0.278   0.332   0.352   0.367   0.332  2090
+TRAFFIC_SIGN  0.277   0.283   0.292   0.312   0.291  1503
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.760   0.773   0.767   0.216   
+PERSON        0.540   0.468   0.501   0.186   
+TWO_WHEELER   0.395   0.427   0.410   0.213   
+TRAFFIC_SIGN  0.415   0.285   0.338   0.254   
+
+mAP 0.4445 | macro P 0.528 R 0.488 F1 0.504 @2 m | mean centre error (TP@2m) 0.329 m | 3026 frames
+
+![alt text](docs/img/train/train5-result.png)
+
+![alt text](docs/img/train/train5-example.png)
+
+Depth context vs not: near-identical mAP (0.445 vs 0.4445). Depth-ctx wins TWO_WHEELER (+0.038 mean AP) and TRAFFIC_SIGN (+0.009); no-depth-ctx wins PERSON (+0.035) and VEHICLE (+0.010). Both beat PIPELINE C no-depth (#8, mAP 0.437) on mAP and centre error, on 5.4k fewer trainable params — but #8's macro F1 (0.511) and precision (0.590) are still the best of the three, driven by TRAFFIC_SIGN precision (0.586 vs 0.398/0.415).
