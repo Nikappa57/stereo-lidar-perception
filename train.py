@@ -204,26 +204,31 @@ class CenterPointLoss(nn.Module):
 # =========================================================================== #
 # The trainable assemblies live in network.py: LidarOnlyDetector (baseline),
 # PipelineA / PipelineB / PipelineC (branches + fusion + head, end-to-end).
-def encode_sample(sample, encoder: "TargetEncoder", *, flip: bool = False
+def encode_sample(sample, encoder: "TargetEncoder", *, aug=None
                   ) -> tuple[torch.Tensor, torch.Tensor]:
     """StereoSample → batched ``(heatmap, offset)`` targets.
 
     Applies the globals class remap (dropping ignored classes) and the BEV-grid
     filter, then encodes — the same recipe the consistency test/visualiser use.
 
-    ``flip`` mirrors the GT box centres across ego-y (negate y) — the *target*
-    half of the BEV horizontal-flip augmentation, whose *input* half is
-    ``flip=True`` on the model forward (see ``network._MIRROR_Y``). The
-    CenterPoint encoder keys only on the box centre, so negating y is the whole
-    transform: no heatmap/offset channel surgery, and the sub-cell offset comes
-    out correct because the encoder re-derives it from the mirrored centre. Must
-    use the *same* per-frame coin as the input flip, or target and input
-    disagree.
+    ``aug`` is the ``(4, 4)`` ego-frame BEV-augmentation matrix (from
+    :func:`network.build_aug_matrix`) — the *target* half of the augmentation
+    whose *input* half is ``aug=`` on the model forward. It is applied to the GT
+    box **centres** (``M @ [x, y, z, 1]``); the CenterPoint encoder keys only on
+    the centre, so that is the whole transform — no heatmap/offset channel
+    surgery, and the sub-cell offset comes out right because the encoder
+    re-derives it from the transformed centre. (Heading/size are untouched — the
+    centre-point target does not use them.) Must use the *same* per-frame matrix
+    as the input, or target and input disagree.
     """
     boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)
-    if flip and len(boxes) > 0:
+    if aug is not None and len(boxes) > 0:
         boxes = boxes.clone()
-        boxes[:, 1] = -boxes[:, 1]  # mirror centres across ego-y (BEV flip aug)
+        M = torch.as_tensor(aug, dtype=torch.float32)
+        xyz1 = torch.cat(
+            [boxes[:, :3], torch.ones((len(boxes), 1), dtype=torch.float32)],
+            dim=1)                                    # (n, 4)
+        boxes[:, :3] = (xyz1 @ M.T)[:, :3]            # transform centres (BEV aug)
     idx = [G.class_index(l) for l in sample.boxes_3d_labels]
     if len(boxes) == 0:  # frames with no GT (common on KITTI-360, sparse labels)
         return (torch.zeros((1, G.NUM_CLASSES, encoder.nx, encoder.ny)),
@@ -695,6 +700,8 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                 seed: int = 0, sample_kwargs: dict | None = None,
                 patience: "int | None" = None, min_delta: float = 0.0,
                 augment: bool = False, flip_p: float = 0.5,
+                rot_deg: float = 0.0,
+                scale_range: "tuple[float, float] | None" = None,
                 device: torch.device = torch.device("cpu")) -> dict:
     """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
 
@@ -715,15 +722,19 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         for :class:`network.LidarOnlyDetector`.
     :param patience: stop after this many consecutive epochs with no val-loss
         improvement (> ``min_delta``); ``None`` (default) disables early stop.
-    :param augment: enable BEV horizontal-flip augmentation (train only). Each
-        train frame is independently mirrored across ego-y with prob ``flip_p``:
-        the model forward gets ``flip=True`` (mirrors LiDAR points + the camera
-        extrinsic, so the whole branch processes a mirrored scene) and the
-        target is encoded from mirrored box centres — the two share one coin so
-        they stay aligned. ``False`` (default) reproduces prior runs bit-for-bit
-        (the coin is short-circuited, so the RNG stream is untouched). Val is
-        never augmented.
-    :param flip_p: per-frame flip probability when ``augment`` (default 0.5).
+    :param augment: enable BEV augmentation (train only). Each train frame gets
+        one ego-frame transform (:func:`network.build_aug_matrix`) composing a
+        lateral flip (prob ``flip_p``), a yaw rotation (``±rot_deg``), and an
+        isotropic scale (``scale_range``). The *same* matrix drives the model
+        forward (``aug=`` — transforms LiDAR points + the camera extrinsic, so
+        the whole branch processes the augmented scene) and the target (box
+        centres), so they stay aligned. ``False`` (default) reproduces prior runs
+        bit-for-bit (no RNG draws are made). Val is never augmented.
+    :param flip_p: per-frame lateral-flip probability when ``augment`` (0.5).
+    :param rot_deg: max yaw rotation magnitude in degrees, sampled uniform in
+        ``[-rot_deg, +rot_deg]``; ``0.0`` (default) disables rotation.
+    :param scale_range: ``(lo, hi)`` isotropic-scale range sampled uniform;
+        ``None`` (default) disables scaling.
     :returns: history dict — per-epoch ``"train"`` / ``"val"`` mean losses and
         the per-step ``"steps"`` list (for plotting).
     """
@@ -746,15 +757,20 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
     rng = random.Random(seed)
     order = list(range(len(train_frames)))
 
-    def _prep(frame, flip=False):
-        sample = frame.to_stereo_sample(**sample_kwargs)
-        tgt_hm, tgt_off = encode_sample(sample, encoder, flip=flip)
-        return input_fn(sample), tgt_hm, tgt_off, flip
+    from network import build_aug_matrix
 
-    def _coin():
-        # short-circuits when augment=False, so the RNG stream (and thus every
-        # non-augmented run) is bit-identical to before this feature existed.
-        return augment and (rng.random() < flip_p)
+    def _prep(frame, aug=None):
+        sample = frame.to_stereo_sample(**sample_kwargs)
+        tgt_hm, tgt_off = encode_sample(sample, encoder, aug=aug)
+        return input_fn(sample), tgt_hm, tgt_off, aug
+
+    def _sample_aug():
+        # Returns None when augment=False (no RNG draws), so the stream — and
+        # thus every non-augmented run — is bit-identical to before this feature.
+        if not augment:
+            return None
+        return build_aug_matrix(rng, flip_p=flip_p, rot_deg=rot_deg,
+                                scale_range=scale_range)
 
     history: dict = {"train": [], "val": [], "steps": [],
                      "val_precision": [], "val_recall": [], "val_f1": [],
@@ -767,13 +783,13 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         opt.zero_grad()
         total = 0.0
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_prep, train_frames[order[0]], _coin())
+            future = pool.submit(_prep, train_frames[order[0]], _sample_aug())
             for k in range(len(order)):
-                inputs, tgt_hm, tgt_off, flip = future.result()
+                inputs, tgt_hm, tgt_off, aug = future.result()
                 if k + 1 < len(order):  # prefetch the next frame
                     future = pool.submit(_prep, train_frames[order[k + 1]],
-                                         _coin())
-                pred = model(inputs, device=device, flip=flip)
+                                         _sample_aug())
+                pred = model(inputs, device=device, aug=aug)
                 loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
                 (loss / accum).backward()
                 if (k + 1) % accum == 0 or k == len(order) - 1:
