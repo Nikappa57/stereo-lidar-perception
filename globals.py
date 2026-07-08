@@ -47,6 +47,7 @@ GRID_SIZE: tuple[int, int] = grid_size()  # (200, 160) with defaults
 CAMERA_BEV_CHANNELS: int = 64  # C_cam — StereoBEV/MonoBEV context width
 LIDAR_BEV_CHANNELS: int = 128  # C_lidar — PointPillars BEVBackbone2D output
 FUSED_CHANNELS: int = 128  # fused feature depth fed to the head
+USE_GAUSSIAN_ATTN: bool = False  # Pipeline C cross-attention: Gaussian kernel vs dot-product
 
 # --------------------------------------------------------------------------- #
 # Dataset selection — single source of truth (flip these to swap datasets)
@@ -62,6 +63,7 @@ VAL_SPLIT: str = "kitti360_val"
 # so the id names are shared with AV2; only the split names above differ.
 LEFT_CAMERA: str = "pcam_stereo_l"
 RIGHT_CAMERA: str = "pcam_stereo_r"
+
 
 # --------------------------------------------------------------------------- #
 # Classes (design doc §05)
