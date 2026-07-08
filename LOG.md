@@ -516,3 +516,53 @@ mAP 0.4445 | macro P 0.528 R 0.488 F1 0.504 @2 m | mean centre error (TP@2m) 0.3
 ![alt text](docs/img/train/train5-example.png)
 
 Depth context vs not: near-identical mAP (0.445 vs 0.4445). Depth-ctx wins TWO_WHEELER (+0.038 mean AP) and TRAFFIC_SIGN (+0.009); no-depth-ctx wins PERSON (+0.035) and VEHICLE (+0.010). Both beat PIPELINE C no-depth (#8, mAP 0.437) on mAP and centre error, on 5.4k fewer trainable params — but #8's macro F1 (0.511) and precision (0.590) are still the best of the three, driven by TRAFFIC_SIGN precision (0.586 vs 0.398/0.415).
+
+
+#### 10) PIPELINE C, with depth
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.523   0.678   0.733   0.746   0.670  15975
+PERSON        0.325   0.330   0.335   0.348   0.334  2911
+TWO_WHEELER   0.242   0.285   0.290   0.302   0.280  2090
+TRAFFIC_SIGN  0.258   0.265   0.274   0.294   0.273  1503
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.745   0.795   0.769   0.191   
+PERSON        0.438   0.356   0.393   0.170   
+TWO_WHEELER   0.373   0.365   0.369   0.133   
+TRAFFIC_SIGN  0.397   0.279   0.327   0.261   
+
+mAP 0.389 | macro P 0.488 R 0.449 F1 0.465 @2 m | mean centre error (TP@2m) 0.359 m | 3026 frames
+
+![alt text](docs/img/train/train6-result.png)
+
+
+#### 10) PIPELINE C, with depth and gaussian attention
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.685   0.842   0.904   0.916   0.837  11232
+PERSON        0.350   0.382   0.390   0.409   0.383  1532
+TWO_WHEELER   0.233   0.275   0.286   0.308   0.276  1427
+TRAFFIC_SIGN  0.189   0.193   0.204   0.234   0.205  1077
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.886   0.833   0.859   0.265   
+PERSON        0.438   0.415   0.426   0.169   
+TWO_WHEELER   0.452   0.345   0.392   0.137   
+TRAFFIC_SIGN  0.348   0.272   0.306   0.233   
+
+mAP 0.425 | macro P 0.531 R 0.467 F1 0.496 @2 m | mean centre error (TP@2m) 0.348 m | 3125 frames
+
+stopped before
+
+![alt text](docs/img/train/train6-result.png)
+
+
+
+
