@@ -546,16 +546,10 @@ mAP 0.4445 | macro P 0.528 R 0.488 F1 0.504 @2 m | mean centre error (TP@2m) 0.3
 Depth context vs not: near-identical mAP (0.445 vs 0.4445). Depth-ctx wins TWO_WHEELER (+0.038 mean AP) and TRAFFIC_SIGN (+0.009); no-depth-ctx wins PERSON (+0.035) and VEHICLE (+0.010). Both beat PIPELINE C no-depth (#8, mAP 0.437) on mAP and centre error, on 5.4k fewer trainable params — but #8's macro F1 (0.511) and precision (0.590) are still the best of the three, driven by TRAFFIC_SIGN precision (0.586 vs 0.398/0.415).
 
 
-#### 11) PIPELINE C no gauss, depth
-patch
 
 
 
-
-
-
-
-#### 10) PIPELINE C, with depth
+#### 11) PIPELINE C, with depth
 
 class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
 -----------------------------------------------------------
@@ -577,7 +571,7 @@ mAP 0.389 | macro P 0.488 R 0.449 F1 0.465 @2 m | mean centre error (TP@2m) 0.35
 ![alt text](docs/img/train/train6-result.png)
 
 
-#### 10) PIPELINE C, with depth and gaussian attention
+#### 12) PIPELINE C, without depth and gaussian attention
 
 class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
 -----------------------------------------------------------
