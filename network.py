@@ -836,6 +836,7 @@ class StereoBEVBranch(nn.Module):
             sample: "StereoSample",
             device: torch.device = torch.device("cpu"),
             sd=None,
+            flip: bool = False,
     ) -> torch.Tensor:
         """Run the full stereo BEV branch on one sample.
 
@@ -855,7 +856,11 @@ class StereoBEVBranch(nn.Module):
             bundle = load_stereo_inputs(self.cache_root, sample.log_name,
                                         sample.iteration)
             if bundle is not None:
-                return self.forward_tensors(*bundle, device=device)
+                image, depth, K, T_cam2ego = bundle
+                if flip:  # BEV flip aug: mirror the splat across ego-y
+                    T_cam2ego = _MIRROR_Y @ T_cam2ego
+                return self.forward_tensors(image, depth, K, T_cam2ego,
+                                            device=device)
         if sd is None:
             if sample.image_left is None:
                 raise RuntimeError(
@@ -867,6 +872,8 @@ class StereoBEVBranch(nn.Module):
             sd = self._stereo_depth_memo(sample)
         image, depth, K, T_cam2ego = stereo_branch_inputs(
             sample, self.target_hw, self.sgbm_cfg, sd=sd)
+        if flip:  # BEV flip aug: mirror the splat across ego-y
+            T_cam2ego = _MIRROR_Y @ T_cam2ego
         return self.forward_tensors(image, depth, K, T_cam2ego, device=device)
 
     def forward_tensors(
@@ -1575,6 +1582,26 @@ def describe(detector: BEVDetector) -> None:
 # ===========================================================================
 # Pipelines — one trainable end-to-end class per design pipeline (doc §07)
 # ===========================================================================
+# Lateral (ego-y) mirror for the BEV horizontal-flip augmentation. Negating ego
+# y reflects the whole scene across the driving axis — a label-preserving
+# symmetry. Applied *consistently* to the three geometry sources so branch
+# outputs and targets stay aligned: LiDAR points (points.y), the camera
+# extrinsic (``T_cam2ego -> M @ T_cam2ego`` so the splat lands at mirrored y),
+# and the GT box centres (``train.encode_sample``). Left-multiplying T is right
+# because T maps camera->ego and we want the *ego* coords mirrored:
+# ``ego' = M @ (T @ p_cam)``. Flipping the branch *input* (not its output) means
+# the whole branch — splat + BEV CNN — processes the mirrored scene end to end,
+# which is what a real flipped example would produce.
+_MIRROR_Y = np.diag([1.0, -1.0, 1.0, 1.0]).astype(np.float32)
+
+
+def _flip_points_y(points: np.ndarray) -> np.ndarray:
+    """Return a copy of ``(N, >=2)`` points with ego-y negated (BEV flip aug)."""
+    flipped = points.copy()
+    flipped[:, 1] = -flipped[:, 1]
+    return flipped
+
+
 def lidar_points(sample) -> np.ndarray:
     """StereoSample → ``(N, 4)`` ``[x, y, z, intensity]`` for the LiDAR branch."""
     return np.concatenate(
@@ -1599,9 +1626,12 @@ class LidarOnlyDetector(nn.Module):
                                     dropout=head_dropout)
 
     def forward(self, points: np.ndarray,
-                device: torch.device = torch.device("cpu")
+                device: torch.device = torch.device("cpu"),
+                flip: bool = False,
                 ) -> dict[str, torch.Tensor]:
         self.to(device)  # keep weights with the requested device (no-op if there)
+        if flip:  # BEV horizontal-flip augmentation (train-time only)
+            points = _flip_points_y(points)
         bev = self.branch(points, device=device)  # (C, nx, ny), grad-enabled
         return self.head(bev.unsqueeze(0))
 
@@ -1627,10 +1657,11 @@ class CameraOnlyDetector(nn.Module):
                                     dropout=head_dropout)
 
     def forward(self, sample,
-                device: torch.device = torch.device("cpu")
+                device: torch.device = torch.device("cpu"),
+                flip: bool = False,
                 ) -> dict[str, torch.Tensor]:
         self.to(device)
-        bev = self.branch(sample, device=device)  # (C, nx, ny), grad-enabled
+        bev = self.branch(sample, device=device, flip=flip)  # (C, nx, ny)
         return self.head(bev.unsqueeze(0))
 
 
@@ -1654,7 +1685,8 @@ class MonoBEVBranch(nn.Module):
         self.model = MonoBEV(self.cfg)
 
     def forward(self, sample,
-                device: torch.device = torch.device("cpu")) -> torch.Tensor:
+                device: torch.device = torch.device("cpu"),
+                flip: bool = False) -> torch.Tensor:
         """StereoSample → ``(C, nx, ny)`` predicted-depth camera BEV on *device*."""
         import torchvision.transforms.functional as TF
 
@@ -1681,8 +1713,10 @@ class MonoBEVBranch(nn.Module):
         K_np[0] *= target_w / img_w
         K_np[1] *= target_h / img_h
         K = torch.from_numpy(K_np).to(device)
-        T = torch.from_numpy(
-            sample.calibration.left_to_ego.astype(np.float32)).to(device)
+        T_np = sample.calibration.left_to_ego.astype(np.float32)
+        if flip:  # BEV flip aug: mirror the lift-splat across ego-y
+            T_np = _MIRROR_Y @ T_np
+        T = torch.from_numpy(T_np).to(device)
 
         self.model.to(device)
         bev = self.model(img_batch, K, T)                  # (1, C, nx, ny)
@@ -1708,10 +1742,11 @@ class MonoOnlyDetector(nn.Module):
                                     dropout=head_dropout)
 
     def forward(self, sample,
-                device: torch.device = torch.device("cpu")
+                device: torch.device = torch.device("cpu"),
+                flip: bool = False,
                 ) -> dict[str, torch.Tensor]:
         self.to(device)
-        bev = self.branch(sample, device=device)  # (C, nx, ny), grad-enabled
+        bev = self.branch(sample, device=device, flip=flip)  # (C, nx, ny)
         return self.head(bev.unsqueeze(0))
 
 
@@ -1780,7 +1815,8 @@ class Pipeline(nn.Module):
     def stereo_cache_root(self, value):
         self.camera_branch.cache_root = value
 
-    def forward(self, sample, device: torch.device = torch.device("cpu")
+    def forward(self, sample, device: torch.device = torch.device("cpu"),
+                flip: bool = False,
                 ) -> dict[str, torch.Tensor]:
         assert self.drop_branch in (None, "camera", "lidar"), self.drop_branch
         self.to(device)  # keep weights with the requested device (no-op if there)
@@ -1789,12 +1825,15 @@ class Pipeline(nn.Module):
             bev_lidar = torch.zeros(cfg.lidar_channels, *cfg.grid_size,
                                     device=device)
         else:
-            bev_lidar = self.lidar_branch(lidar_points(sample), device=device)
+            pts = lidar_points(sample)
+            if flip:  # BEV flip aug: mirror points so both branches agree
+                pts = _flip_points_y(pts)
+            bev_lidar = self.lidar_branch(pts, device=device)
         if self.drop_branch == "camera":
             bev_camera = torch.zeros(cfg.camera_channels, *cfg.grid_size,
                                      device=device)
         else:
-            bev_camera = self.camera_branch(sample, device=device)
+            bev_camera = self.camera_branch(sample, device=device, flip=flip)
         fused = self.detector.fusion(bev_camera, bev_lidar)  # (1, C, nx, ny)
         out = self.detector.head(fused)
         if self.debug:

@@ -204,14 +204,26 @@ class CenterPointLoss(nn.Module):
 # =========================================================================== #
 # The trainable assemblies live in network.py: LidarOnlyDetector (baseline),
 # PipelineA / PipelineB / PipelineC (branches + fusion + head, end-to-end).
-def encode_sample(sample, encoder: "TargetEncoder"
+def encode_sample(sample, encoder: "TargetEncoder", *, flip: bool = False
                   ) -> tuple[torch.Tensor, torch.Tensor]:
     """StereoSample → batched ``(heatmap, offset)`` targets.
 
     Applies the globals class remap (dropping ignored classes) and the BEV-grid
     filter, then encodes — the same recipe the consistency test/visualiser use.
+
+    ``flip`` mirrors the GT box centres across ego-y (negate y) — the *target*
+    half of the BEV horizontal-flip augmentation, whose *input* half is
+    ``flip=True`` on the model forward (see ``network._MIRROR_Y``). The
+    CenterPoint encoder keys only on the box centre, so negating y is the whole
+    transform: no heatmap/offset channel surgery, and the sub-cell offset comes
+    out correct because the encoder re-derives it from the mirrored centre. Must
+    use the *same* per-frame coin as the input flip, or target and input
+    disagree.
     """
     boxes = torch.as_tensor(sample.boxes_3d_ego, dtype=torch.float32)
+    if flip and len(boxes) > 0:
+        boxes = boxes.clone()
+        boxes[:, 1] = -boxes[:, 1]  # mirror centres across ego-y (BEV flip aug)
     idx = [G.class_index(l) for l in sample.boxes_3d_labels]
     if len(boxes) == 0:  # frames with no GT (common on KITTI-360, sparse labels)
         return (torch.zeros((1, G.NUM_CLASSES, encoder.nx, encoder.ny)),
@@ -682,6 +694,7 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
                 nms_radius_by_class: "dict[int, float] | None" = None,
                 seed: int = 0, sample_kwargs: dict | None = None,
                 patience: "int | None" = None, min_delta: float = 0.0,
+                augment: bool = False, flip_p: float = 0.5,
                 device: torch.device = torch.device("cpu")) -> dict:
     """Multi-frame training loop (P1): frame-by-frame + gradient accumulation.
 
@@ -702,6 +715,15 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         for :class:`network.LidarOnlyDetector`.
     :param patience: stop after this many consecutive epochs with no val-loss
         improvement (> ``min_delta``); ``None`` (default) disables early stop.
+    :param augment: enable BEV horizontal-flip augmentation (train only). Each
+        train frame is independently mirrored across ego-y with prob ``flip_p``:
+        the model forward gets ``flip=True`` (mirrors LiDAR points + the camera
+        extrinsic, so the whole branch processes a mirrored scene) and the
+        target is encoded from mirrored box centres — the two share one coin so
+        they stay aligned. ``False`` (default) reproduces prior runs bit-for-bit
+        (the coin is short-circuited, so the RNG stream is untouched). Val is
+        never augmented.
+    :param flip_p: per-frame flip probability when ``augment`` (default 0.5).
     :returns: history dict — per-epoch ``"train"`` / ``"val"`` mean losses and
         the per-step ``"steps"`` list (for plotting).
     """
@@ -724,10 +746,15 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
     rng = random.Random(seed)
     order = list(range(len(train_frames)))
 
-    def _prep(frame):
+    def _prep(frame, flip=False):
         sample = frame.to_stereo_sample(**sample_kwargs)
-        tgt_hm, tgt_off = encode_sample(sample, encoder)
-        return input_fn(sample), tgt_hm, tgt_off
+        tgt_hm, tgt_off = encode_sample(sample, encoder, flip=flip)
+        return input_fn(sample), tgt_hm, tgt_off, flip
+
+    def _coin():
+        # short-circuits when augment=False, so the RNG stream (and thus every
+        # non-augmented run) is bit-identical to before this feature existed.
+        return augment and (rng.random() < flip_p)
 
     history: dict = {"train": [], "val": [], "steps": [],
                      "val_precision": [], "val_recall": [], "val_f1": [],
@@ -740,12 +767,13 @@ def train_model(model: nn.Module, train_frames, val_frames, *,
         opt.zero_grad()
         total = 0.0
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_prep, train_frames[order[0]])
+            future = pool.submit(_prep, train_frames[order[0]], _coin())
             for k in range(len(order)):
-                inputs, tgt_hm, tgt_off = future.result()
+                inputs, tgt_hm, tgt_off, flip = future.result()
                 if k + 1 < len(order):  # prefetch the next frame
-                    future = pool.submit(_prep, train_frames[order[k + 1]])
-                pred = model(inputs, device=device)
+                    future = pool.submit(_prep, train_frames[order[k + 1]],
+                                         _coin())
+                pred = model(inputs, device=device, flip=flip)
                 loss, _ = loss_fn(pred, tgt_hm.to(device), tgt_off.to(device))
                 (loss / accum).backward()
                 if (k + 1) % accum == 0 or k == len(order) - 1:

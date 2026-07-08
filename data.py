@@ -1485,8 +1485,19 @@ def precompute_stereo_inputs(
             continue
         # The cache only stores image + depth + K + extrinsic, so skip the
         # in-box point mask / box assembly (the dominant ~0.9 s/frame cost).
-        sample = frame.to_stereo_sample(point_mask=False)
-        image, depth, K, T = stereo_branch_inputs(sample, target_hw, sgbm_cfg)
+        try:
+            sample = frame.to_stereo_sample(point_mask=False)
+            image, depth, K, T = stereo_branch_inputs(sample, target_hw, sgbm_cfg)
+        except Exception as e:  # noqa: BLE001 — re-raised with context below
+            # A corrupt/truncated raw PNG surfaces here as an opaque OpenCV
+            # ``cvtColor !_src.empty()`` assertion from deep inside py123d's
+            # image reader, with no hint at *which* frame. Name it so the fix
+            # (re-extract, or copy a neighbour over the bad file) is obvious.
+            raise RuntimeError(
+                f"failed to build stereo inputs for {frame.log_name}"
+                f"#{frame.iteration} — likely a corrupt/truncated raw image "
+                f"(check image_00/image_01 data_rect PNGs for this drive). "
+                f"Original error: {type(e).__name__}: {e}") from e
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, image=image, depth=depth, K=K, T_cam2ego=T)
         n_done += 1
