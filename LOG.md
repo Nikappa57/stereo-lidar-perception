@@ -453,6 +453,34 @@ mAP 0.437 | macro P 0.590 R 0.470 F1 0.511 @2 m | mean centre error (TP@2m) 0.33
 
 ![alt text](image-1.png)
 
+#### 8.1) PIPELINE C, no depth, AUG and more WD and dropout, gaussian filter
+
+
+WEIGHT_DECAY = 1e-3  # AdamW decoupled L2 (try 1e-4..1e-2); 0 = plain Adam
+HEAD_DROPOUT = 0.2 
+bev aug
+ gaussian filter
+
+ PipelineC: 1,411,147 trainable | 2,572,280 frozen (yolo26 backbone)
+
+ class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.498   0.655   0.724   0.737   0.654  15975
+PERSON        0.289   0.298   0.302   0.321   0.302  2911
+TWO_WHEELER   0.171   0.222   0.228   0.238   0.215  2090
+TRAFFIC_SIGN  0.225   0.237   0.253   0.287   0.250  1503
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.726   0.778   0.751   0.174   
+PERSON        0.358   0.327   0.342   0.143   
+TWO_WHEELER   0.343   0.326   0.334   0.109   
+TRAFFIC_SIGN  0.409   0.251   0.311   0.334   
+
+mAP 0.355 | macro P 0.459 R 0.421 F1 0.435 @2 m | mean centre error (TP@2m) 0.385 m | 3026 frames
+
+
 #### 9) PIPELINE A, depth-ctx
 
 runs/pipeline_a_yolo26_igev_20260707_203755 — git 68414af
@@ -516,3 +544,7 @@ mAP 0.4445 | macro P 0.528 R 0.488 F1 0.504 @2 m | mean centre error (TP@2m) 0.3
 ![alt text](docs/img/train/train5-example.png)
 
 Depth context vs not: near-identical mAP (0.445 vs 0.4445). Depth-ctx wins TWO_WHEELER (+0.038 mean AP) and TRAFFIC_SIGN (+0.009); no-depth-ctx wins PERSON (+0.035) and VEHICLE (+0.010). Both beat PIPELINE C no-depth (#8, mAP 0.437) on mAP and centre error, on 5.4k fewer trainable params — but #8's macro F1 (0.511) and precision (0.590) are still the best of the three, driven by TRAFFIC_SIGN precision (0.586 vs 0.398/0.415).
+
+
+#### 11) PIPELINE C no gauss, depth
+patch
