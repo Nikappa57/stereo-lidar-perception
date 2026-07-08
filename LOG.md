@@ -595,5 +595,51 @@ stopped before
 ![alt text](docs/img/train/train6-result.png)
 
 
+#### 13) PIPELINE A, depth-ctx + WD 1e-3 + dropout 0.2 + BEV aug
+
+runs/pipeline_a_yolo26_igev_20260708_120420 — git 605edd7
+
+PipelineA: 1,364,294 trainable | 2,572,280 frozen (yolo26 backbone)
+
+Same config as #9 (depth-ctx, yolo_levels=p3p4) plus WEIGHT_DECAY=1e-3, HEAD_DROPOUT=0.2 and BEV augmentation (flip_p=0.5). EPOCHS=50, PATIENCE=5 — metrics.csv logged 7 epochs (best-val checkpoint = epoch 3, lowest val_loss 2.206); epoch 8 started but the run was stopped before it finished (no epoch-8 summary line, no further checkpoint past `last.pt`). Run dir created 12:04, `best.pt` written 13:44 (epoch 3), `last.pt`/metrics.csv last written 15:59 (epoch 7) — ~3h55m wall clock for the 7 logged epochs.
+
+![alt text](docs/img/train/train8-loss.png)
+
+class         AP@0.5  AP@1    AP@2    AP@4      mean   n_gt
+-----------------------------------------------------------
+VEHICLE       0.587   0.698   0.749   0.765   0.700  15975
+PERSON        0.417   0.421   0.424   0.440   0.426  2911
+TWO_WHEELER   0.310   0.344   0.351   0.369   0.343  2090
+TRAFFIC_SIGN  0.272   0.277   0.287   0.306   0.286  1503
+
+F1-optimal operating point @2 m (apply 'confidence >= score' at deployment):
+class         prec    recall  F1      score   
+----------------------------------------------
+VEHICLE       0.753   0.783   0.768   0.231   
+PERSON        0.560   0.404   0.470   0.215   
+TWO_WHEELER   0.457   0.373   0.411   0.192   
+TRAFFIC_SIGN  0.423   0.269   0.329   0.271   
+
+mAP 0.439 | macro P 0.548 R 0.457 F1 0.494 @2 m | mean centre error (TP@2m) 0.328 m | 3026 frames
+
+![alt text](docs/img/train/train8-result.png)
+
+![alt text](docs/img/train/train8-example.png)
+
+![alt text](docs/img/train/train8-example2.png)
+
+vs #9 (same depth-ctx config, no WD/dropout/aug): mAP 0.439 vs 0.445, precision 0.548 vs 0.526 (up), recall 0.457 vs 0.494 (down), err 0.328 vs 0.325 (about the same). Same direction as #8.1 (WD+dropout+aug on Pipeline C also regressed mAP, 0.437→0.355) — regularization + aug trades recall for precision here too, net mAP slightly down, though the drop is much smaller with depth-ctx anchoring localization.
+
+##### Branch contribution (drop_branch ablation)
+
+Trained checkpoint (best.pt, epoch 3) re-evaluated with one branch zeroed at inference time — bounds each branch's marginal contribution inside the fusion (not a retrained baseline; a zeroed branch is a "silent sensor" the fusion conv never saw during training). Note: this ablation's eval call doesn't pass the custom per-class NMS radii used in the headline report above, so its own "none" row (mAP 0.444) differs slightly from the headline number (0.439) — same checkpoint, different NMS at inference.
+
+| drop_branch | mAP | VEHICLE | PERSON | TWO_WHEELER | TRAFFIC_SIGN | P | R | F1 | Err (m) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| none | 0.444 | 0.720 | 0.426 | 0.345 | 0.285 | 0.537 | 0.451 | 0.486 | 0.337 |
+| camera (→ lidar-only) | 0.355 | 0.667 | 0.223 | 0.237 | 0.291 | 0.466 | 0.398 | 0.423 | 0.350 |
+| lidar (→ camera-only) | 0.032 | 0.036 | 0.022 | 0.038 | 0.033 | 0.662 | 0.055 | 0.098 | 0.965 |
+
+Zeroing LiDAR is catastrophic (mAP 0.444→0.032, recall collapses to 0.055) — the fusion conv leans almost entirely on the LiDAR branch for localization. Zeroing camera costs much less (0.444→0.355) but still roughly halves PERSON/TWO_WHEELER AP, so the camera branch is still pulling weight on the smaller classes.
 
 
